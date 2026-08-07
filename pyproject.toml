@@ -1,14 +1,15 @@
 [project]
 name = "walkie-dokie"
 version = "0.1.0"
-description = "Voice-first multi-agent assistant for frontline property and home-service workers"
+description = "Multi-platform bot office assistant for elderly users, backed by pluggable coding agents"
 requires-python = ">=3.11"
 dependencies = [
     "langgraph",
-    "langchain-anthropic",
-    "openai",
-    "anthropic",
 ]
+
+[project.optional-dependencies]
+# 执行后端二选一或都装；Codex 走 CLI/子进程调用，暂无需专门的 pip 依赖。
+claude = ["claude-agent-sdk"]
 
 [build-system]
 requires = ["setuptools>=68"]

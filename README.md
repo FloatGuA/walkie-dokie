@@ -1,18 +1,16 @@
-# Walkie-Dokie — Multi-Agent Work Assistant for Frontline Service Workers
+# Walkie-Dokie — 多平台办公助手
 
-小帮 · 说一句话，报修单就派出去了。
+小帮 · 说一句话，文档就给你办好。
 
 ## 这是什么
 
-面向物业管理 / 家政服务一线人员（以中老年从业者为主）的语音优先多 Agent 工作助手。用户通过企业微信发一条语音或一张照片，系统完成意图澄清、工单创建、跨组织派单、话术生成与危险操作审批。
+面向中老年人群的多平台（企业微信 / QQ / 微信）机器人办公助手。给机器人发一条消息或一份文件，它帮你生成 Word 文档、处理 Excel 表格、回答文档里的问题——不用自己打开 Office，不用学怎么操作电脑。
 
-输入端极度非结构化（方言、口语、省略主语），输出端有真实副作用（真的会派单、真的会给业主发消息）——所以澄清机制、状态机、人工审批（HITL）、可观测性和评测都是核心设计，不是附加项。
-
-同时这是一个求职作品项目，用来展示 Agent 系统工程能力。
+同时这是一个求职作品项目，用来展示 Agent 系统工程能力：多平台适配层设计、跨消息会话状态管理、可插拔执行后端。
 
 ## 现状
 
-项目刚建立，目前只有目录骨架，尚无可运行的功能。详细进度见 [PROGRESS.md](PROGRESS.md)。
+骨架阶段：三层目录结构和抽象接口（`PlatformAdapter` / `SessionState` / `ExecutionAgent`）已就位，均为占位实现，尚无可运行功能。详细进度见 [PROGRESS.md](PROGRESS.md)。
 
 ## 安装（开发环境）
 
@@ -20,21 +18,18 @@
 pip install -e .
 ```
 
-需要 Python 3.11+。
+需要 Python 3.11+。如果要用 Claude Agent SDK 作为执行后端：
 
-## 技术栈一览
+```bash
+pip install -e ".[claude]"
+```
 
-| 组件 | 职责 |
-|---|---|
-| LangGraph | 主编排，checkpoint + interrupt 支撑工单状态机与人工审批暂停 |
-| OpenAI Agents SDK | 高频低成本任务：意图分类、槽位抽取 |
-| Anthropic SDK | 需要判断力的任务：澄清策略、危险操作审核、沟通措辞 |
-| A2A | 跨组织委派，例如物业 Agent 把深度保洁任务委派给家政平台 Agent |
-| n8n | 确定性集成调度：企业微信 webhook、定时推送、超时告警、结算导出 |
-| MCP | 把工单系统 API 封装成 MCP Server，供多个客户端复用 |
+## 架构一览
 
-每个组件的选型理由见 [DECISION.md](DECISION.md)，架构与模块划分见 [TECHNICAL.md](TECHNICAL.md)（尚未建立）。
+| 层 | 目录 | 职责 |
+|---|---|---|
+| 平台适配层 | `src/walkie_dokie/platforms/` | 把企业微信/QQ/微信等平台的消息统一转成内部 Event（MVP 先实现企业微信自建应用） |
+| 编排层 | `src/walkie_dokie/orchestrator/` | LangGraph 管理跨消息的会话状态机（等待指令/执行中/等待确认/完成） |
+| 执行层 | `src/walkie_dokie/agents/` | 可插拔的 coding agent 执行后端（Claude Agent SDK / Codex），在沙箱里写代码完成文档操作 |
 
-## 适老化设计原则
-
-语音进语音出、一次只说一件事、回复不超过两句、避免"工单/SLA"等术语（对用户说"报修单""多久上门"）、确认统一用"回 1 / 回 2"、记住每个用户的个人词表。
+每层为什么这么划分、否掉了哪些方案，见 [DECISION.md](DECISION.md)。
