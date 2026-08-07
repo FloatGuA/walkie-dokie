@@ -9,3 +9,4 @@ build/
 .pytest_cache/
 .langgraph/
 *.log
+scripts/_test_output*

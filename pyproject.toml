@@ -5,6 +5,9 @@ description = "Multi-platform bot office assistant for elderly users, backed by 
 requires-python = ">=3.11"
 dependencies = [
     "langgraph",
+    "httpx",
+    "python-dotenv",
+    "lark-oapi",
 ]
 
 [project.optional-dependencies]

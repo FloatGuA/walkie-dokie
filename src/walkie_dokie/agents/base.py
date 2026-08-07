@@ -17,4 +17,6 @@ class ExecutionAgent(ABC):
     """
 
     @abstractmethod
-    async def run(self, instruction: str, input_file: bytes | None) -> ExecutionResult: ...
+    async def run(
+        self, instruction: str, input_file: bytes | None, input_filename: str | None = None
+    ) -> ExecutionResult: ...
