@@ -1,0 +1,18 @@
+[project]
+name = "walkie-dokie"
+version = "0.1.0"
+description = "Voice-first multi-agent assistant for frontline property and home-service workers"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph",
+    "langchain-anthropic",
+    "openai",
+    "anthropic",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
