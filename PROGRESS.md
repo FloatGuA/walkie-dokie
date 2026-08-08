@@ -8,6 +8,8 @@
 
 ## 待处理 / 下一步
 
+- **`bypassPermissions` 提示词注入敞口**：`ClaudeAgentSDKBackend` 一直用 `bypassPermissions` 跑，现在又接了"读用户文件"的功能，存在真实的提示词注入风险，但现在收益太低不值得处理。**硬性条件：项目公开给除开发者之外的人用之前必须先处理**，详细取舍见 DECISION.md
+- **同一用户执行中再发消息，会不会跟前一次的 `ainvoke()` 在同一个 checkpoint thread 上打架**：未验证的风险，不是确认的 bug。防抖只在 `aget_state().next` 为空时才会对同一个 `thread_id` 发起新的 `graph.ainvoke()`——但"图正在跑 `_execute`"这个状态本身 `next` 也是空的（不是 `interrupt()` 暂停），所以理论上用户在执行期间（Claude 跑 30-60 秒）又发消息，会对同一个 thread 并发发起第二次 `ainvoke()`。有没有实际问题、LangGraph 的 checkpointer 撑不撑得住这种并发写入，都还没测过
 - **文件问答/总结的效果不太好**：实测让 Claude 总结一份 `worklog.md`，流程全部走通了（收文件→确认→执行→发回结果），但用户反馈总结内容质量不够好。用户明确说"效果问题另说"，先不查，工作流本身通了就行——如果要认真做，大概率要在 draft/执行阶段的 prompt 上下功夫，不是这次的重点
 - **Codex 后端在 Windows 上不可用**：不是订阅额度问题（额度问题已过去），是 Codex CLI `workspace-write` 沙箱在 Windows 上的已知上游 bug，拦掉几乎所有命令执行。用户拍板不开 `--dangerously-bypass-approvals-and-sandbox` 绕过（风险太大，见 DECISION.md）。MVP 阶段只用 Claude 这条后端，Codex 等上游修复或者考虑换 harness / 挪到非 Windows 环境再验证
 - `lark_oapi` 自己的 logger 会被我们的 root logger 重复打印一遍（不影响功能，未处理）
