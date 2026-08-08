@@ -4,12 +4,11 @@
 
 项目方向：面向中老年人群的多平台机器人办公助手，核心场景是 Word/Excel 文档的生成/编辑/问答（原「物业家政多Agent平台」方向已搁置，见 [DECISION.md](DECISION.md)）。
 
-**MVP 端到端闭环已跑通并验证，orchestrator 也已接入**：飞书发一句文字指令 → LangGraph 状态机（`orchestrator/`）→ `ClaudeAgentSDKBackend` 用 python-docx 生成 docx → 飞书把文件和文字回复发回用户。每条消息独立工作目录（`var/workspaces/`，持久化不清理）+ 结构化留痕（`var/logs/turns.jsonl`）+ 项目本地日志（`var/logs/walkie-dokie.log`，DEBUG 粒度）。平台选型定为飞书自建应用（长连接，见 DECISION.md），执行后端目前只有 Claude 这一条能跑，Codex 卡在订阅额度。
+**MVP 端到端闭环已跑通并验证，orchestrator 也已接入，防抖+确认环节也跑通了**：飞书发一句文字指令 → LangGraph 状态机（`orchestrator/`：防抖攒消息 → 生成任务草稿 → 列出缺失信息等用户确认 → 确认后强制执行不再追问）→ `ClaudeAgentSDKBackend` 用 python-docx 生成 docx → 飞书把文件和文字回复发回用户。每条消息独立工作目录（`var/workspaces/`，持久化不清理）+ 结构化留痕（`var/logs/turns.jsonl`）+ 项目本地日志（`var/logs/walkie-dokie.log`，DEBUG 粒度）。平台选型定为飞书自建应用（长连接，见 DECISION.md），执行后端目前只有 Claude 这一条能跑，Codex 卡在订阅额度。
 
 ## 待处理 / 下一步
 
-- **orchestrator 的"够不够执行"判断目前是假的**：只要有文本就立刻执行，不会真的等信息补全——因为文件接收还没实现，`pending_file` 恒为 `None`，唯一变量是文本，任何文本都满足"够了"。跟下面"防抖 + 任务提示词确认"是同一件事，一起做
-- **同一用户连续快发消息会并发执行，不是排队/合并**：实测过，同一用户几秒内发两条消息，orchestrator 会并发处理成两个独立请求，而不是当成一轮意图的补充。这个和防抖机制强相关，设计已经讨论过：10 秒无新消息才算一轮，攒够了生成 task prompt 草稿，回复用户确认，确认了再派发给执行 agent；用 LangGraph 的 checkpoint/interrupt 做"等确认"这一步暂停。**这是下一步要做的东西**
+- **执行结果文字里偶尔混入无关内容**：实测有一次 `ClaudeAgentSDKBackend` 的 `reply_text` 末尾多了一句"claude.ai 的 Gmail/Calendar/Drive 连接器尚未授权"之类的提示，跟任务本身无关，只出现过一次，原因未查——如果这段文字被转发给真实用户会很困惑，需要留意会不会重复出现，重复出现的话要查根因（可能是 Claude Agent SDK 环境里某种连接器状态检查漏进了最终回复）
 - 用户发文件给 bot 这条链路还没实现——`FeishuAdapter._on_message` 目前收到文件消息时 `file` 字段写死 `None`
 - Codex 执行后端订阅额度问题未解决，暂缓，不阻塞主线
 - `lark_oapi` 自己的 logger 会被我们的 root logger 重复打印一遍（不影响功能，未处理）
@@ -25,6 +24,13 @@
 （无）
 
 ## 已完成
+
+- **防抖 + 任务草稿确认闭环**（2026-08-09，已验证：真实在飞书测试——发"我写一份请假条" → 10 秒防抖后收到列明 7 项缺失信息的确认消息 → 回"是" → 派发执行时自动加上"用占位符直接完成、不要再问"的限定 → Claude 真的用合理默认值生成了 `请假条.docx`，不再卡在反复追问）
+  - `src/walkie_dokie/orchestrator/debounce.py`：新增 `Debouncer`，按 `user_id` 缓冲消息，每条新消息重置一个可取消的 10 秒 `asyncio.Task`，到期把窗口内消息合并派发
+  - `src/walkie_dokie/orchestrator/draft.py`：新增 `generate_draft_task_prompt()`，轻量 Claude Agent SDK 调用（`allowed_tools=[]`、`max_turns=1`，不跑代码），结构化输出 `{task_summary, missing_info}`——第一版只输出一句纯文本草稿，实测发现草稿如果自带"应该先问用户"的判断，会在用户确认后被原样喂给执行 agent 导致执行 agent 也去追问，改成结构化拆开 `task_summary`/`missing_info` 两个字段后，confirm 消息才能直接把缺什么列清楚，且执行时能针对性地加"别再问了"的限定
+  - `src/walkie_dokie/orchestrator/graph.py`：图从两节点扩成四节点 `collect → draft → ask_confirm → execute`，`ask_confirm` 用 `langgraph.types.interrupt()` 暂停等用户回复，`_route_confirm` 机械判断回复是不是确认词（`是/对/确认/ok/yes` 等固定集合，不是 NLU 意图分类），不是就并回 `pending_instruction` 重新生成草稿；`execute` 节点如果 `draft.missing_info` 非空，会把"这些信息用占位符直接完成，不要再问"拼进喂给执行 agent 的最终指令
+  - `scripts/run_mvp.py`：`handle_event` 先查 `graph.aget_state().next` 判断这个用户是不是正卡在 `ask_confirm`——是的话直接 `ainvoke(Command(resume=文本))` 恢复，不走防抖；不是的话才丢给 `Debouncer`
+  - 用一个玩具两节点图（`scripts/_scratch_interrupt_test.py`，验证完删了）单独确认了 `interrupt()`/`Command(resume=...)`/`aget_state().next` 的实际行为再动手写正式代码：中断后 `ainvoke()` 返回值带 `__interrupt__` 字段，恢复时节点从头重跑
 
 - **orchestrator 接入 + 日志/留痕基础设施**（2026-08-08，已验证：真实在飞书发消息，工作目录/结构化留痕/项目日志三者都确认落盘正确，见 `var/workspaces/feishu_ou_.../20260808/96025e01/请假条.docx` 和对应的 `var/logs/turns.jsonl` 记录）
   - `src/walkie_dokie/orchestrator/graph.py`：`build_graph()` 用 LangGraph `StateGraph` 实装，两个节点 `collect`（把新消息并入 pending_* 状态）/`execute`（调用执行 agent，记结构化留痕），按 `user_id` 做 checkpoint thread 隔离
