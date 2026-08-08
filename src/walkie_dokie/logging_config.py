@@ -6,6 +6,12 @@ from pathlib import Path
 _VAR_ROOT = Path(__file__).parent.parent.parent / "var"
 LOG_FILE = _VAR_ROOT / "logs" / "walkie-dokie.log"
 
+# 传输层的帧级细节（websocket ping/pong 之类）价值不大，只吵——真正需要看
+# 连通性时，飞书 SDK 自己在 INFO 级别已经打了 connected/disconnected/
+# reconnecting，够用了。这里只按 logger 名字调粗，不影响我们自己模块
+# （walkie_dokie.*）和其他第三方库的 DEBUG 粒度。
+_QUIET_LOGGERS = ["websockets"]
+
 
 def setup_logging(console_level: int = logging.INFO, file_level: int = logging.DEBUG) -> None:
     """全项目统一的日志初始化，入口脚本启动时调一次。
@@ -40,3 +46,6 @@ def setup_logging(console_level: int = logging.INFO, file_level: int = logging.D
     root.setLevel(min(console_level, file_level))
     root.addHandler(console_handler)
     root.addHandler(file_handler)
+
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.INFO)

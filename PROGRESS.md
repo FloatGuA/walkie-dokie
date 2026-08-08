@@ -8,7 +8,6 @@
 
 ## 待处理 / 下一步
 
-- **执行结果文字里偶尔混入无关内容**：实测有一次 `ClaudeAgentSDKBackend` 的 `reply_text` 末尾多了一句"claude.ai 的 Gmail/Calendar/Drive 连接器尚未授权"之类的提示，跟任务本身无关，只出现过一次，原因未查——如果这段文字被转发给真实用户会很困惑，需要留意会不会重复出现，重复出现的话要查根因（可能是 Claude Agent SDK 环境里某种连接器状态检查漏进了最终回复）
 - **文件问答/总结的效果不太好**：实测让 Claude 总结一份 `worklog.md`，流程全部走通了（收文件→确认→执行→发回结果），但用户反馈总结内容质量不够好。用户明确说"效果问题另说"，先不查，工作流本身通了就行——如果要认真做，大概率要在 draft/执行阶段的 prompt 上下功夫，不是这次的重点
 - **Codex 后端在 Windows 上不可用**：不是订阅额度问题（额度问题已过去），是 Codex CLI `workspace-write` 沙箱在 Windows 上的已知上游 bug，拦掉几乎所有命令执行。用户拍板不开 `--dangerously-bypass-approvals-and-sandbox` 绕过（风险太大，见 DECISION.md）。MVP 阶段只用 Claude 这条后端，Codex 等上游修复或者考虑换 harness / 挪到非 Windows 环境再验证
 - `lark_oapi` 自己的 logger 会被我们的 root logger 重复打印一遍（不影响功能，未处理）
@@ -17,7 +16,7 @@
 - 周计划/路线图还没细化，留到下一步单独讨论
 - **进程常驻/自动重启**：现在是手动敲命令跑的开发脚本，关终端/重启/崩溃都没人管。用户拍板"这个好做，以后再做"，方案已讨论过（Windows 服务化包装，或挪到云主机 + 进程管理器），暂不实现
 - **部署目标机器未定**：本地先跑通，以后要挪云主机，但云主机是 Linux/macOS/Windows 都还没定，用户明确说"现在还不知道"——先不依赖任何特定 OS 的实现细节
-- **日志粒度后续要调粗**：现在项目早期，`var/logs/walkie-dokie.log` 存 DEBUG 粒度（连第三方库如 websockets 的底层帧都记了），文件用轮转限制了体积（10MB×5）暂时不会失控。用户明确说了等过了高频调试阶段再调粗，不用现在处理
+- **日志粒度**：websocket 帧级噪音（PING/PONG）已经调粗，其余（`walkie_dokie.*`、urllib3 等）还是 DEBUG 粒度，用户明确说了等过了高频调试阶段再整体调粗，不用现在处理
 - **用户级 memory 还没做**：两层都缺——① orchestrator 的会话状态只在内存里（`InMemorySaver()`），进程一重启就丢，跟"记住用户是谁"无关，纯粹是重启存活的问题；② 记住具体用户的信息（姓名/部门/常用称呼这类）减少重复问——今天测试时因为不知道真实信息，Claude 只能编"张伟""李明经理"这类占位符。Claude Agent SDK 不提供这两层中的任何一层（尤其我们还特意做了 `setting_sources=[]` 隔离），得自己做。用户明确表示"先把基础的搭建起来"，这个先缓一缓
 
 ## 进行中
@@ -25,6 +24,10 @@
 （无）
 
 ## 已完成
+
+- **执行 agent 显式 system_prompt + websocket 日志降噪**（2026-08-09，已冒烟测试：`test_claude_backend.py` 正常生成文件，没再出现无关内容；websocket PING/PONG 不再进日志，`Lark` SDK 自己的 connected/disconnected/reconnecting 这些连通性日志还在）
+  - `src/walkie_dokie/agents/claude_agent.py`：之前从没给 `ClaudeAgentOptions` 设过 `system_prompt`，实际跑的是 Claude Code 默认的通用助手人设——这很可能就是之前"回复里混进 Gmail/Calendar 连接器提示"那次异常的根因。改成 `{"type": "preset", "preset": "claude_code", "append": ..., "exclude_dynamic_sections": True}`：保留 Claude Code 自带的代码能力，追加 walkie-dokie 自己的任务框定，用 `exclude_dynamic_sections` 去掉 auto-memory/git status 这类跟单个用户绑定、这里用不上的动态段落
+  - `src/walkie_dokie/logging_config.py`：新增 `_QUIET_LOGGERS`，把 `websockets` logger 单独调到 INFO，不影响 `walkie_dokie.*` 或其他第三方库的 DEBUG 粒度——这是按 logger 名字精确降噪，不是笼统调整全局级别
 
 - **文件接收链路打通 + 两个交互 bug 修复**（2026-08-09，已验证：真实发 `worklog.md` 给 bot 让它总结，`var/workspaces/feishu_ou_.../20260809/f643acf3/` 下同时存了输入文件 `worklog.md` 和输出文件 `worklog_summary.docx`，`turns.jsonl` 里对应的 `run_id` 能直接定位到这个目录——按 session 找回输入输出的诉求确认可行）
   - `src/walkie_dokie/platforms/feishu.py`：`_on_message` 收到 `message_type == "file"` 时，调用飞书"获取消息中的资源文件" API（`client.im.v1.message_resource`，按 `message_id` + `file_key` 下载）拿到真实字节，填进 `InboundEvent.file`

@@ -7,6 +7,14 @@ from .base import ExecutionAgent, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
+_SYSTEM_PROMPT_APPEND = (
+    "你现在是 walkie-dokie 的文档处理执行单元，只做一件事：用 Python 代码"
+    "（Word 用 python-docx，Excel 用 openpyxl）在当前工作目录里完成用户的文档请求"
+    "（生成、编辑或读取问答 Word/Excel 文件）。不要提及、也不要尝试使用任何跟这个"
+    "任务无关的能力（比如 Gmail、日历、云盘之类的连接器/授权流程）——那些在这个"
+    "环境里不存在也用不上，提了只会让用户困惑。"
+)
+
 _OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -61,6 +69,16 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
             # 显式传的 system_prompt/options 决定，不会被个人日常用的 Claude Code
             # 配置污染（见 PITFALLS.md，Codex 那边同类问题的 --ignore-user-config）。
             setting_sources=[],
+            # 保留 Claude Code 自带的代码能力（怎么安全地用工具、写代码），只追加
+            # 我们自己的任务框定，并且去掉 auto-memory/git status 这类跟每个用户
+            # 绑定的动态段落——怀疑就是这类动态内容导致过一次回复里混进了跟任务
+            # 无关的"Gmail/Calendar 连接器"提示，见 PROGRESS.md。
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": _SYSTEM_PROMPT_APPEND,
+                "exclude_dynamic_sections": True,
+            },
         )
 
         structured: dict | None = None
