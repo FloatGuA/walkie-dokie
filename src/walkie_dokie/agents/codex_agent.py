@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -11,6 +12,13 @@ logger = logging.getLogger(__name__)
 _CODEX_EXECUTABLE = shutil.which("codex")
 if _CODEX_EXECUTABLE is None:
     raise RuntimeError("找不到 codex CLI，确认已安装并在 PATH 里（`codex --version` 能跑通）")
+
+# 独立 CODEX_HOME，跟开发者本机 ~/.codex 的 config.toml/AGENTS.md/rules/skills
+# 彻底隔离——实测踩过这三层配置分别泄漏进执行结果的坑，见 PITFALLS.md。
+# 首次使用需要单独 `codex login`（这个目录下没有 auth.json，见 README.md）。
+_VAR_ROOT = Path(__file__).parent.parent.parent.parent / "var"
+CODEX_HOME_DIR = _VAR_ROOT / "codex_home"
+CODEX_HOME_DIR.mkdir(parents=True, exist_ok=True)
 
 _OUTPUT_SCHEMA = {
     "type": "object",
@@ -26,7 +34,9 @@ _OUTPUT_SCHEMA = {
 class CodexBackend(ExecutionAgent):
     """基于 Codex CLI（`codex exec`）的执行后端。
 
-    走本机 `codex login` 缓存的 ChatGPT 订阅鉴权，不设 CODEX_API_KEY。
+    走独立 `CODEX_HOME`（见 `CODEX_HOME_DIR`）下缓存的 ChatGPT 订阅鉴权，不设
+    CODEX_API_KEY。这个目录跟开发者本机的 ~/.codex 完全隔离，首次使用需要单独
+    登录一次：`CODEX_HOME=<CODEX_HOME_DIR> codex login`（见 README.md）。
     """
 
     async def run(
@@ -58,6 +68,7 @@ class CodexBackend(ExecutionAgent):
             "（生成文件相对当前目录的文件名；如果没有生成文件，filename 留空字符串）。"
         )
 
+        env = {**os.environ, "CODEX_HOME": str(CODEX_HOME_DIR)}
         proc = await asyncio.create_subprocess_exec(
             _CODEX_EXECUTABLE,
             "exec",
@@ -68,6 +79,7 @@ class CodexBackend(ExecutionAgent):
             str(schema_path),
             prompt,
             cwd=workdir,
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

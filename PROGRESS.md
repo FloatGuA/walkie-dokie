@@ -10,7 +10,7 @@
 
 - **执行结果文字里偶尔混入无关内容**：实测有一次 `ClaudeAgentSDKBackend` 的 `reply_text` 末尾多了一句"claude.ai 的 Gmail/Calendar/Drive 连接器尚未授权"之类的提示，跟任务本身无关，只出现过一次，原因未查——如果这段文字被转发给真实用户会很困惑，需要留意会不会重复出现，重复出现的话要查根因（可能是 Claude Agent SDK 环境里某种连接器状态检查漏进了最终回复）
 - 用户发文件给 bot 这条链路还没实现——`FeishuAdapter._on_message` 目前收到文件消息时 `file` 字段写死 `None`
-- Codex 执行后端订阅额度问题未解决，暂缓，不阻塞主线
+- **Codex 后端在 Windows 上不可用**：不是订阅额度问题（额度问题已过去），是 Codex CLI `workspace-write` 沙箱在 Windows 上的已知上游 bug，拦掉几乎所有命令执行。用户拍板不开 `--dangerously-bypass-approvals-and-sandbox` 绕过（风险太大，见 DECISION.md）。MVP 阶段只用 Claude 这条后端，Codex 等上游修复或者考虑换 harness / 挪到非 Windows 环境再验证
 - `lark_oapi` 自己的 logger 会被我们的 root logger 重复打印一遍（不影响功能，未处理）
 - `lark_oapi` 报了个不影响功能的噪音错误：`processor not found, type: im.message.reaction.created_v1`（用户在飞书给消息点了个表情反应，触发了一个我们没注册处理器的事件类型），不影响主流程，未处理
 - 针对"文档办公"场景重新梳理适老化交互设计（旧方向的语音优先设计不完全适用，具体怎么做还没讨论）
@@ -24,6 +24,13 @@
 （无）
 
 ## 已完成
+
+- **执行后端配置隔离排查**（2026-08-09，已验证隔离本身生效：`ClaudeAgentSDKBackend`/draft 加 `setting_sources=[]` 后不再受影响；`CodexBackend` 切到独立 `CODEX_HOME` 后确认不再读取开发者个人的 `~/.codex` 内容——但排查过程中发现 Codex 在 Windows 上还有一个隔离之外的、更深的沙箱执行 bug，未解决，见上方"待处理"和 DECISION.md）
+  - 起因：`CodexBackend` 测试时回复混入无关前缀"FGuA"，查到是开发者本机 `~/.codex/AGENTS.md` 的个人全局约束泄漏
+  - `src/walkie_dokie/agents/claude_agent.py`、`src/walkie_dokie/orchestrator/draft.py`：`ClaudeAgentOptions` 都加了 `setting_sources=[]`
+  - `src/walkie_dokie/agents/codex_agent.py`：新增 `CODEX_HOME_DIR`（`var/codex_home/`，自动创建），子进程调用传 `env={**os.environ, "CODEX_HOME": ...}`，不再需要 `--ignore-user-config`/`--ignore-rules` 这类单项 flag
+  - `scripts/test_claude_backend.py`、`scripts/test_codex_backend.py`：修了个遗留问题——两个脚本还在用 `ExecutionAgent.run()` 的旧签名（没传 `workdir`），跟不上早前的接口改动，顺手改成用 `create_workspace_dir()`
+  - 排查过程中用 `codex exec --json` 才能看到真实的执行拒绝原因（`rejected: blocked by policy`），不加 `--json` 只能看到 Codex 把拒绝包装成的自然语言回复，容易被误判成"意图理解不到位"
 
 - **防抖 + 任务草稿确认闭环**（2026-08-09，已验证：真实在飞书测试——发"我写一份请假条" → 10 秒防抖后收到列明 7 项缺失信息的确认消息 → 回"是" → 派发执行时自动加上"用占位符直接完成、不要再问"的限定 → Claude 真的用合理默认值生成了 `请假条.docx`，不再卡在反复追问）
   - `src/walkie_dokie/orchestrator/debounce.py`：新增 `Debouncer`，按 `user_id` 缓冲消息，每条新消息重置一个可取消的 10 秒 `asyncio.Task`，到期把窗口内消息合并派发
@@ -53,13 +60,4 @@
   - `pyproject.toml` 新增依赖：`httpx`、`python-dotenv`、`lark-oapi`
   - 平台选型过程：企业微信自建应用（缺资质）→ 企业微信智能机器人/微信公众号（不支持发文件）→ QQ 官方机器人（缺资质）→ 一度拍板个人微信 `wxauto`（用户接受封号风险）→ 最终定为飞书自建应用（长连接、零封号风险、原生支持发文件），详细取舍见 DECISION.md
 
-- **骨架按新方向重建**（2026-08-07，已验证：`pip install -e . --no-deps` 在独立 venv 中成功，`import walkie_dokie.{platforms.base, orchestrator.state, agents.base}` 通过；未验证任何实际业务逻辑，因为还没写）
-  - 删除物业家政方向的旧代码：`graphs/`、旧 `agents/`、`tools/`、`memory/`、`integrations/` 目录，`state.py`（`WorkOrderState`），空目录 `eval/`、`n8n/`、`docs/`
-  - 新增 `src/walkie_dokie/platforms/`：`base.py`（`PlatformAdapter` 抽象接口、`InboundEvent`/`OutboundMessage`/`IncomingFile`）、`wecom.py`（`WeComAdapter` 占位，`NotImplementedError`）
-  - 新增 `src/walkie_dokie/orchestrator/`：`state.py`（`SessionState`，字段 platform/user_id/pending_file/instruction/backend/status/result_file）、`graph.py`（占位，图节点未定义）
-  - 新增 `src/walkie_dokie/agents/`：`base.py`（`ExecutionAgent` 抽象接口）、`claude_agent.py`（`ClaudeAgentSDKBackend` 占位）、`codex_agent.py`（`CodexBackend` 占位），均 `NotImplementedError`
-  - `pyproject.toml`：依赖改为 `langgraph`，新增可选依赖组 `claude`（`claude-agent-sdk`），移除不再需要的 `langchain-anthropic`/`openai`/`anthropic`
-  - README.md、DECISION.md 同步更新为新方向
-
-- **项目骨架搭建（物业家政方向，已作废）**（2026-08-07）
-  - 见上方"骨架按新方向重建"，此前的目录结构和 `WorkOrderState` 已被删除，历史记录见 git log
+- 更早的骨架搭建历史（2026-08-07，物业家政方向作废 + 按新方向重建）搬到了 [docs/progress-archive.md](docs/progress-archive.md)

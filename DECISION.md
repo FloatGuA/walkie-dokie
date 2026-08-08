@@ -152,3 +152,21 @@
 - **否掉了什么，为什么**：把"生成草稿"这一步做成一个正式的 tool——用户明确说不需要，就是一次轻量调用，不用工具化。**这条不推翻**"不做 awaiting_confirm"那条旧决策——旧决策否掉确认环节的理由是"没有真实副作用风险"，这条理由依然成立；这次加确认环节的理由是另一个不同的动机："意图理解准头不够，用便宜的确认环节提前纠错，比让执行 agent 直接跑一次几十秒的完整生成再发现理解错了要划算"，是成本/准确率的权衡，不是风险控制。
 - **代价 / 已知不足**：每一轮多了至少一次额外的轻量 LLM 调用和一次用户往返，交互链路变长；10 秒防抖窗口的具体时长是拍脑袋定的，没有实测调过；这个功能**截至记录时还没开始写代码**，只是设计定了。
 - **什么情况下应该重新考虑**：如果实测发现 10 秒窗口经常等太久（用户等得不耐烦）或者太短（消息经常被拆成好几轮），需要调整或者换成更智能的触发方式（比如判断消息是否像"说完了"而不是纯定时）。
+
+## 两个执行后端都要跟开发者本机的个人 AI 配置彻底隔离
+
+- **日期**：2026-08-09
+- **背景**：实测 `CodexBackend` 时，回复里混进一个跟任务无关的前缀"FGuA"，排查发现是开发者本机 `~/.codex/AGENTS.md` 里的个人全局约束泄漏进了执行结果——`codex exec`（本地 CLI）不管走订阅还是 API key 鉴权，都会读同一份 `$CODEX_HOME`（默认 `~/.codex`）下的 config.toml/AGENTS.md/rules/skills，这些是开发者过去几个月在别的项目里攒下来的个人定制，跟 walkie-dokie 完全无关。类似地，`ClaudeAgentSDKBackend` 默认也会加载开发者本机 `~/.claude` 的全局设置。
+- **选了什么**：`ClaudeAgentSDKBackend`/draft 生成两处调用都传 `ClaudeAgentOptions(setting_sources=[])`（SDK 自带的"隔离模式"，一个参数关掉所有文件系统配置加载）；`CodexBackend` 改为使用独立的 `CODEX_HOME`（`var/codex_home/`，不进 git），跟开发者本机的 `~/.codex` 完全分开，需要单独 `codex login` 一次。
+- **否掉了什么，为什么**：一开始想给 `codex exec` 加 `--ignore-user-config`/`--ignore-rules` 这类单项跳过 flag——排查过程中发现开发者本机的污染源不止一个（config.toml、AGENTS.md、rules 三层各自独立），一个个加 flag 属于打地鼠，以后开发者本机再新增别的个人定制还会重新泄漏；换独立 `CODEX_HOME` 是一次性彻底隔离，以后开发者本机配置怎么变都不影响这个项目。
+- **代价 / 已知不足**：独立 `CODEX_HOME` 需要额外一次 `codex login`（多一步人工操作）；这次隔离只覆盖了「配置/规则/AGENTS.md」这一类问题，不覆盖下面这条记录的 Windows 沙箱执行 bug（那是完全不同的另一层问题）。
+- **什么情况下应该重新考虑**：不预期重新考虑——这是任何"服务不该依赖某个开发者个人机器状态"场景下都成立的通用原则，以后接入其他执行后端也应该默认按这个原则设计，不用等踩坑才想起来。
+
+## Codex 后端在 Windows 上暂不可用，不开 `--dangerously-bypass-approvals-and-sandbox` 绕过
+
+- **日期**：2026-08-09
+- **背景**：解决了配置隔离问题后，`CodexBackend` 依然在全新隔离的 `CODEX_HOME` 下对任何 PowerShell 命令返回 `rejected: blocked by policy`，排查确认是 Codex CLI 在 Windows 上 `workspace-write` 沙箱策略检查器的已知开放问题（上游 bug，GitHub `openai/codex` issue #11885 等），跟本项目的配置无关，见 PITFALLS.md。唯一能绕开的办法是 `--dangerously-bypass-approvals-and-sandbox`，完全跳过审批和沙箱。
+- **选了什么**：**用户拍板**——不开这个 flag，风险太大（"可能会有提示词攻击的问题"）。Codex 后端代码保留（`CodexBackend`、独立 `CODEX_HOME` 隔离都已实现），但标记为"Windows 上暂不可用"，MVP 阶段只用 `ClaudeAgentSDKBackend` 这一条能跑的路径，"先把流程跑通"优先于"两个后端都验证过"。
+- **否掉了什么，为什么**：开 `--dangerously-bypass-approvals-and-sandbox` 硬跑通——官方文档明确这个 flag 只该用于"外部已经做好沙箱隔离"的环境，而我们的"隔离"只是换了个当前工作目录，不是操作系统级隔离，开了之后 Codex 生成的命令对整台机器有无限制读写和网络权限，用户执行agent 的输入本质上部分来自用户的自然语言消息，存在真实的提示词注入风险，即使"纯粹自己用"也不划算用这个代价换 Codex 能跑。
+- **代价 / 已知不足**：Codex 这条执行后端目前完全没有被验证过（从写完代码到现在，一次成功执行都没有——先卡订阅额度，额度问题解决后又卡这个沙箱 bug），"双后端可插拔"这个设计目标目前只有一半是活的。
+- **什么情况下应该重新考虑**：OpenAI 修复这个上游 Windows 沙箱 bug 之后；或者决定换一个不同的 harness/execution 方式跑 Codex（比如 WSL，用户提到过但这次没有验证时间）；或者未来部署到 Linux/macOS 云主机上（这个 bug 描述上像是 Windows/PowerShell 特有的，别的平台可能不受影响，但这个推测未经验证）。

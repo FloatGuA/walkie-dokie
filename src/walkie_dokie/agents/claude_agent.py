@@ -57,6 +57,10 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
             cwd=str(workdir),
             permission_mode="bypassPermissions",
             output_format={"type": "json_schema", "schema": _OUTPUT_SCHEMA},
+            # 隔离模式：不读开发者本机的 ~/.claude 全局配置/CLAUDE.md，行为只由这里
+            # 显式传的 system_prompt/options 决定，不会被个人日常用的 Claude Code
+            # 配置污染（见 PITFALLS.md，Codex 那边同类问题的 --ignore-user-config）。
+            setting_sources=[],
         )
 
         structured: dict | None = None

@@ -43,3 +43,13 @@
 **正确做法**：入口脚本启动时显式把 `sys.stdout`/`sys.stderr` reconfigure 成 `utf-8`（`sys.stdout.reconfigure(encoding="utf-8")`），或者设置环境变量 `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`。项目里统一放在 `src/walkie_dokie/logging_config.py` 的 `setup_logging()` 里做，所有入口脚本启动时调一次，不用每个脚本各自处理。
 
 **判据**：Windows 上跑 Python 脚本，终端或日志文件里中文变问号/乱码方块，但脚本逻辑本身跑通了（没抛异常）——先怀疑这条，不要去查业务逻辑。
+
+## `codex exec` 的 `workspace-write` 沙箱在 Windows 上几乎拦掉所有 PowerShell 命令，且这是上游未修复的 bug，不是我们能配置绕开的
+
+**现象**：`codex exec --sandbox workspace-write` 明确开了写权限，但只要 Codex 试图执行任何 PowerShell 命令（包括完全无害的，比如单纯写一个文件），都会收到 `rejected: blocked by policy`，最终 Codex 只能回复"工作区是只读的，没法执行"，即使任务本身清楚明确、不缺任何信息。表面上像是"意图理解不到位在反复追问"，实际上是执行层面被拦了，Codex 只是把"拒绝原因"包装成了自然语言解释。
+
+**真因**：这是 Codex CLI 在 Windows 上的已知开放问题（GitHub `openai/codex` issue #11885、`openai/codex-plugin-cc` issue #57）——`workspace-write` 沙箱策略检查器在 Windows/PowerShell 路径下几乎拒绝所有命令执行，跟本地有没有自定义 config.toml/AGENTS.md/rules 完全无关（本项目已经排除过：换了全新隔离的 `CODEX_HOME`、用 `-c sandbox_permissions=...` 显式覆盖配置，问题依旧存在）。文档提到的另一个说法是 `config.toml` 的 `sandbox_permissions` 只有"direct CLI path"生效、"app-server path"不生效，但即使按"direct CLI path"配置也没能绕开。
+
+**正确做法**：目前没有能在不牺牲安全性的前提下修复的办法——唯一的绕过方式是 `--dangerously-bypass-approvals-and-sandbox`（完全跳过审批和沙箱），官方文档明确警告这只该用于"外部已经做好沙箱隔离"的环境，而我们的执行只是换了个当前工作目录，不构成真正的操作系统级隔离，开这个 flag 等于让 Codex 生成的命令对整台机器有无限制的读写和网络权限，存在真实的提示词注入风险。**本项目决定不开这个 flag**，Codex 后端在 Windows 上暂不可用，见 DECISION.md。
+
+**判据**：Windows 上用 `codex exec --sandbox workspace-write` 执行任何命令，只要看到 stderr 里出现 `rejected: blocked by policy`（用 `--json` 才能看到这条，不加 `--json` 只会看到 Codex 把拒绝原因转述成自然语言的"信息不全"式回复），直接对应这条已知问题，不用再花时间排查自己的 prompt/config 写得对不对。

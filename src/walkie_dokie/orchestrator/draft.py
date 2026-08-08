@@ -42,6 +42,7 @@ async def generate_draft_task_prompt(accumulated_text: str) -> dict:
         permission_mode="bypassPermissions",
         max_turns=1,
         output_format={"type": "json_schema", "schema": _OUTPUT_SCHEMA},
+        setting_sources=[],  # 隔离模式，见 claude_agent.py 的同一条注释 / PITFALLS.md
     )
     draft: dict | None = None
     async for message in query(prompt=accumulated_text, options=options):
