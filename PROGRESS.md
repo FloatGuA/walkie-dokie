@@ -4,22 +4,37 @@
 
 项目方向：面向中老年人群的多平台机器人办公助手，核心场景是 Word/Excel 文档的生成/编辑/问答（原「物业家政多Agent平台」方向已搁置，见 [DECISION.md](DECISION.md)）。
 
-**MVP 端到端闭环已跑通并验证**：飞书发一句文字指令 → `ClaudeAgentSDKBackend` 用 python-docx 生成 docx → 飞书把文件和文字回复发回用户。平台选型定为飞书自建应用（长连接，见 DECISION.md），执行后端目前只有 Claude 这一条能跑，Codex 卡在订阅额度。`orchestrator/` 还没接入，现在是 `scripts/run_mvp.py` 里的纯线性胶水逻辑。
+**MVP 端到端闭环已跑通并验证，orchestrator 也已接入**：飞书发一句文字指令 → LangGraph 状态机（`orchestrator/`）→ `ClaudeAgentSDKBackend` 用 python-docx 生成 docx → 飞书把文件和文字回复发回用户。每条消息独立工作目录（`var/workspaces/`，持久化不清理）+ 结构化留痕（`var/logs/turns.jsonl`）+ 项目本地日志（`var/logs/walkie-dokie.log`，DEBUG 粒度）。平台选型定为飞书自建应用（长连接，见 DECISION.md），执行后端目前只有 Claude 这一条能跑，Codex 卡在订阅额度。
 
 ## 待处理 / 下一步
 
+- **orchestrator 的"够不够执行"判断目前是假的**：只要有文本就立刻执行，不会真的等信息补全——因为文件接收还没实现，`pending_file` 恒为 `None`，唯一变量是文本，任何文本都满足"够了"。跟下面"防抖 + 任务提示词确认"是同一件事，一起做
+- **同一用户连续快发消息会并发执行，不是排队/合并**：实测过，同一用户几秒内发两条消息，orchestrator 会并发处理成两个独立请求，而不是当成一轮意图的补充。这个和防抖机制强相关，设计已经讨论过：10 秒无新消息才算一轮，攒够了生成 task prompt 草稿，回复用户确认，确认了再派发给执行 agent；用 LangGraph 的 checkpoint/interrupt 做"等确认"这一步暂停。**这是下一步要做的东西**
 - 用户发文件给 bot 这条链路还没实现——`FeishuAdapter._on_message` 目前收到文件消息时 `file` 字段写死 `None`
 - Codex 执行后端订阅额度问题未解决，暂缓，不阻塞主线
-- `orchestrator/`（`SessionState` + `graph.py`）还没接入 `run_mvp.py`，跨消息的会话状态（比如"文件已收到但指令不明确"）目前没有承载
-- `lark_oapi` 自己的 logger 会被我们的 root logger 重复打印一遍（不影响功能，未处理，属于可以顺手修的小事）
+- `lark_oapi` 自己的 logger 会被我们的 root logger 重复打印一遍（不影响功能，未处理）
+- `lark_oapi` 报了个不影响功能的噪音错误：`processor not found, type: im.message.reaction.created_v1`（用户在飞书给消息点了个表情反应，触发了一个我们没注册处理器的事件类型），不影响主流程，未处理
 - 针对"文档办公"场景重新梳理适老化交互设计（旧方向的语音优先设计不完全适用，具体怎么做还没讨论）
 - 周计划/路线图还没细化，留到下一步单独讨论
+- **进程常驻/自动重启**：现在是手动敲命令跑的开发脚本，关终端/重启/崩溃都没人管。用户拍板"这个好做，以后再做"，方案已讨论过（Windows 服务化包装，或挪到云主机 + 进程管理器），暂不实现
+- **部署目标机器未定**：本地先跑通，以后要挪云主机，但云主机是 Linux/macOS/Windows 都还没定，用户明确说"现在还不知道"——先不依赖任何特定 OS 的实现细节
+- **日志粒度后续要调粗**：现在项目早期，`var/logs/walkie-dokie.log` 存 DEBUG 粒度（连第三方库如 websockets 的底层帧都记了），文件用轮转限制了体积（10MB×5）暂时不会失控。用户明确说了等过了高频调试阶段再调粗，不用现在处理
 
 ## 进行中
 
 （无）
 
 ## 已完成
+
+- **orchestrator 接入 + 日志/留痕基础设施**（2026-08-08，已验证：真实在飞书发消息，工作目录/结构化留痕/项目日志三者都确认落盘正确，见 `var/workspaces/feishu_ou_.../20260808/96025e01/请假条.docx` 和对应的 `var/logs/turns.jsonl` 记录）
+  - `src/walkie_dokie/orchestrator/graph.py`：`build_graph()` 用 LangGraph `StateGraph` 实装，两个节点 `collect`（把新消息并入 pending_* 状态）/`execute`（调用执行 agent，记结构化留痕），按 `user_id` 做 checkpoint thread 隔离
+  - `src/walkie_dokie/orchestrator/state.py`：`SessionState` 加回 `platform` 字段（工作目录命名要用）；`result` 字段从直接存 `ExecutionResult` dataclass 改成存 plain dict——碰到 LangGraph checkpointer 对未注册自定义类型的 deprecation 警告，改存 dict 更省心
+  - `src/walkie_dokie/workspace.py`：新增 `create_workspace_dir(platform, user_id)`，执行目录改为 `var/workspaces/{platform}_{user_id}/{日期}/{run_id}/`，不再用 `tempfile.TemporaryDirectory()` 自动销毁——项目早期要能复盘，生成过程要留得住
+  - `src/walkie_dokie/turn_log.py`：新增 `log_turn()`，每轮"输入→输出"结构化记一行 JSONL 到 `var/logs/turns.jsonl`（时间戳/平台/用户/输入/输出/后端/耗时/成功与否），跟人读的日志分开，供以后写脚本查询统计
+  - `src/walkie_dokie/logging_config.py`：加了落盘到 `var/logs/walkie-dokie.log` 的 `RotatingFileHandler`（10MB×5 份），文件里存 DEBUG 粒度、控制台保持 INFO，不再依赖会话临时目录存日志
+  - `src/walkie_dokie/agents/base.py`/`claude_agent.py`/`codex_agent.py`：`ExecutionAgent.run()` 加了 `workdir: Path` 参数，两个后端都不再自己起临时目录，改用调用方传入的工作目录
+  - `src/walkie_dokie/platforms/base.py`：顺手修了一个遗留 bug——`Platform` 类型标注还是 `Literal["wecom", "qq", "wechat"]`，没有 `"feishu"`，跟 `feishu.py` 实际赋的值对不上
+  - `scripts/run_mvp.py`：`asyncio.create_task()` 改成每条消息真正并发派发（之前是线性 `while` 循环）；发现新问题——同一用户连续快发消息现在会并发执行成多个独立请求，不是排队/合并，见下方"待处理"
 
 - **MVP 端到端闭环跑通**（2026-08-08，已验证：真实在飞书里发消息、真实收到生成的 docx 文件和文字回复，日志全链路确认——收消息→执行→上传文件→发文件→发文字回复全部成功）
   - `src/walkie_dokie/platforms/feishu.py`：`FeishuAdapter`，用 `lark-oapi` 官方 SDK 长连接收消息（`P2ImMessageReceiveV1` 事件桥接到 `asyncio.Queue`），REST API 发消息/传文件（`file_key` 机制）。删除了过时的 `wecom.py` 占位

@@ -1,13 +1,24 @@
-from typing import Literal, TypedDict
+from typing import TypedDict
 
-from walkie_dokie.platforms.base import Platform
+from walkie_dokie.platforms.base import IncomingFile
 
 
 class SessionState(TypedDict):
-    platform: Platform
+    """按 user_id 做 checkpoint 的会话状态。
+
+    pending_* 字段跨消息累积：用户可能分几条消息把文件和指令发过来，
+    图里的 collect 节点负责拼，够了才派发给执行 agent。
+    new_* 字段是单次调用图时传入的"这一条新消息带来了什么"，
+    collect 节点消费完就清空，不跨调用持久化。
+    """
+
+    platform: str
     user_id: str
-    pending_file: dict | None
-    instruction: str | None
-    backend: Literal["claude_agent_sdk", "codex"]
-    status: Literal["awaiting_input", "running", "awaiting_confirm", "done"]
-    result_file: dict | None
+    pending_file: IncomingFile | None
+    pending_instruction: str | None
+    new_text: str | None
+    new_file: IncomingFile | None
+    # dict 而不是 ExecutionResult dataclass 直接存——checkpointer 序列化自定义类会报
+    # deprecation 警告（未注册类型），存 plain dict 更省心。字段对齐 ExecutionResult：
+    # reply_text / result_file / result_filename。
+    result: dict | None

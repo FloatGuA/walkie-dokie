@@ -10,3 +10,4 @@ build/
 .langgraph/
 *.log
 scripts/_test_output*
+/var/

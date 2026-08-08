@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
-Platform = Literal["wecom", "qq", "wechat"]
+Platform = Literal["feishu", "wecom", "qq", "wechat"]
 
 
 @dataclass
