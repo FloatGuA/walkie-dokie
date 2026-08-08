@@ -51,7 +51,13 @@ async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dic
 
     result = state.get("result")
     if result is None:
-        # collect 之后没有 pending_instruction（罕见，比如只发了空文件），静默等下一条
+        pending_file = state.get("pending_file")
+        if pending_file is not None:
+            # 飞书发文件时不能带文字，只能分开发——收到文件但还没指令是正常情况，
+            # 得主动回一句，不能沉默，不然用户不知道文件收到没有。
+            await platform.send(
+                user_id, OutboundMessage(text=f"收到文件「{pending_file.filename}」了，请告诉我需要我做什么。")
+            )
         return
 
     if result["result_file"] is not None:
@@ -68,10 +74,17 @@ async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dic
     await platform.send(user_id, OutboundMessage(text=result["reply_text"]))
 
 
-async def dispatch_fresh(graph, platform: FeishuAdapter, user_id: str, combined_text: str) -> None:
+async def dispatch_fresh(
+    graph, platform: FeishuAdapter, user_id: str, combined_text: str, file: IncomingFile | None
+) -> None:
     try:
         state = await graph.ainvoke(
-            {"platform": "feishu", "user_id": user_id, "new_text": combined_text, "new_file": None},
+            {
+                "platform": "feishu",
+                "user_id": user_id,
+                "new_text": combined_text or None,
+                "new_file": file,
+            },
             config={"configurable": {"thread_id": user_id}},
         )
     except Exception:
@@ -94,15 +107,16 @@ async def resume_pending(graph, platform: FeishuAdapter, user_id: str, reply_tex
 
 
 async def handle_event(graph, platform: FeishuAdapter, debouncer: Debouncer, event: InboundEvent) -> None:
-    if not event.text:
+    if not event.text and event.file is None:
         return
 
     snapshot = await graph.aget_state(config={"configurable": {"thread_id": event.user_id}})
     if snapshot.next:
-        # 这个用户正卡在 ask_confirm 等回复——直接当确认/补充处理，不走防抖
-        await resume_pending(graph, platform, event.user_id, event.text)
+        # 这个用户正卡在 ask_confirm 等回复——直接当确认/补充处理，不走防抖。
+        # 确认回复目前只看文字；如果用户这时候发的是文件，忽略文字部分为空的情况。
+        await resume_pending(graph, platform, event.user_id, event.text or "")
     else:
-        debouncer.add(event.user_id, event.text)
+        debouncer.add(event.user_id, event.text, event.file)
 
 
 async def main():
@@ -114,7 +128,7 @@ async def main():
     graph = build_graph(backend, checkpointer=InMemorySaver())
     debouncer = Debouncer(
         DEBOUNCE_WINDOW_SECONDS,
-        on_ready=lambda user_id, text: dispatch_fresh(graph, platform, user_id, text),
+        on_ready=lambda user_id, text, file: dispatch_fresh(graph, platform, user_id, text, file),
     )
 
     platform.start()

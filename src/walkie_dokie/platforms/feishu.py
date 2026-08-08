@@ -10,6 +10,7 @@ from lark_oapi.api.im.v1 import (
     CreateFileRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    GetMessageResourceRequest,
     P2ImMessageReceiveV1,
 )
 
@@ -19,10 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class FeishuAdapter(PlatformAdapter):
-    """飞书自建应用适配器，走长连接接收消息（不需要公网回调地址）。
-
-    文件消息的接收暂未实现——先跑通纯文本指令这条链路，收文件是下一步。
-    """
+    """飞书自建应用适配器，走长连接接收消息（不需要公网回调地址）。"""
 
     def __init__(self, app_id: str, app_secret: str):
         self._client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
@@ -41,20 +39,56 @@ class FeishuAdapter(PlatformAdapter):
     def _on_message(self, data: P2ImMessageReceiveV1) -> None:
         message = data.event.message
         text = None
+        file = None
         if message.message_type == "text":
             text = json.loads(message.content).get("text")
+        elif message.message_type == "file":
+            content = json.loads(message.content)
+            file = self._download_message_file(
+                message_id=message.message_id, file_key=content["file_key"], file_name=content["file_name"]
+            )
+        else:
+            logger.info("收到不支持的消息类型 message_type=%s，忽略", message.message_type)
 
         user_id = data.event.sender.sender_id.open_id
-        logger.info("收到飞书消息 user_id=%s message_type=%s text=%r", user_id, message.message_type, text)
+        logger.info(
+            "收到飞书消息 user_id=%s message_type=%s text=%r file=%r",
+            user_id,
+            message.message_type,
+            text,
+            file.filename if file else None,
+        )
 
         inbound = InboundEvent(
             platform="feishu",
             user_id=user_id,
             text=text,
-            file=None,
+            file=file,
         )
         assert self._loop is not None, "FeishuAdapter.start() 还没调用就收到消息了"
         self._loop.call_soon_threadsafe(self._queue.put_nowait, inbound)
+
+    def _download_message_file(self, message_id: str, file_key: str, file_name: str) -> IncomingFile | None:
+        request = (
+            GetMessageResourceRequest.builder()
+            .message_id(message_id)
+            .file_key(file_key)
+            .type("file")
+            .build()
+        )
+        response = self._client.im.v1.message_resource.get(request)
+        if not response.success():
+            logger.error(
+                "飞书文件下载失败 message_id=%s file_key=%s code=%s msg=%s",
+                message_id,
+                file_key,
+                response.code,
+                response.msg,
+            )
+            return None
+        content = response.file.read()
+        logger.info("飞书文件下载成功 file_name=%s 大小=%d bytes", file_name, len(content))
+        return IncomingFile(filename=file_name, content=content, mime_type="application/octet-stream")
 
     def start(self) -> None:
         """启动长连接监听。必须在 asyncio 事件循环内调用一次，长连接本身跑在后台线程。"""

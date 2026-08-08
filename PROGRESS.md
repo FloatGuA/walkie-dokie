@@ -9,7 +9,7 @@
 ## 待处理 / 下一步
 
 - **执行结果文字里偶尔混入无关内容**：实测有一次 `ClaudeAgentSDKBackend` 的 `reply_text` 末尾多了一句"claude.ai 的 Gmail/Calendar/Drive 连接器尚未授权"之类的提示，跟任务本身无关，只出现过一次，原因未查——如果这段文字被转发给真实用户会很困惑，需要留意会不会重复出现，重复出现的话要查根因（可能是 Claude Agent SDK 环境里某种连接器状态检查漏进了最终回复）
-- 用户发文件给 bot 这条链路还没实现——`FeishuAdapter._on_message` 目前收到文件消息时 `file` 字段写死 `None`
+- **文件问答/总结的效果不太好**：实测让 Claude 总结一份 `worklog.md`，流程全部走通了（收文件→确认→执行→发回结果），但用户反馈总结内容质量不够好。用户明确说"效果问题另说"，先不查，工作流本身通了就行——如果要认真做，大概率要在 draft/执行阶段的 prompt 上下功夫，不是这次的重点
 - **Codex 后端在 Windows 上不可用**：不是订阅额度问题（额度问题已过去），是 Codex CLI `workspace-write` 沙箱在 Windows 上的已知上游 bug，拦掉几乎所有命令执行。用户拍板不开 `--dangerously-bypass-approvals-and-sandbox` 绕过（风险太大，见 DECISION.md）。MVP 阶段只用 Claude 这条后端，Codex 等上游修复或者考虑换 harness / 挪到非 Windows 环境再验证
 - `lark_oapi` 自己的 logger 会被我们的 root logger 重复打印一遍（不影响功能，未处理）
 - `lark_oapi` 报了个不影响功能的噪音错误：`processor not found, type: im.message.reaction.created_v1`（用户在飞书给消息点了个表情反应，触发了一个我们没注册处理器的事件类型），不影响主流程，未处理
@@ -18,12 +18,19 @@
 - **进程常驻/自动重启**：现在是手动敲命令跑的开发脚本，关终端/重启/崩溃都没人管。用户拍板"这个好做，以后再做"，方案已讨论过（Windows 服务化包装，或挪到云主机 + 进程管理器），暂不实现
 - **部署目标机器未定**：本地先跑通，以后要挪云主机，但云主机是 Linux/macOS/Windows 都还没定，用户明确说"现在还不知道"——先不依赖任何特定 OS 的实现细节
 - **日志粒度后续要调粗**：现在项目早期，`var/logs/walkie-dokie.log` 存 DEBUG 粒度（连第三方库如 websockets 的底层帧都记了），文件用轮转限制了体积（10MB×5）暂时不会失控。用户明确说了等过了高频调试阶段再调粗，不用现在处理
+- **用户级 memory 还没做**：两层都缺——① orchestrator 的会话状态只在内存里（`InMemorySaver()`），进程一重启就丢，跟"记住用户是谁"无关，纯粹是重启存活的问题；② 记住具体用户的信息（姓名/部门/常用称呼这类）减少重复问——今天测试时因为不知道真实信息，Claude 只能编"张伟""李明经理"这类占位符。Claude Agent SDK 不提供这两层中的任何一层（尤其我们还特意做了 `setting_sources=[]` 隔离），得自己做。用户明确表示"先把基础的搭建起来"，这个先缓一缓
 
 ## 进行中
 
 （无）
 
 ## 已完成
+
+- **文件接收链路打通 + 两个交互 bug 修复**（2026-08-09，已验证：真实发 `worklog.md` 给 bot 让它总结，`var/workspaces/feishu_ou_.../20260809/f643acf3/` 下同时存了输入文件 `worklog.md` 和输出文件 `worklog_summary.docx`，`turns.jsonl` 里对应的 `run_id` 能直接定位到这个目录——按 session 找回输入输出的诉求确认可行）
+  - `src/walkie_dokie/platforms/feishu.py`：`_on_message` 收到 `message_type == "file"` 时，调用飞书"获取消息中的资源文件" API（`client.im.v1.message_resource`，按 `message_id` + `file_key` 下载）拿到真实字节，填进 `InboundEvent.file`
+  - 修了一个真实存在、用户实测发现的 bug：**飞书发消息文件和文字不能一起发，只能分开**，所以"只收到文件、没收到指令"是必然会发生的正常情况，但原来的 orchestrator 在这种情况下直接静默结束、不回复用户，跟"什么都没收到"没区别。`scripts/run_mvp.py` 的 `deliver_graph_output` 现在检测到"有 `pending_file` 但没有 `result`"时，主动回一句"收到文件「xxx」了，请告诉我需要我做什么"
+  - 修了另一个真实 bug：`orchestrator/graph.py` 的 `_is_confirmation` 原来是精确匹配一个词表，用户回"是的"（词表里只有"是"）没被识别成确认，被当成"还在补充说明"重新生成了一遍草稿。改成前缀匹配（`str.startswith(tuple)`），"是的""好的呢"这类自然说法都能过
+  - `src/walkie_dokie/orchestrator/draft.py`：draft 生成失败时的日志从只打一个 `message.result`（经常是 `None`，没有诊断价值）扩展成打 `subtype`/`stop_reason`/`terminal_reason`/`api_error_status`/`errors`/`result` 全部字段
 
 - **执行后端配置隔离排查**（2026-08-09，已验证隔离本身生效：`ClaudeAgentSDKBackend`/draft 加 `setting_sources=[]` 后不再受影响；`CodexBackend` 切到独立 `CODEX_HOME` 后确认不再读取开发者个人的 `~/.codex` 内容——但排查过程中发现 Codex 在 Windows 上还有一个隔离之外的、更深的沙箱执行 bug，未解决，见上方"待处理"和 DECISION.md）
   - 起因：`CodexBackend` 测试时回复混入无关前缀"FGuA"，查到是开发者本机 `~/.codex/AGENTS.md` 的个人全局约束泄漏

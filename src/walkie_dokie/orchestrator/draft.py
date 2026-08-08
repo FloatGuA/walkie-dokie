@@ -33,9 +33,16 @@ _OUTPUT_SCHEMA = {
 }
 
 
-async def generate_draft_task_prompt(accumulated_text: str) -> dict:
-    """返回 {"task_summary": str, "missing_info": list[str]}。"""
-    logger.info("生成 task prompt 草稿，accumulated_text=%r", accumulated_text)
+async def generate_draft_task_prompt(accumulated_text: str, input_filename: str | None = None) -> dict:
+    """返回 {"task_summary": str, "missing_info": list[str]}。
+
+    input_filename 不为空表示用户已经发过一个文件——草稿要知道这件事，
+    不然容易把"文件"错误地列进 missing_info（用户明明发了）。
+    """
+    prompt = accumulated_text or ""
+    if input_filename:
+        prompt += f"\n\n（用户已经发来一个文件：{input_filename}，不要把'文件'当成缺失信息再问一遍。）"
+    logger.info("生成 task prompt 草稿，accumulated_text=%r input_filename=%r", accumulated_text, input_filename)
     options = ClaudeAgentOptions(
         system_prompt=_SYSTEM_PROMPT,
         allowed_tools=[],
@@ -45,14 +52,26 @@ async def generate_draft_task_prompt(accumulated_text: str) -> dict:
         setting_sources=[],  # 隔离模式，见 claude_agent.py 的同一条注释 / PITFALLS.md
     )
     draft: dict | None = None
-    async for message in query(prompt=accumulated_text, options=options):
+    last_result_message: ResultMessage | None = None
+    async for message in query(prompt=prompt, options=options):
         if isinstance(message, ResultMessage):
+            last_result_message = message
             if message.is_error:
-                logger.error("draft 生成失败：%s", message.result)
-                raise RuntimeError(f"draft 生成失败：{message.result}")
+                logger.error(
+                    "draft 生成失败：subtype=%r stop_reason=%r terminal_reason=%r "
+                    "api_error_status=%r errors=%r result=%r",
+                    message.subtype,
+                    message.stop_reason,
+                    message.terminal_reason,
+                    message.api_error_status,
+                    message.errors,
+                    message.result,
+                )
+                raise RuntimeError(f"draft 生成失败：subtype={message.subtype} errors={message.errors}")
             draft = message.structured_output
 
     if draft is None:
+        logger.error("draft 生成没有返回结构化结果，最后一条 ResultMessage=%r", last_result_message)
         raise RuntimeError("draft 生成没有返回结构化结果")
 
     logger.info("task prompt 草稿：%r", draft)

@@ -35,14 +35,15 @@ from walkie_dokie.workspace import create_workspace_dir
 
 logger = logging.getLogger(__name__)
 
-_CONFIRM_WORDS = {
-    "是", "对", "对的", "确认", "没错", "可以", "行", "嗯", "嗯嗯", "好", "好的", "ok", "okay", "yes", "y",
-}
+_CONFIRM_PREFIXES = (
+    "是", "对", "确认", "没错", "可以", "行", "嗯", "好", "ok", "okay", "yes", "y",
+)
 
 
 def _is_confirmation(reply: str) -> bool:
-    """机械判断，不是 NLU 意图分类——只认这几个词，别的一律当"还在补充信息"。"""
-    return reply.strip().lower() in _CONFIRM_WORDS
+    """机械判断，不是 NLU 意图分类——前缀匹配这几个词（"是的""好的呢"这类都算），
+    别的一律当"还在补充信息"。"""
+    return reply.strip().lower().startswith(_CONFIRM_PREFIXES)
 
 
 def _collect(state: SessionState) -> dict:
@@ -63,7 +64,10 @@ def _has_instruction(state: SessionState) -> str:
 
 
 async def _draft(state: SessionState) -> dict:
-    draft = await generate_draft_task_prompt(state["pending_instruction"])
+    file = state.get("pending_file")
+    draft = await generate_draft_task_prompt(
+        state["pending_instruction"], input_filename=file.filename if file else None
+    )
     return {"draft_task_prompt": draft}
 
 
