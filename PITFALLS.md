@@ -63,3 +63,23 @@
 **正确做法**：处理消息的状态机必须把"只收到文件、没收到指令"和"只收到指令、没收到文件"都当成正常的中间状态来设计，不能假设两者会在同一条消息里一起到达；而且收到单独一条文件消息时必须主动给用户反馈（哪怕只是"收到了，请告诉我要做什么"），不能因为"信息还不全"就沉默不回复——沉默会让用户以为发送失败了。
 
 **判据**：设计任何"文件+指令"两部分输入的交互流程之前，先确认目标 IM 平台的客户端到底支不支持"发文件时同时带文字"，不要想当然。
+
+## Claude Agent SDK 用 `output_format` 要结构化输出时，`max_turns=1` 偶尔会被判超限报错
+
+**现象**：`query()` 配了 `output_format={"type": "json_schema", ...}` 和 `max_turns=1`，绝大多数调用正常返回结构化结果，但偶尔会报错，`ResultMessage.result` 是 `None`（没有诊断价值，容易一头雾水）。打印 `subtype`/`stop_reason`/`terminal_reason`/`errors` 这些字段才能看清：`subtype='error_max_turns'`、`stop_reason='tool_use'`、`errors=['Reached maximum number of turns (1)']`。
+
+**真因**：`output_format` 要求的结构化输出，内部是靠模型调用一次工具来交付最终答案实现的（不是直接在文本里返回 JSON）。这次工具调用本身要占一轮，如果模型在给出这次工具调用之前还想先"思考"一下（哪怕只是很短的一步），就需要 2 轮才能完成，`max_turns=1` 这时候会把这次调用直接判定超限失败，而不是等它继续。
+
+**正确做法**：给结构化输出的调用留够余量——实测 `max_turns=2` 依然撞见过超限报错，轮数波动比预期大，不值得为了省一点 token 精确调这个数字。`allowed_tools=[]` 不能防住这个问题——结构化输出用的那次工具调用是 SDK/CLI 内部机制，不受 `allowed_tools` 白名单约束。既然工具本来就被 `allowed_tools=[]` 卡死了，多给几轮不会导致失控探索，直接给够（比如 6）就行，不用来回试小数字。
+
+**判据**：`output_format` + 较小的 `max_turns` 组合，只要看到 `ResultMessage.is_error=True` 且 `result=None`，先打印 `subtype`/`errors` 字段确认是不是 `error_max_turns`，不要凭空猜测是 prompt 写得不对。
+
+## 同一用户的消息在 execute 节点还没跑完时又发一条，会对同一个 LangGraph thread 触发并发 `ainvoke()`，导致 checkpoint 状态错乱（不报错，更隐蔽）
+
+**现象**：用 `asyncio.create_task` 让不同用户互不阻塞是对的，但同一个用户在"图正在跑 `_execute`"这段时间又发一条新消息，会被当成一次全新请求，对**同一个 `thread_id`** 再发起一次 `ainvoke()`。两次调用各自独立完成、都不报错，但最终 checkpoint 状态是错的——先完成的那次执行结果可能在最终状态里丢失，用户会先收到"完成了"，紧接着又收到一个跟原始任务对不上的新确认问题，状态还卡在这个新问题上。
+
+**真因**：`aget_state().next` 只在图真正暂停在 `interrupt()` 时才非空——`_execute` 节点正在跑（哪怕跑很久）不算暂停，所以判断"这个用户是不是正卡在等确认"这个检查会漏掉"正在执行中"这个窗口，把这期间的新消息误判成全新请求处理。LangGraph 的 checkpointer 不会替你把同一个 thread 的并发调用排队或加锁，两次 `ainvoke()` 各自读、各自写，后写的会覆盖/丢失先写的部分字段。
+
+**正确做法**：按 `user_id` 加一把 `asyncio.Lock`（见 `orchestrator/locks.py` 的 `UserLocks`），所有对同一个 `thread_id` 的 `ainvoke()`/`Command(resume=...)` 调用都要先拿到这个用户的锁才能发起，不同用户的锁互不相干，不影响跨用户并发。
+
+**判据**：任何用 LangGraph checkpointer 按 `thread_id` 隔离多用户状态的场景，只要允许"用户在一次调用还没返回时又发起新的一次调用"，就要检查有没有对同一个 thread 做互斥——这不是 LangGraph 自动帮你做的事。

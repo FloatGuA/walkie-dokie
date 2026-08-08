@@ -47,7 +47,10 @@ async def generate_draft_task_prompt(accumulated_text: str, input_filename: str 
         system_prompt=_SYSTEM_PROMPT,
         allowed_tools=[],
         permission_mode="bypassPermissions",
-        max_turns=1,
+        # 结构化输出（output_format）内部靠工具调用交付最终答案，实测轮数波动
+        # 比预期大，max_turns=1/2 都撞见过被判超限报错（见 PITFALLS.md）。
+        # allowed_tools=[] 已经防住了失控调用，这里不需要卡轮数，给够余量。
+        max_turns=6,
         output_format={"type": "json_schema", "schema": _OUTPUT_SCHEMA},
         setting_sources=[],  # 隔离模式，见 claude_agent.py 的同一条注释 / PITFALLS.md
     )

@@ -6,7 +6,7 @@
 
 所有执行后端（`agents/claude_agent.py` 的 `ClaudeAgentSDKBackend`、`agents/codex_agent.py` 的 `CodexBackend`）统一遵循同一个协议，接口定义见 `agents/base.py`：
 
-1. 每次调用在一个独立的 `tempfile.TemporaryDirectory()` 里跑。有输入文件的话先写进这个目录，指令里明确要求后端在这个目录内用代码（python-docx/openpyxl）完成任务，产出文件也存这里。
+1. 每次调用在一个独立的工作目录里跑，由调用方通过 `workspace.create_workspace_dir(platform, user_id)` 创建并传入 `run(..., workdir=...)`——不是执行后端自己起临时目录，也不用完即焚，落在 `var/workspaces/{platform}_{user_id}/{日期}/{run_id}/`，方便复盘（见 DECISION.md）。有输入文件的话先写进这个目录，指令里明确要求后端在这个目录内用代码（python-docx/openpyxl）完成任务，产出文件也存这里。
 2. 后端必须返回结构化 JSON：`{"reply_text": string, "filename": string}`，`filename` 为空字符串表示没有生成文件。两个后端各自的结构化输出机制不同——Claude Agent SDK 用 `ClaudeAgentOptions(output_format={"type": "json_schema", "schema": ...})`，Codex 用 `codex exec --output-schema`——但对上层暴露的都是同一个 `ExecutionResult` dataclass。
 3. 调用方按 `filename` 去临时目录里读文件。**如果后端汇报的文件名在目录里找不到，直接抛错并把目录实际内容列出来**，不静默兜底——这条是踩出来的：Claude 曾经在 `reply_text` 里说完成了，`filename` 也给了，但实际保存的文件名跟汇报的不一致，早期实现直接 `read_bytes()` 导致裸 `FileNotFoundError`，现在改成先检查存在性、报错时带上目录实际内容，方便下次直接定位。
 
@@ -24,3 +24,11 @@
 - `receive()` 就是 `await queue.get()`
 
 这个模式不是飞书专用的。以后任何"SDK 是回调/轮询风格，但我们的接口要求 async pull"的场景（比如后续如果接个人微信 `wxauto`，它的消息监听也不是天然 async 的）都可以照搬这个桥接方式，不用重新设计。
+
+## orchestrator：对同一个 LangGraph thread 的调用必须按 user_id 加锁
+
+`orchestrator/graph.py` 用 `checkpointer` 按 `thread_id`（即 `user_id`）隔离每个用户的会话状态，`scripts/run_mvp.py` 用 `asyncio.create_task` 让不同用户的消息并发处理——这两点组合起来有一个**不是 LangGraph 自动保证**的前提：同一个 `thread_id` 不能被并发 `ainvoke()`。
+
+实测验证过：用户在 `_execute` 节点还没跑完时又发一条消息，会被误判成"没有在等确认"（`aget_state().next` 只在图暂停在 `interrupt()` 时才非空，节点正在执行不算），从而对同一个 `thread_id` 发起第二次并发 `ainvoke()`。两次调用都不报错，但会各自独立读写同一份 checkpoint，导致其中一次的结果在最终状态里丢失、状态卡在跟原始任务对不上的地方。
+
+**规则**：任何要对某个 `thread_id` 发起 `ainvoke()`/`Command(resume=...)` 的地方，都必须先拿到 `orchestrator/locks.py` 里 `UserLocks.get(user_id)` 返回的锁。以后新增别的入口调用这个图（不只是 `run_mvp.py` 现在的 `dispatch_fresh`/`resume_pending` 两处）时，这条规则同样适用，不能假设 LangGraph 会替你处理并发。

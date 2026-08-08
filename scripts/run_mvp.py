@@ -24,6 +24,7 @@ from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
 from walkie_dokie.logging_config import setup_logging
 from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.debounce import Debouncer
+from walkie_dokie.orchestrator.locks import UserLocks
 from walkie_dokie.platforms.base import IncomingFile, InboundEvent, OutboundMessage
 from walkie_dokie.platforms.feishu import FeishuAdapter
 
@@ -75,38 +76,49 @@ async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dic
 
 
 async def dispatch_fresh(
-    graph, platform: FeishuAdapter, user_id: str, combined_text: str, file: IncomingFile | None
+    graph,
+    platform: FeishuAdapter,
+    user_id: str,
+    combined_text: str,
+    file: IncomingFile | None,
+    locks: UserLocks,
 ) -> None:
-    try:
-        state = await graph.ainvoke(
-            {
-                "platform": "feishu",
-                "user_id": user_id,
-                "new_text": combined_text or None,
-                "new_file": file,
-            },
-            config={"configurable": {"thread_id": user_id}},
-        )
-    except Exception:
-        logger.exception("orchestrator 处理失败 user_id=%s", user_id)
-        await platform.send(user_id, OutboundMessage(text="处理失败，稍后再试一下"))
-        return
+    async with locks.get(user_id):
+        try:
+            state = await graph.ainvoke(
+                {
+                    "platform": "feishu",
+                    "user_id": user_id,
+                    "new_text": combined_text or None,
+                    "new_file": file,
+                },
+                config={"configurable": {"thread_id": user_id}},
+            )
+        except Exception:
+            logger.exception("orchestrator 处理失败 user_id=%s", user_id)
+            await platform.send(user_id, OutboundMessage(text="处理失败，稍后再试一下"))
+            return
     await deliver_graph_output(platform, user_id, state)
 
 
-async def resume_pending(graph, platform: FeishuAdapter, user_id: str, reply_text: str) -> None:
-    try:
-        state = await graph.ainvoke(
-            Command(resume=reply_text), config={"configurable": {"thread_id": user_id}}
-        )
-    except Exception:
-        logger.exception("orchestrator 恢复失败 user_id=%s", user_id)
-        await platform.send(user_id, OutboundMessage(text="处理失败，稍后再试一下"))
-        return
+async def resume_pending(
+    graph, platform: FeishuAdapter, user_id: str, reply_text: str, locks: UserLocks
+) -> None:
+    async with locks.get(user_id):
+        try:
+            state = await graph.ainvoke(
+                Command(resume=reply_text), config={"configurable": {"thread_id": user_id}}
+            )
+        except Exception:
+            logger.exception("orchestrator 恢复失败 user_id=%s", user_id)
+            await platform.send(user_id, OutboundMessage(text="处理失败，稍后再试一下"))
+            return
     await deliver_graph_output(platform, user_id, state)
 
 
-async def handle_event(graph, platform: FeishuAdapter, debouncer: Debouncer, event: InboundEvent) -> None:
+async def handle_event(
+    graph, platform: FeishuAdapter, debouncer: Debouncer, locks: UserLocks, event: InboundEvent
+) -> None:
     if not event.text and event.file is None:
         return
 
@@ -114,7 +126,7 @@ async def handle_event(graph, platform: FeishuAdapter, debouncer: Debouncer, eve
     if snapshot.next:
         # 这个用户正卡在 ask_confirm 等回复——直接当确认/补充处理，不走防抖。
         # 确认回复目前只看文字；如果用户这时候发的是文件，忽略文字部分为空的情况。
-        await resume_pending(graph, platform, event.user_id, event.text or "")
+        await resume_pending(graph, platform, event.user_id, event.text or "", locks)
     else:
         debouncer.add(event.user_id, event.text, event.file)
 
@@ -126,9 +138,10 @@ async def main():
     platform = FeishuAdapter(app_id, app_secret)
     backend = ClaudeAgentSDKBackend()
     graph = build_graph(backend, checkpointer=InMemorySaver())
+    locks = UserLocks()
     debouncer = Debouncer(
         DEBOUNCE_WINDOW_SECONDS,
-        on_ready=lambda user_id, text, file: dispatch_fresh(graph, platform, user_id, text, file),
+        on_ready=lambda user_id, text, file: dispatch_fresh(graph, platform, user_id, text, file, locks),
     )
 
     platform.start()
@@ -136,7 +149,7 @@ async def main():
 
     while True:
         event = await platform.receive()
-        asyncio.create_task(handle_event(graph, platform, debouncer, event))
+        asyncio.create_task(handle_event(graph, platform, debouncer, locks, event))
 
 
 asyncio.run(main())
