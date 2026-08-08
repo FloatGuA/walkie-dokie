@@ -26,6 +26,14 @@
 
 ## 已完成
 
+- **搭起 pytest 自检套件**（2026-08-09，已验证：`pytest tests/` 22 项全过，1.76 秒跑完，不依赖网络/真实 API/`claude login`）
+  - `tests/test_debounce.py`：`Debouncer` 的窗口触发、多消息合并+重置计时器、文件文字分开到达再合并、不同用户互不干扰
+  - `tests/test_locks.py`：`UserLocks` 同用户拿同一把锁、不同用户互不阻塞、并发访问确实被串行化——这条直接对应昨天验证过的并发竞态修复，以后回归就靠它守
+  - `tests/test_graph.py`：`collect→draft→ask_confirm→execute` 全流程（用 `FakeAgent` + monkeypatch 掉 `create_workspace_dir`/`log_turn`/`generate_draft_task_prompt`，不碰真实文件系统和 API）、文件单独到达不触发执行、拒绝确认会循环回草稿不执行、`_is_confirmation` 前缀匹配的参数化测试（含"是的"这个之前修过的 bug）
+  - `pyproject.toml` 新增 `dev` extra（`pytest`/`pytest-asyncio`）和 `[tool.pytest.ini_options]`
+  - 测试怎么 mock 图的三个真实依赖，写进了 TECHNICAL.md，以后加新测试直接抄
+  - 顺手更新了 README.md 几处过时内容（"orchestrator 还没接入"、"临时目录"、"Codex 卡订阅额度"，都已经不是事实了）
+
 - **验证并修复"同一用户并发写同一 checkpoint thread"的竞态**（2026-08-09，已用脚本验证：假执行后端 + 真实 `graph.ainvoke()` 制造竞态场景，加锁前确认会复现状态错乱，加锁后确认干净——不同任务的 result 不再互相覆盖，脚本验证完已删除）
   - `src/walkie_dokie/orchestrator/locks.py`：新增 `UserLocks`，按 `user_id` 分 `asyncio.Lock`，`scripts/run_mvp.py` 的 `dispatch_fresh`/`resume_pending` 两个发起 `ainvoke()` 的地方都改成先拿锁。TECHNICAL.md 记了这条规则，以后新增别的调用图的入口也要遵守
   - 顺带定位并修了另一个之前遗留的问题：`orchestrator/draft.py` 的 `max_turns=1`（后来 2 也不够）会偶尔被结构化输出内部的工具调用撞上"轮数超限"报错，之前那次神秘的"draft 生成失败：None"就是这个——诊断信息升级后（打 `subtype`/`errors` 等字段）这次直接看清了根因，改成 `max_turns=6`，见 PITFALLS.md

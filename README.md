@@ -10,7 +10,7 @@
 
 ## 现状
 
-MVP 端到端闭环已跑通：飞书发一句话 → Claude Agent SDK 生成文档 → 飞书把文件发回来。`orchestrator/` 还没接入，目前是 `scripts/run_mvp.py` 里的线性胶水逻辑。详细进度见 [PROGRESS.md](PROGRESS.md)。
+MVP 端到端闭环已跑通：飞书发消息（文字/文件）→ orchestrator（LangGraph：防抖攒消息 → 生成任务草稿 → 列出缺失信息等确认 → 执行）→ Claude Agent SDK 生成/编辑/总结文档 → 飞书把文件和回复发回来。详细进度见 [PROGRESS.md](PROGRESS.md)。
 
 ## 安装（开发环境）
 
@@ -18,7 +18,12 @@ MVP 端到端闭环已跑通：飞书发一句话 → Claude Agent SDK 生成文
 pip install -e .
 ```
 
-需要 Python 3.11+，且本机要能跑通 `claude login`（Claude Agent SDK 走订阅鉴权，见 PITFALLS.md）。
+需要 Python 3.11+，且本机要能跑通 `claude login`（Claude Agent SDK 走订阅鉴权，见 PITFALLS.md）。开发时要跑测试的话：
+
+```bash
+pip install -e ".[dev]"
+pytest tests/
+```
 
 ## 运行 MVP
 
@@ -34,8 +39,8 @@ python scripts/run_mvp.py
 
 | 层 | 目录 | 职责 |
 |---|---|---|
-| 平台适配层 | `src/walkie_dokie/platforms/` | 把飞书等平台的消息统一转成内部 Event（`feishu.py` 已实装，走长连接） |
-| 编排层 | `src/walkie_dokie/orchestrator/` | LangGraph 管理跨消息的会话状态机（等待指令/执行中/等待确认/完成）——还没接入，见 PROGRESS.md |
-| 执行层 | `src/walkie_dokie/agents/` | 可插拔的 coding agent 执行后端（Claude Agent SDK 已跑通 / Codex 卡在订阅额度），在临时目录里写代码完成文档操作 |
+| 平台适配层 | `src/walkie_dokie/platforms/` | 把飞书等平台的消息统一转成内部 Event（`feishu.py` 已实装，走长连接，收发文字/文件都支持） |
+| 编排层 | `src/walkie_dokie/orchestrator/` | LangGraph 状态机：防抖攒消息 → 生成任务草稿 → 等用户确认 → 执行，按用户加锁避免并发写同一会话状态 |
+| 执行层 | `src/walkie_dokie/agents/` | 可插拔的 coding agent 执行后端（Claude Agent SDK 已跑通 / Codex 在 Windows 上因上游沙箱 bug 暂不可用），在独立工作目录（`var/workspaces/`，不自动清理）里写代码完成文档操作 |
 
 每层为什么这么划分、否掉了哪些方案，见 [DECISION.md](DECISION.md)；`ExecutionAgent` 的临时目录 + 结构化输出协议怎么设计的，见 [TECHNICAL.md](TECHNICAL.md)。

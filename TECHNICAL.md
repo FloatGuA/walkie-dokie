@@ -2,7 +2,7 @@
 
 三层分工（平台适配层 / 编排层 / 执行层）的概览见 [README.md](README.md) 的架构表格，这里不重复。本文档只记跨模块的稳定约定——半年后应该还成立、且读代码读不出全貌的那种。
 
-## ExecutionAgent 契约：临时目录 + 结构化输出
+## ExecutionAgent 契约：独立工作目录 + 结构化输出
 
 所有执行后端（`agents/claude_agent.py` 的 `ClaudeAgentSDKBackend`、`agents/codex_agent.py` 的 `CodexBackend`）统一遵循同一个协议，接口定义见 `agents/base.py`：
 
@@ -32,3 +32,14 @@
 实测验证过：用户在 `_execute` 节点还没跑完时又发一条消息，会被误判成"没有在等确认"（`aget_state().next` 只在图暂停在 `interrupt()` 时才非空，节点正在执行不算），从而对同一个 `thread_id` 发起第二次并发 `ainvoke()`。两次调用都不报错，但会各自独立读写同一份 checkpoint，导致其中一次的结果在最终状态里丢失、状态卡在跟原始任务对不上的地方。
 
 **规则**：任何要对某个 `thread_id` 发起 `ainvoke()`/`Command(resume=...)` 的地方，都必须先拿到 `orchestrator/locks.py` 里 `UserLocks.get(user_id)` 返回的锁。以后新增别的入口调用这个图（不只是 `run_mvp.py` 现在的 `dispatch_fresh`/`resume_pending` 两处）时，这条规则同样适用，不能假设 LangGraph 会替你处理并发。
+
+## 测试图（`orchestrator/graph.py`）不用真实依赖
+
+`tests/test_graph.py` 是写新图相关测试时的参考模板，三个东西都要换成假的，不然测试会真的调 Claude API、真的读写磁盘、跑得慢还要花钱：
+
+- `checkpointer` 传 `InMemorySaver()`（`build_graph()` 本来就是可注入的，不用改生产代码）
+- `create_workspace_dir`/`log_turn` 用 `monkeypatch.setattr("walkie_dokie.orchestrator.graph.xxx", ...)` 换掉——这两个是在 `graph.py` 里按名字导入的模块级函数，patch 的目标是 `graph` 模块里的引用，不是原始定义的模块，不然 patch 不生效
+- `generate_draft_task_prompt` 同样用 `monkeypatch` 换成返回固定 `{"task_summary": ..., "missing_info": [...]}` 的假函数，不调真实模型
+- 执行后端用一个实现了 `ExecutionAgent` 接口的 `FakeAgent`（记录被调用的 `instruction`，方便断言），不用真的 `ClaudeAgentSDKBackend`/`CodexBackend`
+
+这样一套图相关的测试能在秒级跑完，`pytest tests/` 不依赖网络、不依赖 `claude login`、不产生真实费用。

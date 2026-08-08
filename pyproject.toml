@@ -13,6 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 # 执行后端二选一或都装；Codex 走 CLI/子进程调用，暂无需专门的 pip 依赖。
 claude = ["claude-agent-sdk"]
+dev = ["pytest", "pytest-asyncio"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -20,3 +21,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
