@@ -4,7 +4,7 @@
 
 项目方向：面向中老年人群的多平台机器人办公助手，核心场景是 Word/Excel 文档的生成/编辑/问答（原「物业家政多Agent平台」方向已搁置，见 [DECISION.md](DECISION.md)）。
 
-**MVP 端到端闭环已跑通并验证，orchestrator 也已接入，防抖+确认环节也跑通了**：飞书发一句文字指令 → LangGraph 状态机（`orchestrator/`：防抖攒消息 → 生成任务草稿 → 列出缺失信息等用户确认 → 确认后强制执行不再追问）→ `ClaudeAgentSDKBackend` 用 python-docx 生成 docx → 飞书把文件和文字回复发回用户。每条消息独立工作目录（`var/workspaces/`，持久化不清理）+ 结构化留痕（`var/logs/turns.jsonl`）+ 项目本地日志（`var/logs/walkie-dokie.log`，DEBUG 粒度）。平台选型定为飞书自建应用（长连接，见 DECISION.md），执行后端目前只有 Claude 这一条能跑，Codex 卡在订阅额度。
+**MVP 端到端闭环已跑通并验证，orchestrator 也已接入，防抖+确认环节也跑通了，用户 memory 两层都做了**：飞书发消息（文字/文件）→ LangGraph 状态机（`orchestrator/`：防抖攒消息 → 生成任务草稿（带已知用户信息）→ 列出缺失信息等用户确认 → 确认后强制执行不再追问，执行完被动提取新事实并回显给用户）→ `ClaudeAgentSDKBackend` 用 python-docx 生成/编辑/总结文档 → 飞书把文件和文字回复发回用户。会话状态用 `AsyncSqliteSaver` 落盘（`var/checkpoints.db`），能扛进程重启（防抖缓冲区除外，见下方"待处理"）。每条消息独立工作目录（`var/workspaces/`，持久化不清理）+ 结构化留痕（`var/logs/turns.jsonl`）+ 项目本地日志（`var/logs/walkie-dokie.log`，DEBUG 粒度）+ `pytest tests/` 自检套件。平台选型定为飞书自建应用（长连接，见 DECISION.md），执行后端目前只有 Claude 这一条能跑，Codex 在 Windows 上因上游沙箱 bug 不可用。
 
 ## 待处理 / 下一步
 
@@ -18,13 +18,25 @@
 - **进程常驻/自动重启**：现在是手动敲命令跑的开发脚本，关终端/重启/崩溃都没人管。用户拍板"这个好做，以后再做"，方案已讨论过（Windows 服务化包装，或挪到云主机 + 进程管理器），暂不实现
 - **部署目标机器未定**：本地先跑通，以后要挪云主机，但云主机是 Linux/macOS/Windows 都还没定，用户明确说"现在还不知道"——先不依赖任何特定 OS 的实现细节
 - **日志粒度**：websocket 帧级噪音（PING/PONG）已经调粗，其余（`walkie_dokie.*`、urllib3 等）还是 DEBUG 粒度，用户明确说了等过了高频调试阶段再整体调粗，不用现在处理
-- **用户级 memory 还没做**：两层都缺——① orchestrator 的会话状态只在内存里（`InMemorySaver()`），进程一重启就丢，跟"记住用户是谁"无关，纯粹是重启存活的问题；② 记住具体用户的信息（姓名/部门/常用称呼这类）减少重复问——今天测试时因为不知道真实信息，Claude 只能编"张伟""李明经理"这类占位符。Claude Agent SDK 不提供这两层中的任何一层（尤其我们还特意做了 `setting_sources=[]` 隔离），得自己做。用户明确表示"先把基础的搭建起来"，这个先缓一缓
+- **服务不可用时用户端完全无感知**：现在是长连接架构，没有同步的请求/响应，进程崩溃/被杀/断电时，用户发的消息会被飞书那边默默丢掉，界面上看不出"服务不可用"和"机器人半天不回复"有什么区别。已包住的异常路径（`dispatch_fresh`/`resume_pending` 内部）用户能收到"处理失败"，但进程整个挂掉/被杀这种情况完全没有任何反馈机制。要做的话需要一个独立的健康监控/通知机制（主进程恢复后主动给受影响用户发一条说明），现在完全没有，是新工作量
+- **防抖缓冲区不持久化，进程重启会丢消息**：2026-08-09 实测发现——即使 orchestrator 的会话状态已经用 `SqliteSaver` 落盘（见下方"已完成"），`Debouncer` 的缓冲区（`_buffers`/`_files`/`_tasks`）是纯内存状态，不在 checkpoint 里。用户发消息后如果正好卡在 10 秒防抖窗口内，这时候进程被杀/崩溃，这条消息就真的丢了，跟会话状态有没有持久化无关。跟上面"服务不可用无感知"是相关但独立的两个缺口——就算做了健康监控通知，防抖窗口内丢的消息本身也追不回来
+- **提取 prompt 会把"用户怎么称呼机器人"误当成"用户自己的姓名"**：实测"你是小帮，是我的智能助手"被提取成了用户的第二个姓名字段，不是幻觉，是 prompt 没有把"用户自己的身份信息"和"用户对机器人的称呼"分开，需要在 `orchestrator/memory.py` 的 `_EXTRACT_SYSTEM_PROMPT` 里明确排除后者
 
 ## 进行中
 
 （无）
 
 ## 已完成
+
+- **用户 memory 两层 + 会话持久化**（2026-08-09，已验证：`memory.extract_facts()` 直接单测过，能正确从"我是浮瓜，是这个项目的开发者"提取出姓名/职位；`AsyncSqliteSaver` 落盘位置和启动日志确认过。**完整的飞书端到端链路——防抖→草稿→确认→执行→提取→回显——这一串目前还没有一次成功跑完过**，上次实测卡在防抖缓冲区丢消息，见下方"待处理"，效果验证还差最后一步）
+  - 层 1（会话持久化）：`scripts/run_mvp.py` 的 checkpointer 从 `InMemorySaver()` 换成 `AsyncSqliteSaver.from_conn_string(var/checkpoints.db)`，启动时 `await checkpointer.setup()` 建表
+  - 层 2（用户事实记忆）：新增 `src/walkie_dokie/orchestrator/memory.py`——`load_facts`/`save_facts` 按 `{platform}_{user_id}.json` 存取（`var/memory/`），`extract_facts()` 执行完成后被动提取个人身份类事实
+  - 提取模型选型走了一圈弯路：先试本地 Ollama（`qwen2.5:7b`/`qwen3:8b`），两次都严重跑题、完全答非所问，改用 DeepSeek `deepseek-chat`（`openai` SDK 换 `base_url`），效果明显可靠，详细经过见 DECISION.md、PITFALLS.md
+  - `orchestrator/graph.py`：`_draft`/`_execute` 都会先 `memory.load_facts()` 拿已知信息注入 prompt（"涉及这些字段用真实值，不要用占位符"）；`_execute` 成功后提取新事实、存下来、通过新增的 `SessionState.new_facts` 字段带出去
+  - `scripts/run_mvp.py` 的 `deliver_graph_output`：`new_facts` 不为空时，主动发一条"顺便记住了：...如果记错了，跟我说一声就能改"——被动记忆不能悄悄发生，这条是用户明确要求加的，测过要一行一条信息，别挤成一句话（面向中老年用户）
+  - 顺手把 `draft`/`ask_confirm` 里 missing_info 列表的展示也从"、"密集拼接改成一行一条，跟上面同一个诉求
+  - `tests/test_graph.py` 补了 `test_newly_extracted_facts_surface_in_final_state`/`test_no_new_facts_leaves_new_facts_none`/`test_known_facts_flow_into_draft_and_execute` 三个用例
+  - `pyproject.toml` 新增依赖 `langgraph-checkpoint-sqlite`、可选依赖组 `memory`（`openai`）
 
 - **搭起 pytest 自检套件**（2026-08-09，已验证：`pytest tests/` 22 项全过，1.76 秒跑完，不依赖网络/真实 API/`claude login`）
   - `tests/test_debounce.py`：`Debouncer` 的窗口触发、多消息合并+重置计时器、文件文字分开到达再合并、不同用户互不干扰

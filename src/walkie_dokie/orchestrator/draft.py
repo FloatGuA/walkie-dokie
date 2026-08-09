@@ -33,15 +33,23 @@ _OUTPUT_SCHEMA = {
 }
 
 
-async def generate_draft_task_prompt(accumulated_text: str, input_filename: str | None = None) -> dict:
+async def generate_draft_task_prompt(
+    accumulated_text: str, input_filename: str | None = None, known_facts: dict | None = None
+) -> dict:
     """返回 {"task_summary": str, "missing_info": list[str]}。
 
     input_filename 不为空表示用户已经发过一个文件——草稿要知道这件事，
     不然容易把"文件"错误地列进 missing_info（用户明明发了）。
+
+    known_facts 是从这个用户过往对话里提取存下来的个人信息（姓名/部门这类，
+    见 orchestrator/memory.py）——已经知道的字段不该再出现在 missing_info 里。
     """
     prompt = accumulated_text or ""
     if input_filename:
         prompt += f"\n\n（用户已经发来一个文件：{input_filename}，不要把'文件'当成缺失信息再问一遍。）"
+    if known_facts:
+        facts_str = "、".join(f"{k}：{v}" for k, v in known_facts.items())
+        prompt += f"\n\n（已知这个用户的信息——{facts_str}。这些字段不用再列进 missing_info。）"
     logger.info("生成 task prompt 草稿，accumulated_text=%r input_filename=%r", accumulated_text, input_filename)
     options = ClaudeAgentOptions(
         system_prompt=_SYSTEM_PROMPT,

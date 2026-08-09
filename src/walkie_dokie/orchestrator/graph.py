@@ -28,6 +28,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from walkie_dokie.agents.base import ExecutionAgent
+from walkie_dokie.orchestrator import memory
 from walkie_dokie.orchestrator.draft import generate_draft_task_prompt
 from walkie_dokie.orchestrator.state import SessionState
 from walkie_dokie.turn_log import TurnRecord, log_turn
@@ -65,8 +66,9 @@ def _has_instruction(state: SessionState) -> str:
 
 async def _draft(state: SessionState) -> dict:
     file = state.get("pending_file")
+    known_facts = memory.load_facts(state["platform"], state["user_id"])
     draft = await generate_draft_task_prompt(
-        state["pending_instruction"], input_filename=file.filename if file else None
+        state["pending_instruction"], input_filename=file.filename if file else None, known_facts=known_facts
     )
     return {"draft_task_prompt": draft}
 
@@ -87,6 +89,11 @@ def build_graph(execution_agent: ExecutionAgent, checkpointer=None) -> CompiledS
         user_id = state["user_id"]
         draft = state["draft_task_prompt"]
         task_prompt = draft["task_summary"]
+        known_facts = memory.load_facts(platform, user_id)
+        if known_facts:
+            # 有存下来的用户信息，优先用真实值，不要为已知字段编占位符。
+            facts_str = "、".join(f"{k}：{v}" for k, v in known_facts.items())
+            task_prompt += f"\n\n（已知这个用户的信息——{facts_str}。涉及这些字段时用真实值，不要用占位符。）"
         if draft["missing_info"]:
             # 用户已经确认"照这个理解直接做"，缺的信息不能再让执行 agent 反过来追问，
             # 交代它自己用合理的通用占位符/默认值把任务完成。
@@ -103,6 +110,7 @@ def build_graph(execution_agent: ExecutionAgent, checkpointer=None) -> CompiledS
         started = time.monotonic()
         error: str | None = None
         result_dict: dict | None = None
+        new_facts: dict = {}
         try:
             result = await execution_agent.run(
                 instruction=task_prompt,
@@ -115,6 +123,8 @@ def build_graph(execution_agent: ExecutionAgent, checkpointer=None) -> CompiledS
                 "result_file": result.result_file,
                 "result_filename": result.result_filename,
             }
+            new_facts = await memory.extract_facts(state["pending_instruction"])
+            memory.save_facts(platform, user_id, new_facts)
         except Exception as e:
             error = str(e)
             raise
@@ -140,6 +150,7 @@ def build_graph(execution_agent: ExecutionAgent, checkpointer=None) -> CompiledS
             "pending_file": None,
             "draft_task_prompt": None,
             "result": result_dict,
+            "new_facts": new_facts or None,
         }
 
     graph = StateGraph(SessionState)

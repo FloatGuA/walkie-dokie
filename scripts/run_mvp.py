@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
@@ -33,16 +33,18 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_WINDOW_SECONDS = 10.0
+CHECKPOINT_DB_PATH = Path(__file__).parent.parent / "var" / "checkpoints.db"
 
 
 async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dict) -> None:
     if "__interrupt__" in state:
         draft = state["__interrupt__"][0].value["draft_task_prompt"]
         if draft["missing_info"]:
-            missing = "、".join(draft["missing_info"])
+            # 面向中老年用户：一行一条信息，别挤成一句话，逐条读起来更清楚。
+            missing = "\n".join(f"- {item}" for item in draft["missing_info"])
             text = (
                 f"我理解你想要：{draft['task_summary']}\n\n"
-                f"还缺这些信息：{missing}\n\n"
+                f"还缺这些信息：\n{missing}\n\n"
                 "可以直接告诉我，或者回'是'我就用通用内容直接生成。"
             )
         else:
@@ -73,6 +75,19 @@ async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dic
             ),
         )
     await platform.send(user_id, OutboundMessage(text=result["reply_text"]))
+
+    new_facts = state.get("new_facts")
+    if new_facts:
+        # 被动记忆不能悄悄发生——存了什么必须回显，用户才知道以后不用再重复说，
+        # 也才有机会发现提取错了。面向中老年用户：一行一条信息，别挤成一句话；
+        # 明确、直白地邀请纠错，不能假设用户能看懂"以后再提一次就能覆盖"这种潜台词。
+        facts_lines = "\n".join(f"{k}：{v}" for k, v in new_facts.items())
+        await platform.send(
+            user_id,
+            OutboundMessage(
+                text=f"顺便记住了：\n{facts_lines}\n\n以后可以少重复说这些。如果记错了，跟我说一声就能改。"
+            ),
+        )
 
 
 async def dispatch_fresh(
@@ -135,21 +150,25 @@ async def main():
     app_id = os.environ["FEISHU_APP_ID"]
     app_secret = os.environ["FEISHU_APP_SECRET"]
 
-    platform = FeishuAdapter(app_id, app_secret)
-    backend = ClaudeAgentSDKBackend()
-    graph = build_graph(backend, checkpointer=InMemorySaver())
-    locks = UserLocks()
-    debouncer = Debouncer(
-        DEBOUNCE_WINDOW_SECONDS,
-        on_ready=lambda user_id, text, file: dispatch_fresh(graph, platform, user_id, text, file, locks),
-    )
+    CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH)) as checkpointer:
+        await checkpointer.setup()
 
-    platform.start()
-    logger.info("MVP 胶水循环已启动，等待飞书消息……（Ctrl+C 停止）")
+        platform = FeishuAdapter(app_id, app_secret)
+        backend = ClaudeAgentSDKBackend()
+        graph = build_graph(backend, checkpointer=checkpointer)
+        locks = UserLocks()
+        debouncer = Debouncer(
+            DEBOUNCE_WINDOW_SECONDS,
+            on_ready=lambda user_id, text, file: dispatch_fresh(graph, platform, user_id, text, file, locks),
+        )
 
-    while True:
-        event = await platform.receive()
-        asyncio.create_task(handle_event(graph, platform, debouncer, locks, event))
+        platform.start()
+        logger.info("MVP 胶水循环已启动，会话状态落盘到 %s，等待飞书消息……（Ctrl+C 停止）", CHECKPOINT_DB_PATH)
+
+        while True:
+            event = await platform.receive()
+            asyncio.create_task(handle_event(graph, platform, debouncer, locks, event))
 
 
 asyncio.run(main())

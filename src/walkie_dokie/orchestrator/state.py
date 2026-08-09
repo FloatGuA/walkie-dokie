@@ -26,3 +26,7 @@ class SessionState(TypedDict):
     # deprecation 警告（未注册类型），存 plain dict 更省心。字段对齐 ExecutionResult：
     # reply_text / result_file / result_filename。
     result: dict | None
+    # 这一轮从对话里新提取、存进用户 memory 的事实（不是全量档案，只是这次新增/
+    # 更新的部分）——不为 None 时，调用方要回显给用户看，被动记忆不能悄悄发生，
+    # 见对话确认。
+    new_facts: dict | None
