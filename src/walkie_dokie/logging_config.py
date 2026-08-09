@@ -6,11 +6,12 @@ from pathlib import Path
 _VAR_ROOT = Path(__file__).parent.parent.parent / "var"
 LOG_FILE = _VAR_ROOT / "logs" / "walkie-dokie.log"
 
-# 传输层的帧级细节（websocket ping/pong 之类）价值不大，只吵——真正需要看
-# 连通性时，飞书 SDK 自己在 INFO 级别已经打了 connected/disconnected/
-# reconnecting，够用了。这里只按 logger 名字调粗，不影响我们自己模块
-# （walkie_dokie.*）和其他第三方库的 DEBUG 粒度。
-_QUIET_LOGGERS = ["websockets"]
+# 第三方库内部的实现细节，没有排查价值、只会淹没真正有用的日志行——
+# websocket 帧级 ping/pong、aiosqlite 每次 checkpoint 写入的具体 SQL 语句，
+# 都是这一类。真正需要看连通性时，飞书 SDK 自己在 INFO 级别已经打了
+# connected/disconnected/reconnecting，够用了。这里只按 logger 名字调粗，
+# 不影响我们自己模块（walkie_dokie.*）和其他第三方库的 DEBUG 粒度。
+_QUIET_LOGGERS = ["websockets", "aiosqlite"]
 
 
 def setup_logging(console_level: int = logging.INFO, file_level: int = logging.DEBUG) -> None:
