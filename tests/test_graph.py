@@ -7,7 +7,18 @@ from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.graph import _is_confirmation
 from walkie_dokie.platforms.base import IncomingFile
 
-FAKE_DRAFT = {"task_summary": "写一份测试文档", "missing_info": []}
+FAKE_DRAFT = {
+    "is_task": True,
+    "task_summary": "写一份测试文档",
+    "missing_info": [],
+    "user_message": "你的意思是不是要写一份测试文档？回复'是'确认",
+}
+FAKE_CHITCHAT_DRAFT = {
+    "is_task": False,
+    "task_summary": "",
+    "missing_info": [],
+    "user_message": "你好，需要我帮你处理什么文档？",
+}
 
 
 class FakeAgent(ExecutionAgent):
@@ -152,6 +163,50 @@ async def test_file_only_message_does_not_trigger_draft(graph, agent):
         {"platform": "test", "user_id": "u1", "new_text": "总结一下", "new_file": None}, config=config
     )
     assert "__interrupt__" in state
+
+
+async def test_chitchat_replies_directly_without_confirm_loop(graph, agent, monkeypatch):
+    """回归测试：闲聊/寒暄（is_task=false）不该被拖进 confirm 循环，得直接回话
+    并清空 pending_instruction——这是 2026-08-10 修的那个死循环的出口。"""
+
+    async def _fake_draft(text, input_filename=None, known_facts=None):
+        return FAKE_CHITCHAT_DRAFT
+
+    monkeypatch.setattr("walkie_dokie.orchestrator.graph.generate_draft_task_prompt", _fake_draft)
+
+    config = _config()
+    state = await graph.ainvoke(
+        {"platform": "test", "user_id": "u1", "new_text": "你好呀", "new_file": None}, config=config
+    )
+    assert "__interrupt__" not in state
+    assert state["result"]["reply_text"] == FAKE_CHITCHAT_DRAFT["user_message"]
+    assert state["result"]["result_file"] is None
+    assert state["pending_instruction"] is None  # 清空了，不会跟下一轮消息拼在一起
+    assert agent.calls == []  # 没有被当成任务执行
+
+
+async def test_stuck_confirm_loop_exits_once_reclassified_as_chitchat(graph, agent, monkeypatch):
+    """模拟真实撞见的场景：用户在 ask_confirm 里回了不相关的话，累积文字被
+    draft 重新判成非任务后，应该跳出循环直接回话，而不是无限攒文字重新问。"""
+    calls = []
+
+    async def _fake_draft(text, input_filename=None, known_facts=None):
+        calls.append(text)
+        if len(calls) == 1:
+            return FAKE_DRAFT  # 第一次：正常任务，进 confirm
+        return FAKE_CHITCHAT_DRAFT  # 第二次：累积文字被重新判成闲聊
+
+    monkeypatch.setattr("walkie_dokie.orchestrator.graph.generate_draft_task_prompt", _fake_draft)
+
+    config = _config()
+    await graph.ainvoke(
+        {"platform": "test", "user_id": "u1", "new_text": "帮我写份文档", "new_file": None}, config=config
+    )
+    state = await graph.ainvoke(Command(resume="我是谁？你是谁？"), config=config)
+    assert "__interrupt__" not in state  # 跳出了循环，不是又生成一次草稿等确认
+    assert state["result"]["reply_text"] == FAKE_CHITCHAT_DRAFT["user_message"]
+    assert state["pending_instruction"] is None
+    assert agent.calls == []
 
 
 async def test_non_confirmation_reply_loops_back_to_draft_without_executing(graph, agent):

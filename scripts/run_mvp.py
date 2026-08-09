@@ -38,18 +38,10 @@ CHECKPOINT_DB_PATH = Path(__file__).parent.parent / "var" / "checkpoints.db"
 
 async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dict) -> None:
     if "__interrupt__" in state:
+        # user_message 是 draft 专门生成的、给用户看的对话式确认话术——不是
+        # task_summary（那个是给执行 agent 看的，两者措辞不通用，见 DECISION.md）。
         draft = state["__interrupt__"][0].value["draft_task_prompt"]
-        if draft["missing_info"]:
-            # 面向中老年用户：一行一条信息，别挤成一句话，逐条读起来更清楚。
-            missing = "\n".join(f"- {item}" for item in draft["missing_info"])
-            text = (
-                f"我理解你想要：{draft['task_summary']}\n\n"
-                f"还缺这些信息：\n{missing}\n\n"
-                "可以直接告诉我，或者回'是'我就用通用内容直接生成。"
-            )
-        else:
-            text = f"你的意思是不是——{draft['task_summary']}\n\n回复'是'确认，或者继续补充说明"
-        await platform.send(user_id, OutboundMessage(text=text))
+        await platform.send(user_id, OutboundMessage(text=draft["user_message"]))
         return
 
     result = state.get("result")

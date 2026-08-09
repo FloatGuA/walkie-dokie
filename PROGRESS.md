@@ -6,6 +6,55 @@
 
 **MVP 端到端闭环已跑通并验证，orchestrator 也已接入，防抖+确认环节也跑通了，用户 memory 两层都做了**：飞书发消息（文字/文件）→ LangGraph 状态机（`orchestrator/`：防抖攒消息 → 生成任务草稿（带已知用户信息）→ 列出缺失信息等用户确认 → 确认后强制执行不再追问，执行完被动提取新事实并回显给用户）→ `ClaudeAgentSDKBackend` 用 python-docx 生成/编辑/总结文档 → 飞书把文件和文字回复发回用户。会话状态用 `AsyncSqliteSaver` 落盘（`var/checkpoints.db`），能扛进程重启（防抖缓冲区除外，见下方"待处理"）。每条消息独立工作目录（`var/workspaces/`，持久化不清理）+ 结构化留痕（`var/logs/turns.jsonl`）+ 项目本地日志（`var/logs/walkie-dokie.log`，DEBUG 粒度）+ `pytest tests/` 自检套件。平台选型定为飞书自建应用（长连接，见 DECISION.md），执行后端目前只有 Claude 这一条能跑，Codex 在 Windows 上因上游沙箱 bug 不可用。
 
+### 数据流 / prompt 注入快照（2026-08-10，随实现变化，不保证长期准确——稳定的跨模块结构见 TECHNICAL.md）
+
+```
+飞书消息 → FeishuAdapter（file 类型先下载）→ InboundEvent
+  → run_mvp.handle_event()：图卡在 ask_confirm？→ Command(resume=文字) 直接恢复
+                             否则 → Debouncer 攒 10 秒 → dispatch_fresh()
+  → graph.ainvoke(thread_id=user_id)
+
+  【collect】合并 new_text/new_file 进 pending_instruction/pending_file
+
+  【draft】（pending_instruction 非空才进；调用 generate_draft_task_prompt）
+      system_prompt：preset="claude_code" + append（draft.py._SYSTEM_PROMPT）
+        + exclude_dynamic_sections=True
+        append 内容：反账号信息泄漏的强制指令 + "判断 is_task，是的话给 task_summary
+        （给执行agent看，客观）/missing_info，不管是不是任务都要给 user_message
+        （给用户看，对话口吻，跟 task_summary 不能混用同一套措辞）"
+      user 输入：pending_instruction 原文
+        + （有文件）"工作目录下有输入文件：xxx"
+        + （有已知档案）memory.load_facts() 读到的用户信息
+      配置：allowed_tools=[]、max_turns=6、setting_sources=[]、output_format=JSON schema
+      产出：{is_task, task_summary, missing_info, user_message}
+
+  【draft 之后按 is_task 分流】
+      is_task=false → 【reply_directly】：发 user_message，清空 pending_*，END
+                       （闲聊/寒暄从这里直接退出，不进 confirm，也是死循环的出口）
+      is_task=true  → 【ask_confirm】：interrupt() 暂停，把 user_message 发给用户
+                       回复匹配确认词前缀 → execute；不匹配 → 回 collect
+                       （回 collect 后文字被合并、重新过一次 draft，可能被
+                       重新分类成 is_task=false 从而跳出循环）
+
+  【execute】（确认通过才跑）
+      system_prompt：preset="claude_code" + append（claude_agent.py._SYSTEM_PROMPT_APPEND）
+        + exclude_dynamic_sections=True
+        append 内容："你是 walkie-dokie 文档处理执行单元，只做文档相关的事，不要提无关能力"
+        + 同一条反账号信息泄漏指令
+      user 输入：task_prompt = draft_task_prompt["task_summary"]
+        + （missing_info 非空）"这些信息用占位符直接完成，不要再问"
+        + （有已知档案）memory.load_facts() 第二次独立读取，"涉及这些字段用真实值"
+      配置：cwd=独立工作目录（var/workspaces/）、bypassPermissions、setting_sources=[]、
+        output_format=JSON schema
+      执行完 → memory.extract_facts(pending_instruction 原文) 用 DeepSeek 提取新事实并存盘
+        （这次调用没有专门的 system_prompt 隔离，走的是 openai SDK 直连 DeepSeek，
+        不涉及 Claude Agent SDK 的账号泄漏问题）
+
+  → deliver_graph_output：发文件 + reply_text +（有新事实）"顺便记住了..."
+```
+
+关键点：`draft`（判断+草稿）、`execute`（真正干活）、`memory.extract_facts`（事实提取）是三次完全独立的模型调用，互不知道对方存在，全靠 `SessionState` 传递；前两次都是 Claude Agent SDK（同一套隔离/反泄漏机制要分别配置，已经在这两处各踩过一次坑，见 PITFALLS.md），第三次是 DeepSeek。
+
 ## 待处理 / 下一步
 
 - **`bypassPermissions` 提示词注入敞口**：`ClaudeAgentSDKBackend` 一直用 `bypassPermissions` 跑，现在又接了"读用户文件"的功能，存在真实的提示词注入风险，但现在收益太低不值得处理。**硬性条件：项目公开给除开发者之外的人用之前必须先处理**，详细取舍见 DECISION.md

@@ -3,16 +3,24 @@
 调用执行 agent 内部具体怎么把代码写出来跑通，这张图不关心——那是
 agents/ 下各执行后端自己的 agentic loop，图里只把它当一个黑盒节点。
 
-流程（见 DECISION.md「orchestrator 加回一道确认环节」）：
+流程（见 DECISION.md「orchestrator 加回一道确认环节」「draft 区分任务/闲聊」）：
 
-    collect --> draft --> ask_confirm --+-- execute --> END
-                  ^                     |
-                  +---------------------+  （用户没确认，当补充信息，回去重新生成草稿）
+    collect --> draft --+-- (is_task=false) --> reply_directly --> END
+                  ^      |
+                  |      +-- (is_task=true) --> ask_confirm --+-- execute --> END
+                  |                                ^          |
+                  +--------------------------------+          |
+                  （不是确认词，当补充信息并回 collect，重新判断/生成草稿）
 
-collect     把这条新消息（new_text/new_file）并进 pending_*
-draft       轻量 LLM 调用，把 pending_instruction 提炼成一句 task prompt 草稿
-ask_confirm 用 interrupt() 暂停，把草稿发给用户，等下一条消息当回复
-execute     确认通过了才跑，拿 draft_task_prompt（不是原始 pending_instruction）喂给执行 agent
+collect        把这条新消息（new_text/new_file）并进 pending_*
+draft          轻量 LLM 调用，判断这是不是真的文档任务（is_task），
+               是的话整理出 task_summary/missing_info（给执行 agent 看）和
+               user_message（给用户看的对话式确认话术，两者措辞不同不能混用）
+reply_directly is_task=false 时直接回复 user_message，清空 pending_*——
+               这是 ask_confirm 循环的"出口"：闲聊/寒暄不会被拖进确认流程，
+               死循环也靠重新分类被打断（累积的文字被判成非任务就退出）
+ask_confirm    用 interrupt() 暂停，把 user_message 发给用户，等下一条消息当回复
+execute        确认通过了才跑，拿 draft_task_prompt.task_summary 喂给执行 agent
 
 10 秒防抖攒消息不归这张图管，是调用方（scripts/run_mvp.py 的 Debouncer）的事——
 图只在"这一轮真的要处理了"时才被调用一次。
@@ -71,6 +79,23 @@ async def _draft(state: SessionState) -> dict:
         state["pending_instruction"], input_filename=file.filename if file else None, known_facts=known_facts
     )
     return {"draft_task_prompt": draft}
+
+
+def _route_after_draft(state: SessionState) -> str:
+    return "ask_confirm" if state["draft_task_prompt"]["is_task"] else "reply_directly"
+
+
+def _reply_directly(state: SessionState) -> dict:
+    """闲聊/寒暄这类 is_task=false 的情况：直接回话，不进 confirm 循环，
+    并清空 pending_*——这是死循环的出口，累积的文字一旦被重新判成非任务，
+    这条边就会把状态清干净，不会无限往 pending_instruction 里加字。"""
+    draft = state["draft_task_prompt"]
+    return {
+        "pending_instruction": None,
+        "pending_file": None,
+        "draft_task_prompt": None,
+        "result": {"reply_text": draft["user_message"], "result_file": None, "result_filename": None},
+    }
 
 
 def _ask_confirm(state: SessionState) -> dict:
@@ -156,12 +181,16 @@ def build_graph(execution_agent: ExecutionAgent, checkpointer=None) -> CompiledS
     graph = StateGraph(SessionState)
     graph.add_node("collect", _collect)
     graph.add_node("draft", _draft)
+    graph.add_node("reply_directly", _reply_directly)
     graph.add_node("ask_confirm", _ask_confirm)
     graph.add_node("execute", _execute)
 
     graph.set_entry_point("collect")
     graph.add_conditional_edges("collect", _has_instruction, {"draft": "draft", END: END})
-    graph.add_edge("draft", "ask_confirm")
+    graph.add_conditional_edges(
+        "draft", _route_after_draft, {"ask_confirm": "ask_confirm", "reply_directly": "reply_directly"}
+    )
+    graph.add_edge("reply_directly", END)
     graph.add_conditional_edges("ask_confirm", _route_confirm, {"execute": "execute", "collect": "collect"})
     graph.add_edge("execute", END)
 
