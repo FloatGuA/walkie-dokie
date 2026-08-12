@@ -78,9 +78,9 @@
 
 **现象**：用 `asyncio.create_task` 让不同用户互不阻塞是对的，但同一个用户在"图正在跑 `_execute`"这段时间又发一条新消息，会被当成一次全新请求，对**同一个 `thread_id`** 再发起一次 `ainvoke()`。两次调用各自独立完成、都不报错，但最终 checkpoint 状态是错的——先完成的那次执行结果可能在最终状态里丢失，用户会先收到"完成了"，紧接着又收到一个跟原始任务对不上的新确认问题，状态还卡在这个新问题上。
 
-**真因**：`aget_state().next` 只在图真正暂停在 `interrupt()` 时才非空——`_execute` 节点正在跑（哪怕跑很久）不算暂停，所以判断"这个用户是不是正卡在等确认"这个检查会漏掉"正在执行中"这个窗口，把这期间的新消息误判成全新请求处理。LangGraph 的 checkpointer 不会替你把同一个 thread 的并发调用排队或加锁，两次 `ainvoke()` 各自读、各自写，后写的会覆盖/丢失先写的部分字段。
+**真因**：LangGraph 的 checkpointer 不会替你把同一个 thread 的并发调用排队或加锁，两次 `ainvoke()` 可以各自读、各自写，后写者覆盖部分状态。另一个早期误解是把 `StateSnapshot.next` 当作“正在等 interrupt”：它其实表示快照中的待执行节点，失败/未完成任务也可以让它非空；真正的动态中断要看 `snapshot.interrupts`。
 
-**正确做法**：按 `user_id` 加一把 `asyncio.Lock`（见 `orchestrator/locks.py` 的 `UserLocks`），所有对同一个 `thread_id` 的 `ainvoke()`/`Command(resume=...)` 调用都要先拿到这个用户的锁才能发起，不同用户的锁互不相干，不影响跨用户并发。
+**正确做法**：按复合 session key `(platform, user_id)` 加一把 `asyncio.Lock`（见 `orchestrator/locks.py` 的 `UserLocks`），状态查询、fresh invoke 和 resume 都在同一把锁内；只在 `snapshot.interrupts` 非空且 `next == ('ask_confirm',)` 时恢复。不同 session 的锁互不相干。该锁只保证当前单进程，多 worker 需要外部串行化。
 
 **判据**：任何用 LangGraph checkpointer 按 `thread_id` 隔离多用户状态的场景，只要允许"用户在一次调用还没返回时又发起新的一次调用"，就要检查有没有对同一个 thread 做互斥——这不是 LangGraph 自动帮你做的事。
 
@@ -103,3 +103,15 @@
 **正确做法**：目前唯一验证有效的办法是在 system prompt 里加一条明确的强制指令——"不要提及、也不要以任何形式透露你可能知道的开发者账号信息（邮箱、账号名），也不要暴露底层工具名字"，实测这条指令能可靠压住。这不是结构性修复，是指令层面的压制，理论上不能保证 100% 不失效。真正的结构性修复是换成 API key 鉴权（不绑定某个人的账号身份），但这个项目目前 MVP 阶段仍在用订阅登录，见 DECISION.md「MVP 阶段接受 ToS 边界不确定性」。
 
 **判据**：任何用 Claude Agent SDK 订阅登录鉴权、且会把模型输出直接展示给最终用户的场景，只要提示词/对话内容可能诱导模型"介绍自己"或回答"你是谁/你了解我什么"这类问题，都要显式测一下会不会带出开发者账号信息——`setting_sources=[]` 和 `exclude_dynamic_sections=True` 都不能替你把这个测试省掉。
+
+**2026-08-12 架构更新**：`draft.py` 已删除，Claude Code 不再承担普通对话或最终用户话术，账号身份泄漏面因此结构性缩小；执行后端的显式压制仍保留，因为其内部 `summary` 还会交给 MainAgent。真正对外使用时仍应换 API key，不能把分层当作鉴权问题的替代修复。
+
+## 受限 sandbox 禁止 asyncio self-pipe 唤醒时，LangGraph 同步节点会“执行完但 ainvoke 永远不返回”
+
+**现象**：`tests/test_graph.py` 卡在第一个 `graph.ainvoke()`；faulthandler 只看到 event loop 睡在 selector。给同步 `_collect` 加输出后会发现函数已经执行完，但图仍不进入下一节点。同步最小 StateGraph 同样卡，全异步节点则立即完成。
+
+**真因**：当前 Codex 受管 Linux sandbox 对 Unix `socket.socketpair().send()` 返回 `EPERM`。asyncio 的 `call_soon_threadsafe()` 需要向 selector self-pipe 写一个字节来唤醒事件循环，并会吞掉这类 `OSError`。LangGraph/`langchain-core` 在 `ainvoke()` 中用 `run_in_executor` 适配同步节点和同步条件路由：worker 已经算完，但完成通知无法唤醒 selector，于是 Future 看似永久 pending。纯 `asyncio.to_thread(lambda: 42)` 也会卡，证明 LangGraph、interrupt 和 `InMemorySaver` 都不是必要条件。
+
+**正确做法**：项目中所有交给 LangGraph 的节点和条件路由统一写成 `async def`，离线 `InMemorySaver + interrupt + Command(resume)` 流程已恢复。不要盲目降级 LangGraph；当前 `langgraph 1.2.11`、`checkpoint 4.2.0`、`langchain-core 1.5.4` 满足依赖约束且 `pip check` 通过。正式运行环境必须允许正常的 asyncio 跨线程唤醒，因为 `aiosqlite` 和飞书 SDK 的线程桥接仍然依赖它。
+
+**判据**：同步函数已经打印完成、async 版本正常、纯 `call_soon_threadsafe`/`to_thread` 也卡时，应从线程完成通知和 event-loop self-pipe 查起；不能只凭“栈停在 Pregel.ainvoke”就断言 LangGraph 死锁。

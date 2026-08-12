@@ -4,9 +4,10 @@ version = "0.1.0"
 description = "Multi-platform bot office assistant for elderly users, backed by pluggable coding agents"
 requires-python = ">=3.11"
 dependencies = [
-    "langgraph",
-    "langgraph-checkpoint-sqlite",
+    "langgraph==1.2.11",
+    "langgraph-checkpoint-sqlite==3.1.1",
     "httpx",
+    "openai",
     "python-dotenv",
     "lark-oapi",
 ]
@@ -14,7 +15,6 @@ dependencies = [
 [project.optional-dependencies]
 # 执行后端二选一或都装；Codex 走 CLI/子进程调用，暂无需专门的 pip 依赖。
 claude = ["claude-agent-sdk"]
-memory = ["openai"]  # 用于调用 DeepSeek 的 OpenAI 兼容 API 做用户事实提取
 dev = ["pytest", "pytest-asyncio"]
 
 [build-system]
@@ -26,3 +26,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]

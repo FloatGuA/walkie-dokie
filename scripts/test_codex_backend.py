@@ -18,16 +18,18 @@ async def main():
     workdir = create_workspace_dir("smoketest", "codex")
     result = await backend.run(
         instruction="生成一份 docx 文档，标题是《测试》，正文写一句话：你好，这是 walkie-dokie 的第一次测试。",
-        input_file=None,
+        input_path=None,
         workdir=workdir,
     )
-    print(f"reply_text: {result.reply_text}")
+    print(f"summary: {result.summary}")
+    print(f"warnings: {result.warnings}")
     print(f"result_filename: {result.result_filename}")
-    if result.result_file is not None:
-        print(f"result_file 大小: {len(result.result_file)} bytes")
-        print(f"已写入 {workdir / result.result_filename}")
+    if result.artifact_path is not None:
+        print(f"result_file 大小: {result.artifact_path.stat().st_size} bytes")
+        print(f"已写入 {result.artifact_path}")
     else:
         print("没有生成文件")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

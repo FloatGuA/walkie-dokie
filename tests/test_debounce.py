@@ -12,43 +12,65 @@ def collected():
 
 
 def _recorder(collected):
-    async def on_ready(user_id, text, file):
-        collected.append((user_id, text, file))
+    async def on_ready(platform, user_id, text, file):
+        collected.append((platform, user_id, text, file))
 
     return on_ready
 
 
 async def test_single_message_fires_after_window(collected):
     d = Debouncer(0.05, _recorder(collected))
-    d.add("u1", "帮我写份文档")
+    d.add("test", "u1", "帮我写份文档")
     await asyncio.sleep(0.15)
-    assert collected == [("u1", "帮我写份文档", None)]
+    assert collected == [("test", "u1", "帮我写份文档", None)]
 
 
 async def test_multiple_messages_in_window_merge_and_reset_timer(collected):
     d = Debouncer(0.08, _recorder(collected))
-    d.add("u1", "第一句")
+    d.add("test", "u1", "第一句")
     await asyncio.sleep(0.03)
-    d.add("u1", "第二句")  # 应该重置计时器，不是各自独立触发一次
+    d.add("test", "u1", "第二句")  # 应该重置计时器，不是各自独立触发一次
     await asyncio.sleep(0.03)
     assert collected == []  # 这时候还没到 0.08s（从第二句算），不该触发
     await asyncio.sleep(0.1)
-    assert collected == [("u1", "第一句\n第二句", None)]
+    assert collected == [("test", "u1", "第一句\n第二句", None)]
 
 
 async def test_file_and_text_arriving_separately_are_combined(collected):
     file = IncomingFile(filename="a.docx", content=b"x", mime_type="application/octet-stream")
     d = Debouncer(0.08, _recorder(collected))
-    d.add("u1", None, file)  # 飞书发文件不能带文字，先单独收到文件
+    d.add("test", "u1", None, file)  # 飞书发文件不能带文字，先单独收到文件
     await asyncio.sleep(0.03)
-    d.add("u1", "总结一下")  # 再补一句指令
+    d.add("test", "u1", "总结一下")  # 再补一句指令
     await asyncio.sleep(0.15)
-    assert collected == [("u1", "总结一下", file)]
+    assert collected == [("test", "u1", "总结一下", file)]
 
 
 async def test_different_users_fire_independently(collected):
     d = Debouncer(0.05, _recorder(collected))
-    d.add("u1", "来自 u1")
-    d.add("u2", "来自 u2")
+    d.add("test", "u1", "来自 u1")
+    d.add("test", "u2", "来自 u2")
     await asyncio.sleep(0.15)
-    assert set(collected) == {("u1", "来自 u1", None), ("u2", "来自 u2", None)}
+    assert set(collected) == {
+        ("test", "u1", "来自 u1", None),
+        ("test", "u2", "来自 u2", None),
+    }
+
+
+async def test_same_user_id_on_different_platforms_is_not_merged(collected):
+    d = Debouncer(0.05, _recorder(collected))
+    d.add("feishu", "same", "飞书消息")
+    d.add("wecom", "same", "企微消息")
+    await asyncio.sleep(0.15)
+    assert set(collected) == {
+        ("feishu", "same", "飞书消息", None),
+        ("wecom", "same", "企微消息", None),
+    }
+
+
+async def test_close_cancels_pending_windows(collected):
+    d = Debouncer(1.0, _recorder(collected))
+    d.add("test", "u1", "不会派发")
+    await d.close()
+    await asyncio.sleep(0)
+    assert collected == []

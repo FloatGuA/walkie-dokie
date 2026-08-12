@@ -6,16 +6,37 @@
 """
 
 import uuid
+import hashlib
+import re
 from datetime import datetime
 from pathlib import Path
 
 _VAR_ROOT = Path(__file__).parent.parent.parent / "var"
 WORKSPACES_ROOT = _VAR_ROOT / "workspaces"
+_SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _safe_segment(value: str) -> str:
+    cleaned = _SAFE_SEGMENT_RE.sub("_", value).strip("._") or "unknown"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+    return f"{cleaned}-{digest}"
 
 
 def create_workspace_dir(platform: str, user_id: str) -> Path:
     run_id = uuid.uuid4().hex[:8]
     date = datetime.now().strftime("%Y%m%d")
-    workdir = WORKSPACES_ROOT / f"{platform}_{user_id}" / date / run_id
+    owner_dir = f"{_safe_segment(platform)}_{_safe_segment(user_id)}"
+    workdir = WORKSPACES_ROOT / owner_dir / date / run_id
     workdir.mkdir(parents=True, exist_ok=False)
     return workdir
+
+
+def resolve_artifact_reference(reference: str) -> Path:
+    """投递 checkpoint 中的 artifact path 前重新验证它仍在 workspace 根下。"""
+    root = WORKSPACES_ROOT.resolve()
+    path = Path(reference).resolve()
+    if not path.is_relative_to(root):
+        raise RuntimeError(f"产物引用越过 workspace 根目录：{reference!r}")
+    if not path.is_file():
+        raise RuntimeError(f"待投递的执行产物不存在：{path}")
+    return path

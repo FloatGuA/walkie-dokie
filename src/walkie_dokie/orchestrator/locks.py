@@ -2,7 +2,7 @@ import asyncio
 
 
 class UserLocks:
-    """按 user_id 分锁，串行化对同一个 LangGraph thread 的 ainvoke() 调用。
+    """按 session key 分锁，串行化对同一个 LangGraph thread 的 ainvoke() 调用。
 
     实测验证过：同一用户在 execute 还没跑完时又发一条消息，会对同一个
     thread_id 触发第二次并发 ainvoke()，两次调用各自独立完成、互不报错，
@@ -14,5 +14,5 @@ class UserLocks:
     def __init__(self):
         self._locks: dict[str, asyncio.Lock] = {}
 
-    def get(self, user_id: str) -> asyncio.Lock:
-        return self._locks.setdefault(user_id, asyncio.Lock())
+    def get(self, session_key: str) -> asyncio.Lock:
+        return self._locks.setdefault(session_key, asyncio.Lock())

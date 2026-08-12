@@ -13,6 +13,11 @@ def test_different_users_return_different_lock_objects():
     assert locks.get("u1") is not locks.get("u2")
 
 
+def test_same_user_id_on_different_platforms_uses_different_session_locks():
+    locks = UserLocks()
+    assert locks.get("feishu:u1") is not locks.get("wechat:u1")
+
+
 async def test_same_user_lock_serializes_concurrent_access():
     """回归测试：这就是 2026-08-09 那次并发竞态修复要守住的行为——
     同一用户不能有两次并发的图调用交错跑。"""

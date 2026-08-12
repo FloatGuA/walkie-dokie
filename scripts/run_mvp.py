@@ -21,27 +21,80 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
+from walkie_dokie.artifacts import resolve_artifact_reference, store_incoming_file
 from walkie_dokie.logging_config import setup_logging
+from walkie_dokie.main_agent import DeepSeekMainAgent, JsonMemoryRepository
 from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.debounce import Debouncer
 from walkie_dokie.orchestrator.locks import UserLocks
 from walkie_dokie.platforms.base import IncomingFile, InboundEvent, OutboundMessage
 from walkie_dokie.platforms.feishu import FeishuAdapter
 
-load_dotenv()
-setup_logging()
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_WINDOW_SECONDS = 10.0
-CHECKPOINT_DB_PATH = Path(__file__).parent.parent / "var" / "checkpoints.db"
+# v2 状态 schema 引入 MainAgent decision，不能拿旧 draft_task_prompt checkpoint
+# 直接恢复；开发阶段明确换一份数据库，旧库保留供复盘，不做破坏性删除。
+CHECKPOINT_DB_PATH = Path(__file__).parent.parent / "var" / "checkpoints-v2.db"
+
+
+def _session_key(platform: str, user_id: str) -> str:
+    """LangGraph thread 和互斥锁都用平台+用户复合键，避免跨平台 ID 碰撞。"""
+    return f"{platform}:{user_id}"
+
+
+def _waiting_for_confirmation(snapshot) -> bool:
+    """`next` is scheduling state; only known user-input interrupts are resumable."""
+    return bool(snapshot.interrupts) and snapshot.next in {
+        ("ask_confirm",),
+        ("ask_memory",),
+    }
+
+
+async def _invoke_from_event(
+    graph,
+    *,
+    config: dict,
+    platform_name: str,
+    user_id: str,
+    text: str,
+    file: IncomingFile | None,
+):
+    """Re-check durable state at dispatch time, then resume or start atomically."""
+    snapshot = await graph.aget_state(config=config)
+    if _waiting_for_confirmation(snapshot):
+        file_reference = (
+            store_incoming_file(platform_name, user_id, file) if file else None
+        )
+        return await graph.ainvoke(
+            Command(resume={"text": text, "file": file_reference}),
+            config=config,
+            durability="sync",
+        )
+    if snapshot.interrupts:
+        raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
+    if snapshot.next:
+        raise RuntimeError(f"会话存在非 interrupt 的未完成任务 next={snapshot.next!r}")
+    file_reference = (
+        store_incoming_file(platform_name, user_id, file) if file else None
+    )
+    return await graph.ainvoke(
+        {
+            "platform": platform_name,
+            "user_id": user_id,
+            "new_text": text or None,
+            "new_file": file_reference,
+        },
+        config=config,
+        durability="sync",
+    )
 
 
 async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dict) -> None:
     if "__interrupt__" in state:
-        # user_message 是 draft 专门生成的、给用户看的对话式确认话术——不是
-        # task_summary（那个是给执行 agent 看的，两者措辞不通用，见 DECISION.md）。
-        draft = state["__interrupt__"][0].value["draft_task_prompt"]
-        await platform.send(user_id, OutboundMessage(text=draft["user_message"]))
+        # 给用户的话来自 MainAgent；task contract 只给 ExecutionAgent，不能混用。
+        payload = state["__interrupt__"][0].value
+        await platform.send(user_id, OutboundMessage(text=payload["user_message"]))
         return
 
     result = state.get("result")
@@ -51,76 +104,63 @@ async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dic
             # 飞书发文件时不能带文字，只能分开发——收到文件但还没指令是正常情况，
             # 得主动回一句，不能沉默，不然用户不知道文件收到没有。
             await platform.send(
-                user_id, OutboundMessage(text=f"收到文件「{pending_file.filename}」了，请告诉我需要我做什么。")
+                user_id,
+                OutboundMessage(
+                    text=f"收到文件「{pending_file['filename']}」了，请告诉我需要我做什么。"
+                ),
             )
         return
 
-    if result["result_file"] is not None:
+    if result["artifact"] is not None:
+        reference = result["artifact"]
+        artifact = resolve_artifact_reference(reference)
         await platform.send(
             user_id,
             OutboundMessage(
                 file=IncomingFile(
-                    filename=result["result_filename"],
-                    content=result["result_file"],
-                    mime_type="application/octet-stream",
+                    filename=reference["filename"],
+                    content=artifact.read_bytes(),
+                    mime_type=reference["mime_type"],
                 )
             ),
         )
     await platform.send(user_id, OutboundMessage(text=result["reply_text"]))
 
-    new_facts = state.get("new_facts")
-    if new_facts:
-        # 被动记忆不能悄悄发生——存了什么必须回显，用户才知道以后不用再重复说，
-        # 也才有机会发现提取错了。面向中老年用户：一行一条信息，别挤成一句话；
-        # 明确、直白地邀请纠错，不能假设用户能看懂"以后再提一次就能覆盖"这种潜台词。
-        facts_lines = "\n".join(f"{k}：{v}" for k, v in new_facts.items())
-        await platform.send(
-            user_id,
-            OutboundMessage(
-                text=f"顺便记住了：\n{facts_lines}\n\n以后可以少重复说这些。如果记错了，跟我说一声就能改。"
-            ),
-        )
-
 
 async def dispatch_fresh(
     graph,
     platform: FeishuAdapter,
+    platform_name: str,
     user_id: str,
     combined_text: str,
     file: IncomingFile | None,
     locks: UserLocks,
 ) -> None:
-    async with locks.get(user_id):
+    session_key = _session_key(platform_name, user_id)
+    async with locks.get(session_key):
         try:
-            state = await graph.ainvoke(
-                {
-                    "platform": "feishu",
-                    "user_id": user_id,
-                    "new_text": combined_text or None,
-                    "new_file": file,
-                },
-                config={"configurable": {"thread_id": user_id}},
+            state = await _invoke_from_event(
+                graph,
+                config={"configurable": {"thread_id": session_key}},
+                platform_name=platform_name,
+                user_id=user_id,
+                text=combined_text,
+                file=file,
             )
         except Exception:
             logger.exception("orchestrator 处理失败 user_id=%s", user_id)
             await platform.send(user_id, OutboundMessage(text="处理失败，稍后再试一下"))
             return
-    await deliver_graph_output(platform, user_id, state)
-
-
-async def resume_pending(
-    graph, platform: FeishuAdapter, user_id: str, reply_text: str, locks: UserLocks
-) -> None:
-    async with locks.get(user_id):
         try:
-            state = await graph.ainvoke(
-                Command(resume=reply_text), config={"configurable": {"thread_id": user_id}}
-            )
+            # MVP 先把同 session 的状态推进与对应网络投递放在同一顺序域；正式版
+            # 应改为 durable outbox，而不是长期持锁等待平台网络。
+            await deliver_graph_output(platform, user_id, state)
         except Exception:
-            logger.exception("orchestrator 恢复失败 user_id=%s", user_id)
-            await platform.send(user_id, OutboundMessage(text="处理失败，稍后再试一下"))
-            return
-    await deliver_graph_output(platform, user_id, state)
+            # 文件可能已经成功而文字失败；不能再追加一条“处理失败”制造更多
+            # 不确定投递。持久 outbox 实现前只记录并保留 workspace 供人工恢复。
+            logger.exception(
+                "投递图输出失败 platform=%s user_id=%s", platform_name, user_id
+            )
 
 
 async def handle_event(
@@ -129,16 +169,65 @@ async def handle_event(
     if not event.text and event.file is None:
         return
 
-    snapshot = await graph.aget_state(config={"configurable": {"thread_id": event.user_id}})
-    if snapshot.next:
-        # 这个用户正卡在 ask_confirm 等回复——直接当确认/补充处理，不走防抖。
-        # 确认回复目前只看文字；如果用户这时候发的是文件，忽略文字部分为空的情况。
-        await resume_pending(graph, platform, event.user_id, event.text or "", locks)
-    else:
-        debouncer.add(event.user_id, event.text, event.file)
+    session_key = _session_key(event.platform, event.user_id)
+    resumed_state = None
+    # 查询状态和决定“resume 还是防抖新回合”也必须和 ainvoke 使用同一把锁。
+    # 否则 execute 正好结束/进入 interrupt 的边界上仍有 TOCTOU 窗口。
+    try:
+        async with locks.get(session_key):
+            snapshot = await graph.aget_state(
+                config={"configurable": {"thread_id": session_key}}
+            )
+            if _waiting_for_confirmation(snapshot):
+                config = {"configurable": {"thread_id": session_key}}
+                file_reference = (
+                    store_incoming_file(event.platform, event.user_id, event.file)
+                    if event.file
+                    else None
+                )
+                resumed_state = await graph.ainvoke(
+                    Command(
+                        resume={"text": event.text or "", "file": file_reference}
+                    ),
+                    config=config,
+                    durability="sync",
+                )
+                try:
+                    await deliver_graph_output(platform, event.user_id, resumed_state)
+                except Exception:
+                    logger.exception("恢复后投递失败 user_id=%s", event.user_id)
+            elif snapshot.interrupts:
+                raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
+            elif snapshot.next:
+                # next 也会出现在 failed/pending task 上，它并不是 interrupt 标志。
+                # 绝不能把当前用户消息作为 resume 吞掉或自动重放有副作用的 execute。
+                logger.error(
+                    "会话存在非 interrupt 的未完成任务 session=%s next=%r",
+                    session_key,
+                    snapshot.next,
+                )
+                await platform.send(
+                    event.user_id,
+                    OutboundMessage(
+                        text="上一次处理留下了异常状态，我没有执行你这条新消息，请联系维护者恢复会话。"
+                    ),
+                )
+                return
+    except Exception:
+        logger.exception("orchestrator 查询/恢复失败 user_id=%s", event.user_id)
+        await platform.send(
+            event.user_id, OutboundMessage(text="处理失败，稍后再试一下")
+        )
+        return
+
+    if resumed_state is not None:
+        return
+    debouncer.add(event.platform, event.user_id, event.text, event.file)
 
 
 async def main():
+    load_dotenv()
+    setup_logging()
     app_id = os.environ["FEISHU_APP_ID"]
     app_secret = os.environ["FEISHU_APP_SECRET"]
 
@@ -147,20 +236,53 @@ async def main():
         await checkpointer.setup()
 
         platform = FeishuAdapter(app_id, app_secret)
+        main_agent = DeepSeekMainAgent()
         backend = ClaudeAgentSDKBackend()
-        graph = build_graph(backend, checkpointer=checkpointer)
+        memory_repository = JsonMemoryRepository()
+        graph = build_graph(
+            main_agent,
+            backend,
+            memory_repository,
+            checkpointer=checkpointer,
+        )
         locks = UserLocks()
         debouncer = Debouncer(
             DEBOUNCE_WINDOW_SECONDS,
-            on_ready=lambda user_id, text, file: dispatch_fresh(graph, platform, user_id, text, file, locks),
+            on_ready=lambda platform_name, user_id, text, file: dispatch_fresh(
+                graph, platform, platform_name, user_id, text, file, locks
+            ),
         )
 
         platform.start()
         logger.info("MVP 胶水循环已启动，会话状态落盘到 %s，等待飞书消息……（Ctrl+C 停止）", CHECKPOINT_DB_PATH)
 
-        while True:
-            event = await platform.receive()
-            asyncio.create_task(handle_event(graph, platform, debouncer, locks, event))
+        in_flight: set[asyncio.Task] = set()
+
+        async def _handle_safely(event: InboundEvent) -> None:
+            try:
+                await handle_event(graph, platform, debouncer, locks, event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "未捕获的事件处理异常 platform=%s user_id=%s",
+                    event.platform,
+                    event.user_id,
+                )
+
+        try:
+            while True:
+                event = await platform.receive()
+                task = asyncio.create_task(_handle_safely(event))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
+        finally:
+            await debouncer.close()
+            for task in in_flight:
+                task.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

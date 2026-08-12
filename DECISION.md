@@ -215,3 +215,39 @@
 - **否掉了什么，为什么**：只做 `exclude_dynamic_sections=True` 不加显式指令——实测验证过不够，账号身份信息不属于该参数覆盖的"动态段落"范围。
 - **代价 / 已知不足**：这是指令层面的压制，不是结构性隔离，理论上不能保证在所有输入下都 100% 生效——真正的结构性修复是换 API key 鉴权（不绑定个人账号身份），但项目还在用订阅登录，这个风险跟"MVP 阶段接受 ToS 边界不确定性"是同一类风险的另一种表现形式。
 - **什么情况下应该重新考虑**：如果后续实测又发现账号信息在其他场景下泄漏（指令没压住），需要考虑更强的隔离手段，或者提前把"换 API key"这件事的优先级提上来，而不是等到"公开给别人用之前"才处理。
+
+## 显式拆分 MainAgent、LangGraph 控制平面与 ExecutionAgent
+
+- **日期**：2026-08-12
+- **背景**：`draft.py` 最初只是“轻量整理任务”，后来逐步承担了闲聊、身份、意图判断、缺失信息、用户确认话术；`graph.py` 又自行读取/写入 memory；`ExecutionResult.reply_text` 让 coding agent 直接决定给终端用户说什么。结果不是完全没有主 Agent 逻辑，而是主 Agent 的职责散落在 draft、graph、memory、runner 和执行器里，没有单一 owner。机器人称呼被误存成用户姓名只是这个边界混乱暴露出的一个症状，继续补 extraction prompt 不能解决根因。
+- **选了什么**：新增显式 `MainAgent` 抽象。当前 `DeepSeekMainAgent` 使用普通 chat API、没有代码工具，统一负责对话身份、意图、`TaskContract`、长期记忆候选/纠错以及用户话术；`JsonMemoryRepository` 对候选做字段白名单和 set/delete 校验；LangGraph 只负责可恢复的状态转移、确认 interrupt/resume；Claude Code/Codex 只实现 `ExecutionAgent`，接收已确认任务并返回内部 `ExecutionReport` 和 artifact reference。**这条明确取代** 2026-08-07“理解和执行都交给 coding agent 自己的 agentic loop”的部分结论；保留 coding agent 做文档执行的决定不变。
+- **否掉了什么，为什么**：继续把 `draft.py` 当小 helper 并给 `memory.extract_facts()` 加更多正反例——模块名与真实职责已经不符，且只在执行成功后提取会漏掉普通对话中的自我介绍/纠错；让 LangGraph 充当“主 Agent”——LangGraph 是工作流 runtime，不拥有对话人格或记忆政策；让执行器直接返回用户话术——会把环境身份、coding harness 偏好和用户交互继续耦合。
+- **代价 / 已知不足**：文档任务通常多一次 `MainAgent.finalize()` 调用，增加延迟和费用；v2 state schema 与旧 checkpoint 不兼容，因此切换到 `checkpoints-v2.db` 并保留旧库；目前只做了离线 fake-client 测试，真实 DeepSeek 对记忆边界和真实飞书交互仍需冒烟/eval 验证。
+- **什么情况下应该重新考虑**：如果 finalize 的成本没有带来可测量的用户体验收益，可改为确定性 presenter，但不能把用户话术重新塞回 ExecutionAgent；如果更换主模型，只替换 `MainAgent` 实现，不改变三者边界。
+
+## checkpoint 只保存 artifact 引用，不保存输入或输出文件 bytes
+
+- **日期**：2026-08-12
+- **背景**：旧 `SessionState.result` 保存 `result_file: bytes`，同时 `pending_file/new_file` 保存带 `content: bytes` 的 `IncomingFile`。输入附件会随 collect、main-agent、interrupt 等多个历史 checkpoint 重复序列化；只修输出仍会让 SQLite 膨胀并长期保留敏感输入。
+- **选了什么**：平台附件在入图前写入 `var/inputs/`；执行输出保存在 `var/workspaces/`。两者都通过 plain JSON `ArtifactReference(kind,path,filename,mime_type)` 进入图。`ExecutionAgent.run` 接受 `input_path` 而不是 bytes；平台投递时才读取输出 bytes。输入名收窄为 basename，输出绝对路径、`..`、子目录、越界 symlink、目录冒充文件一律拒绝。
+- **否掉了什么，为什么**：继续让 checkpoint 充当 artifact store——短期状态存储与大文件存储不是同一职责，已有持久 Artifact 目录无需复制一份；只把输出改成 path——输入 bytes 才是此前遗漏的主要体积和隐私边界。
+- **代价 / 已知不足**：checkpoint 能恢复但本地 artifact 被手工删除时，投递仍会失败；未来上云或多进程部署时应把本地 path 升级为真正的 ArtifactStore URI/ID。
+- **什么情况下应该重新考虑**：部署变成多机或工作目录不再是持久卷时，引入对象存储并把 `artifact_path` 替换为稳定 artifact ID。
+
+## 有副作用的执行前先 checkpoint execution identity，并写完成 marker
+
+- **日期**：2026-08-12
+- **背景**：旧 `_execute` 在一个 LangGraph step 内创建目录、调用 coding agent、finalize、写日志；如果文件已经生成，但 turn log 或后置 checkpoint 失败，节点会保持 pending。下一条消息若再被错误当作 resume，可能重复生成文件和计费。LangGraph checkpoint 不会自动让外部 API/文件系统获得 exactly-once。
+- **选了什么**：确认后先走 `prepare_execution`，把稳定的 `execution_id/workdir` 作为单独 superstep 写入图状态；生产入口显式使用 `durability="sync"`，使该 checkpoint 完成后才进入 execute。编排元数据放在执行 cwd 外：调用 backend 前写 started marker，成功返回后写 report marker。恢复时只有 started 而没有可信 report，就标记结果未知并拒绝自动重跑；已有 report 则复用。业务异常被转换为完成态失败结果；turn log 异常只记录日志，不改变业务成功状态。runner 只按真实 `snapshot.interrupts` resume，非 interrupt pending task 不自动重放。
+- **否掉了什么，为什么**：把任何 `snapshot.next` 都当作可恢复确认——失败节点同样有 next；让诊断日志决定业务成败——会把已经完成的外部副作用变成隐式重试；宣称 marker 等于 exactly-once——coding agent 产生副作用但尚未返回 report 的窗口仍然存在。
+- **代价 / 已知不足**：多一个 checkpoint superstep 和小型 marker 文件；崩溃后某些 session 需要人工/显式 recovery policy。后续仍需 backend 级幂等键、持久 inbox/outbox 和故障注入测试。
+- **什么情况下应该重新考虑**：执行后端原生支持幂等 request key/事务任务队列后，可把 marker 升级为 durable execution ledger；不能退回“收到下一条用户消息就重跑旧 execute”。
+
+## 长期记忆由 MainAgent 提议，但必须由用户确认后落盘
+
+- **日期**：2026-08-12
+- **背景**：即使 memory operation 带当前原文 evidence，正则也无法穷尽引用、玩笑、假设、否定等自然语言语境。把模型候选直接写入 JSON，会让一次语义误判静默污染长期身份；继续堆反例 prompt/regex 只能缓解，不能建立可靠信任边界。
+- **选了什么**：MainAgent 只提出候选；repository 先做字段、evidence、第一人称和长度的保守校验，但不写入。普通对话进入 `ask_memory`，用户回复“记住”才保存，“不用记”则丢弃；文档任务回复“是”只执行，回复“是并记住”才保存后执行。所有实际变更透明回显。
+- **否掉了什么，为什么**：只靠模型 prompt 或正则自动写入——无法证明语句一定在陈述用户本人事实；彻底禁用 memory——会失去用户明确要求的长期个性化能力。
+- **代价 / 已知不足**：多一个确认回合，交互更慢；当前确认后的 JSON mutation 仍没有与 graph checkpoint/outbound 组成原子事务，也没有可撤销 event ledger。
+- **什么情况下应该重新考虑**：有了带 `turn_id/source/evidence` 的幂等、可撤销 memory ledger 后，可优化确认体验，但不能重新允许执行 Agent 或未确认模型候选直接改长期档案。
