@@ -2,6 +2,15 @@
 
 更新时间：2026-08-13（Asia/Shanghai）
 
+## 合同智能 Data Spike 第一批
+
+- 新增 Django 本地管理入口及合同智能领域模型，覆盖项目、不可变文件版本、原始文件哈希、ParserRun、Evidence、Retrieval Trace、人工最终稿声明和 IndexBuild 草稿。
+- 新增 DOCX/XLSX 原生 baseline parser 与 PDF 文字层 baseline；未知或不可靠能力以 warning/失败显式暴露，不静默猜测。
+- 新增 Chunk/Evidence 检查页和中文 BM25 Retrieval Test；检索候选、分词、阶段分数及稳定证据 ID 均可检查和回放。
+- 第二批继续打通发布、合同问答、价格查询、飞书绑定和 Golden Dataset：发布有 Evidence Manifest 门禁；问答有原子 claim verifier 和一次受限重搜；价格采用白名单 MappingSpec → Staging → 人工 Trusted → 固定查询 → Decimal 计算；飞书私聊选择项目、群聊固定项目。
+- 全仓离线套件现为 133 passed。
+- 尚未接入真实样例、Docling/MinerU/RAGFlow、Dense/Reranker、OCR、Phoenix 和 Celery Worker，因此目前仍是可运行但未做真实精度验收的 MVP。
+
 ## 当前结论
 
 用户指出的根因成立：旧架构不是完全没有“主 Agent 逻辑”，而是这部分职责散落在 `draft.py`、graph、memory extractor、runner 和 coding-agent 输出里，没有唯一 owner。Claude Code/Codex 同时干文档、判断用户身份、提取长期记忆、写最终话术，导致机器人身份与用户身份很容易串在一起。

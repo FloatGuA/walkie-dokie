@@ -1,0 +1,132 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+  .ci-grid { display:grid; grid-template-columns: minmax(260px, 1fr) 3fr; gap:20px; }
+  .ci-card { border:1px solid var(--hairline-color); border-radius:6px; padding:16px; margin-bottom:16px; background:var(--body-bg); }
+  .ci-card pre { white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0 0; }
+  .ci-meta { color:var(--body-quiet-color); font-size:12px; }
+  .ci-warning { border-left:4px solid #ba4a00; }
+  .ci-mismatch { border-left:4px solid #ba2121; }
+  .ci-evidence { border-bottom:1px solid var(--hairline-color); padding:14px 0; }
+  .ci-evidence:last-child { border-bottom:0; }
+  .ci-run a { display:block; padding:8px; }
+  .ci-run.selected a { background:var(--selected-row); font-weight:600; }
+  .ci-filter { display:flex; gap:8px; align-items:end; flex-wrap:wrap; }
+  .ci-filter label { display:flex; flex-direction:column; gap:4px; }
+  @media (max-width: 900px) { .ci-grid { grid-template-columns:1fr; } }
+</style>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">首页</a>
+  &rsaquo; <a href="{% url 'admin:contract_intelligence_documentversion_changelist' %}">文档版本</a>
+  &rsaquo; <a href="{% url 'admin:contract_intelligence_documentversion_change' version.pk %}">{{ version }}</a>
+  &rsaquo; Chunk / Evidence
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="ci-card">
+  <h2>{{ version }}</h2>
+  <p>状态：{{ version.get_status_display }}；本页显示 Provider 原始 Evidence Unit，不把增强后的检索文本冒充原文。</p>
+  {% if comparison %}
+    <div class="ci-card {% if comparison.status == 'mismatch' %}ci-mismatch{% elif comparison.status == 'warning' %}ci-warning{% endif %}">
+      <strong>最近一致性检查：{{ comparison.get_status_display }}</strong>
+      <p>{{ comparison.summary }}</p>
+      <div class="ci-meta">{{ comparison.metrics }}</div>
+    </div>
+  {% endif %}
+</div>
+
+<div class="ci-grid">
+  <aside>
+    <div class="ci-card">
+      <h3>Parser Runs</h3>
+      {% for run in runs %}
+        <div class="ci-run {% if selected_run.pk == run.pk %}selected{% endif %}">
+          <a href="?run={{ run.pk }}">
+            {{ run.provider_name }}@{{ run.provider_version }}<br>
+            <span class="ci-meta">{{ run.source_file.original_name }} · {{ run.get_status_display }} · {{ run.started_at }}</span>
+          </a>
+        </div>
+      {% empty %}
+        <p>尚未运行解析。回到版本列表执行 baseline ingestion。</p>
+      {% endfor %}
+    </div>
+    {% if selected_run %}
+      <div class="ci-card">
+        <h3>质量信息</h3>
+        {% for warning in selected_run.warnings %}<p class="ci-warning">{{ warning }}</p>{% empty %}<p>没有 Provider warning。</p>{% endfor %}
+        {% if selected_run.error %}<pre>{{ selected_run.error }}</pre>{% endif %}
+        <details><summary>metadata</summary><pre>{{ selected_run.metadata }}</pre></details>
+      </div>
+    {% endif %}
+  </aside>
+
+  <main>
+    <div class="ci-card">
+      <h3>Retrieval Test</h3>
+      <p class="ci-meta">当前为透明的中文 BM25 诊断 baseline；Dense、融合和 Reranker 尚未接入，因此不会冒充 Hybrid 结果。</p>
+      <form method="post" class="ci-filter">
+        {% csrf_token %}
+        <label>Query<input type="search" name="retrieval_q" value="{{ retrieval_query }}" required></label>
+        <label>Top K<input type="number" name="top_k" min="1" max="50" value="{{ retrieval_top_k }}"></label>
+        <button type="submit">运行检索</button>
+      </form>
+      {% if retrieval_result %}
+        <p>Provider：{{ retrieval_result.provider_name }}@{{ retrieval_result.provider_version }}；tokens：{{ retrieval_result.query_tokens }}；Trace：{{ retrieval_trace.pk }}</p>
+        {% for candidate in retrieval_result.candidates %}
+          <article class="ci-evidence">
+            <strong>#{{ candidate.rank }} · BM25 {{ candidate.score|floatformat:6 }}</strong>
+            <div class="ci-meta">{{ candidate.evidence_id }} · {{ candidate.retrieval_id }} · stage scores {{ candidate.stage_scores }}</div>
+            <pre>{{ candidate.text }}</pre>
+          </article>
+        {% empty %}
+          <p>没有候选。该终态不会自动放松项目/版本过滤条件。</p>
+        {% endfor %}
+      {% endif %}
+    </div>
+
+    <div class="ci-card">
+      <form method="get" class="ci-filter">
+        {% if selected_run %}<input type="hidden" name="run" value="{{ selected_run.pk }}">{% endif %}
+        <label>原文/条款搜索<input type="search" name="q" value="{{ query }}"></label>
+        <label>类型<select name="kind"><option value="">全部</option>{% for kind in kinds %}<option value="{{ kind }}" {% if selected_kind == kind %}selected{% endif %}>{{ kind }}</option>{% endfor %}</select></label>
+        <button type="submit">筛选</button>
+      </form>
+    </div>
+
+    <div class="ci-card">
+      <h3>Evidence Units（{{ evidence_page.paginator.count }}）</h3>
+      {% for evidence in evidence_page %}
+        <article class="ci-evidence">
+          <div><strong>{{ evidence.kind }}</strong> {% if evidence.clause_ref %}· {{ evidence.clause_ref }}{% endif %}</div>
+          <div class="ci-meta">
+            {{ evidence.evidence_id }} · ordinal {{ evidence.ordinal }}
+            {% if evidence.page_physical %}· PDF 物理页 {{ evidence.page_physical }}{% endif %}
+            {% if evidence.page_printed %}· 印刷页 {{ evidence.page_printed }}{% endif %}
+            · anchor {{ evidence.source_anchor }}
+          </div>
+          {% if evidence.title_path %}<div class="ci-meta">路径：{{ evidence.title_path|join:" / " }}</div>{% endif %}
+          <pre>{{ evidence.text }}</pre>
+          {% if evidence.metadata %}<details><summary>结构/单元格 metadata</summary><pre>{{ evidence.metadata }}</pre></details>{% endif %}
+        </article>
+      {% empty %}
+        <p>当前筛选没有 Evidence Unit。</p>
+      {% endfor %}
+
+      {% if evidence_page.has_other_pages %}
+        <p>
+          {% if evidence_page.has_previous %}<a href="?run={{ selected_run.pk }}&q={{ query|urlencode }}&kind={{ selected_kind|urlencode }}&page={{ evidence_page.previous_page_number }}">上一页</a>{% endif %}
+          第 {{ evidence_page.number }} / {{ evidence_page.paginator.num_pages }} 页
+          {% if evidence_page.has_next %}<a href="?run={{ selected_run.pk }}&q={{ query|urlencode }}&kind={{ selected_kind|urlencode }}&page={{ evidence_page.next_page_number }}">下一页</a>{% endif %}
+        </p>
+      {% endif %}
+    </div>
+  </main>
+</div>
+{% endblock %}

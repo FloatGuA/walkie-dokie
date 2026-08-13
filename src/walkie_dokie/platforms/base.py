@@ -20,6 +20,15 @@ class InboundEvent:
     user_id: str
     text: str | None
     file: IncomingFile | None
+    # Group chat and private chat must not share query context or reply routing.
+    conversation_id: str | None = None
+    conversation_type: Literal["private", "group"] | None = None
+
+    @property
+    def reply_target(self) -> str:
+        if self.conversation_type == "group" and self.conversation_id:
+            return f"chat:{self.conversation_id}"
+        return self.user_id
 
 
 @dataclass

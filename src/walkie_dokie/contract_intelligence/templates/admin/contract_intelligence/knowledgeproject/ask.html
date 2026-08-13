@@ -1,0 +1,54 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+  .qa-card { border:1px solid var(--hairline-color); border-radius:6px; padding:18px; margin-bottom:18px; }
+  .qa-form { display:flex; gap:10px; align-items:end; }
+  .qa-form label { flex:1; display:flex; flex-direction:column; gap:6px; }
+  .qa-form textarea { min-height:90px; }
+  .qa-evidence { border-left:4px solid var(--accent); padding:12px; margin:12px 0; background:var(--darkened-bg); }
+  .qa-meta { color:var(--body-quiet-color); font-size:12px; overflow-wrap:anywhere; }
+  .qa-card pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+</style>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">首页</a>
+  &rsaquo; <a href="{% url 'admin:contract_intelligence_knowledgeproject_changelist' %}">知识库项目</a>
+  &rsaquo; <a href="{% url 'admin:contract_intelligence_knowledgeproject_change' project.pk %}">{{ project }}</a>
+  &rsaquo; 高精度问答
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="qa-card">
+  <p>当前发布版本：{{ project.current_index_build }}。系统只能查询该版本，证据不足会拒答。价格走 Trusted PriceRecord，合同走 BM25 → DeepSeek → Evidence Verifier；当前尚未接入 Dense/Reranker。</p>
+  <form method="post" class="qa-form">
+    {% csrf_token %}
+    <label>问题<textarea name="question" required>{{ question }}</textarea></label>
+    <button type="submit">提问</button>
+  </form>
+</div>
+
+{% if result %}
+<div class="qa-card">
+  <h2>{{ result.status }}：{{ result.answer }}</h2>
+  <p>文档：{{ result.document|join:", " }}</p>
+  {% if result.calculation %}<h3>计算账本</h3><pre>{{ result.calculation }}</pre>{% endif %}
+  <h3>Evidence</h3>
+  {% for evidence in result.evidence %}
+    <div class="qa-evidence">
+      <strong>{{ evidence.document }} {% if evidence.clause_ref %}· {{ evidence.clause_ref }}{% endif %}</strong>
+      <div class="qa-meta">{{ evidence.evidence_id }} · {{ evidence.source_file }} · 物理页 {{ evidence.page_physical|default:"-" }} · anchor {{ evidence.source_anchor }}</div>
+      <pre>{{ evidence.text }}</pre>
+    </div>
+  {% empty %}
+    <p>本次没有足以支持回答的证据。</p>
+  {% endfor %}
+  <h3>Confidence</h3><pre>{{ result.confidence }}</pre>
+  <details><summary>完整 Workflow Trace</summary><pre>{{ result.trace }}</pre></details>
+</div>
+{% endif %}
+{% endblock %}

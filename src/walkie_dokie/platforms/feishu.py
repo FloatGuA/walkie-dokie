@@ -65,6 +65,10 @@ class FeishuAdapter(PlatformAdapter):
             user_id=user_id,
             text=text,
             file=file,
+            conversation_id=getattr(message, "chat_id", None),
+            conversation_type=(
+                "group" if getattr(message, "chat_type", None) == "group" else "private"
+            ),
         )
         assert self._loop is not None, "FeishuAdapter.start() 还没调用就收到消息了"
         self._loop.call_soon_threadsafe(self._queue.put_nowait, inbound)
@@ -109,12 +113,20 @@ class FeishuAdapter(PlatformAdapter):
             content = lark.JSON.marshal({"text": message.text or ""})
             msg_type = "text"
 
+        receive_id_type = "open_id"
+        receive_id = user_id
+        if user_id.startswith("chat:"):
+            receive_id_type = "chat_id"
+            receive_id = user_id.removeprefix("chat:")
+            if not receive_id:
+                raise ValueError("飞书 chat reply target 不能为空")
+
         request = (
             CreateMessageRequest.builder()
-            .receive_id_type("open_id")
+            .receive_id_type(receive_id_type)
             .request_body(
                 CreateMessageRequestBody.builder()
-                .receive_id(user_id)
+                .receive_id(receive_id)
                 .msg_type(msg_type)
                 .content(content)
                 .build()
@@ -123,9 +135,9 @@ class FeishuAdapter(PlatformAdapter):
         )
         response = await asyncio.to_thread(self._client.im.v1.message.create, request)
         if not response.success():
-            logger.error("飞书发消息失败 user_id=%s code=%s msg=%s", user_id, response.code, response.msg)
+            logger.error("飞书发消息失败 target=%s code=%s msg=%s", user_id, response.code, response.msg)
             raise RuntimeError(f"飞书发消息失败：code={response.code} msg={response.msg}")
-        logger.info("飞书发消息成功 user_id=%s msg_type=%s", user_id, msg_type)
+        logger.info("飞书发消息成功 target=%s msg_type=%s", user_id, msg_type)
 
     async def _upload_file(self, file: IncomingFile) -> str:
         request = (
