@@ -20,11 +20,20 @@
                                   MainAgent 整理回复 → 飞书
 ```
 
-`ClaudeAgentSDKBackend`/`CodexBackend` 现在都只是执行单元，不再判断长期记忆，也不直接决定给用户说什么。LangGraph 是可恢复的工作流运行时，不是主 Agent。新版已通过 84 项离线测试；重构后的真实飞书链路尚待重新冒烟验证，详细状态见 [PROGRESS.md](PROGRESS.md)。
+`ClaudeAgentSDKBackend`/`CodexBackend` 现在都只是执行单元，不再判断长期记忆，也不直接决定给用户说什么。LangGraph 是可恢复的工作流运行时，不是主 Agent。测试与真实飞书冒烟状态见 [PROGRESS.md](PROGRESS.md)。
+
+主 Agent 会先输出显式意图：知识问答、解释、建议和闲聊是 `chat`，直接由 DeepSeek 回复；只有明确要求生成、修改、读取或分析实际 Word/Excel 文件时才是 `document_task`，进入用户确认和 ExecutionAgent。仅仅询问 Word/Excel 的使用方法不会调用执行单元。
 
 ## 安装
 
-需要 Python 3.11+。运行 Claude 执行后端：
+需要 Python 3.11+。Linux 上的 Claude 执行后端还要求 `bubblewrap` 和 `socat`；
+缺少任一项时沙箱会 fail closed，不会退回到无沙箱执行：
+
+```bash
+sudo apt-get install bubblewrap socat
+```
+
+安装 Python 依赖：
 
 ```bash
 pip install -e ".[claude]"
@@ -39,6 +48,8 @@ pytest tests/
 
 主 Agent 通过 OpenAI 兼容 SDK 调用 DeepSeek，执行 Agent 当前默认用 Claude Agent SDK。鉴权和对外使用边界见 [.env.example](.env.example) 与 [PITFALLS.md](PITFALLS.md)。
 
+执行任务把用户指令、文件名和文档内容全部视为不可信输入。Claude 后端只开放沙箱内 Bash，禁用 MCP、skills、子 Agent、网页与网络，清除应用凭证环境变量，并且只读 Python 运行时、只写本轮用户工作区；Codex 后端使用等价的最小 permission profile。输入和输出只接受经过确定性检查的 `.docx/.xlsx`，宏、嵌入对象、外部关系、危险字段/公式和异常压缩包会在 Agent 前后被拒绝。prompt 约束只是辅助，权限边界由 OS 沙箱和产物校验承担。
+
 ## 运行 MVP
 
 复制 `.env.example` 为 `.env`，配置飞书凭证、`DEEPSEEK_API_KEY`，并为 Claude Agent SDK 配好鉴权，然后运行：
@@ -48,6 +59,8 @@ python scripts/run_mvp.py
 ```
 
 在飞书里给自建应用机器人发一句话，例如“帮我写一份请假条”。10 秒防抖窗口结束后，小帮会先确认理解，用户明确回复“是”才调用执行单元。
+
+用户明确说出的姓名、部门、职位或常用称呼会在逐字证据校验通过后自动写入长期记忆，并透明回显实际变更，不再要求二次确认。单独发送 `/long-term-memory` 可查看当前保存的全部长期记忆；该命令不经过模型。
 
 ## 架构边界
 

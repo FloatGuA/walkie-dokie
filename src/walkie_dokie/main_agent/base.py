@@ -9,6 +9,7 @@ from walkie_dokie.agents.base import ExecutionReport
 MemoryField = Literal["name", "department", "job_title", "preferred_address"]
 MemoryAction = Literal["set", "delete"]
 DecisionAction = Literal["reply", "propose_task"]
+DialogueIntent = Literal["chat", "document_task"]
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ class DialogueContext:
 
 @dataclass(frozen=True)
 class MainAgentDecision:
+    intent: DialogueIntent
     action: DecisionAction
     user_message: str
     task: TaskContract | None = None
@@ -81,6 +83,7 @@ class MainAgent(ABC):
 def decision_to_dict(decision: MainAgentDecision) -> dict:
     task = decision.task
     return {
+        "intent": decision.intent,
         "action": decision.action,
         "user_message": decision.user_message,
         "task": (

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
+from docx import Document
 
 import walkie_dokie.artifacts as artifact_store
 import walkie_dokie.orchestrator.graph as graph_module
@@ -31,6 +32,7 @@ def task_decision(
     use_previous_artifact=False,
 ):
     return MainAgentDecision(
+        intent="document_task",
         action="propose_task",
         user_message=user_message,
         task=TaskContract(
@@ -44,6 +46,7 @@ def task_decision(
 
 def reply_decision(message="你好，需要我帮你处理什么文档？", *, memory_operations=()):
     return MainAgentDecision(
+        intent="chat",
         action="reply",
         user_message=message,
         memory_operations=tuple(memory_operations),
@@ -98,7 +101,9 @@ class FakeExecutionAgent(ExecutionAgent):
             raise self.error
         if self.produce_artifact:
             artifact = workdir / "result.docx"
-            artifact.write_bytes(b"generated")
+            document = Document()
+            document.add_paragraph("generated")
+            document.save(artifact)
             return ExecutionReport(
                 summary="测试文档已生成",
                 artifact_path=artifact,
@@ -232,7 +237,7 @@ async def test_memory_is_owned_by_main_agent_and_applies_on_direct_conversation(
     )
     graph, memory = make_graph(tmp_path, main_agent, execution_agent)
 
-    proposal = await graph.ainvoke(
+    state = await graph.ainvoke(
         {
             "platform": "test",
             "user_id": "u1",
@@ -241,44 +246,125 @@ async def test_memory_is_owned_by_main_agent_and_applies_on_direct_conversation(
         },
         config=config(),
     )
-    assert memory.load("test", "u1") == {}
-    assert "建议保存的长期资料" in proposal["__interrupt__"][0].value["user_message"]
-    state = await graph.ainvoke(Command(resume="记住"), config=config())
     assert memory.load("test", "u1") == {"name": "张三"}
     assert "姓名：张三" in state["result"]["reply_text"]
     assert state["memory_changes"][0]["field"] == "name"
     assert execution_agent.calls == []
 
 
-async def test_memory_proposal_can_be_rejected_without_mutation(
+async def test_implicit_memory_save_replaces_model_claim_with_verified_notice(
     tmp_path, execution_agent
 ):
     main_agent = FakeMainAgent(
         [
             reply_decision(
-                "很高兴认识你。",
+                "好的，浮瓜，我已经记住了。",
                 memory_operations=(
-                    MemoryOperation("set", "name", "张三", "我叫张三"),
+                    MemoryOperation("set", "name", "浮瓜", "我是浮瓜"),
                 ),
             )
         ]
     )
     graph, memory = make_graph(tmp_path, main_agent, execution_agent)
-    await graph.ainvoke(
+
+    state = await graph.ainvoke(
         {
             "platform": "test",
             "user_id": "u1",
-            "new_text": "我叫张三",
+            "new_text": "我是浮瓜",
             "new_file": None,
         },
         config=config(),
     )
-    state = await graph.ainvoke(Command(resume="不用记"), config=config())
+
+    message = state["result"]["reply_text"]
+    assert "我已经记住" not in message
+    assert "我记住了" in message
+    assert "姓名：浮瓜" in message
+    assert memory.load("test", "u1") == {"name": "浮瓜"}
+
+
+async def test_rejected_memory_candidate_cannot_leave_false_saved_reply(
+    tmp_path, execution_agent
+):
+    main_agent = FakeMainAgent(
+        [
+            reply_decision(
+                "好的，我已经记住你叫小帮。",
+                memory_operations=(
+                    MemoryOperation("set", "name", "小帮", "你是小帮"),
+                ),
+            )
+        ]
+    )
+    graph, memory = make_graph(tmp_path, main_agent, execution_agent)
+
+    state = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "你是小帮",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    assert state["result"]["reply_text"] == "谢谢你告诉我。"
     assert memory.load("test", "u1") == {}
-    assert state["result"]["reply_text"] == "好的，这些资料不会保存。"
 
 
-async def test_plain_task_confirmation_executes_without_saving_memory(tmp_path):
+async def test_saved_claim_without_memory_operation_is_also_removed(
+    tmp_path, execution_agent
+):
+    main_agent = FakeMainAgent([reply_decision("好的，我记住了。")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    state = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "我是浮瓜",
+            "new_file": None,
+        },
+        config=config(),
+    )
+    assert state["result"]["reply_text"] == "谢谢你告诉我。"
+
+
+async def test_implicit_memory_write_failure_never_claims_success(
+    tmp_path, execution_agent, monkeypatch
+):
+    main_agent = FakeMainAgent(
+        [
+            reply_decision(
+                "好的，我已经记住了。",
+                memory_operations=(
+                    MemoryOperation("set", "name", "浮瓜", "我是浮瓜"),
+                ),
+            )
+        ]
+    )
+    graph, memory = make_graph(tmp_path, main_agent, execution_agent)
+
+    def fail_apply(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(memory, "apply", fail_apply)
+    state = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "我是浮瓜",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    assert "没有保存成功" in state["result"]["reply_text"]
+    assert "我已经记住" not in state["result"]["reply_text"]
+    assert memory.load("test", "u1") == {}
+
+
+async def test_task_confirmation_is_separate_from_implicit_memory_save(tmp_path):
     operation = MemoryOperation("set", "name", "张三", "我叫张三")
     main_agent = FakeMainAgent(
         [task_decision("为张三写文档", memory_operations=(operation,))]
@@ -294,32 +380,61 @@ async def test_plain_task_confirmation_executes_without_saving_memory(tmp_path):
         },
         config=config(),
     )
-    assert "是并记住" in proposal["__interrupt__"][0].value["user_message"]
+    proposal_message = proposal["__interrupt__"][0].value["user_message"]
+    assert "是并记住" not in proposal_message
+    assert "姓名：张三" in proposal_message
+    assert memory.load("test", "u1") == {"name": "张三"}
     state = await graph.ainvoke(Command(resume="是"), config=config())
     assert state["result"]["success"] is True
-    assert memory.load("test", "u1") == {}
+    assert len(execution_agent.calls) == 1
 
 
-async def test_task_and_memory_require_explicit_combined_confirmation(tmp_path):
-    operation = MemoryOperation("set", "name", "张三", "我叫张三")
-    main_agent = FakeMainAgent(
-        [task_decision("为张三写文档", memory_operations=(operation,))]
-    )
-    execution_agent = FakeExecutionAgent()
+async def test_long_term_memory_command_lists_all_facts_without_main_agent(
+    tmp_path, execution_agent
+):
+    main_agent = FakeMainAgent([reply_decision("不应调用模型")])
     graph, memory = make_graph(tmp_path, main_agent, execution_agent)
-    await graph.ainvoke(
+    memory.apply(
+        "test",
+        "u1",
+        (
+            MemoryOperation("set", "name", "浮瓜", "我是浮瓜"),
+            MemoryOperation("set", "job_title", "开发者", "我是开发者"),
+        ),
+        source_text="我是浮瓜，我是开发者",
+    )
+
+    state = await graph.ainvoke(
         {
             "platform": "test",
             "user_id": "u1",
-            "new_text": "我叫张三，帮我写文档",
+            "new_text": "  /long-term-memory  ",
             "new_file": None,
         },
         config=config(),
     )
-    state = await graph.ainvoke(Command(resume="是并记住"), config=config())
-    assert state["result"]["success"] is True
-    assert memory.load("test", "u1") == {"name": "张三"}
-    assert "姓名：张三" in state["result"]["reply_text"]
+    assert state["result"]["reply_text"] == (
+        "当前保存的长期记忆：\n姓名：浮瓜\n职位：开发者"
+    )
+    assert main_agent.decide_calls == []
+
+
+async def test_long_term_memory_command_reports_empty_profile(
+    tmp_path, execution_agent
+):
+    main_agent = FakeMainAgent([reply_decision("不应调用模型")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    state = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "/long-term-memory",
+            "new_file": None,
+        },
+        config=config(),
+    )
+    assert state["result"]["reply_text"] == "目前还没有保存任何长期记忆。"
+    assert main_agent.decide_calls == []
 
 
 async def test_known_memory_goes_to_main_agent_not_directly_to_executor(
@@ -390,7 +505,7 @@ async def test_memory_changes_do_not_leak_into_next_turn(tmp_path, execution_age
         ]
     )
     graph, _ = make_graph(tmp_path, main_agent, execution_agent)
-    proposal = await graph.ainvoke(
+    first = await graph.ainvoke(
         {
             "platform": "test",
             "user_id": "u1",
@@ -399,8 +514,6 @@ async def test_memory_changes_do_not_leak_into_next_turn(tmp_path, execution_age
         },
         config=config(),
     )
-    assert proposal["memory_changes"] is None
-    first = await graph.ainvoke(Command(resume="记住"), config=config())
     assert first["memory_changes"]
 
     second = await graph.ainvoke(

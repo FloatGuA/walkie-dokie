@@ -52,7 +52,8 @@ class FeishuAdapter(PlatformAdapter):
 
         user_id = data.event.sender.sender_id.open_id
         logger.info(
-            "收到飞书消息 user_id=%s message_type=%s text=%r file=%r",
+            "收到飞书消息 message_id=%s user_id=%s message_type=%s text=%r file=%r",
+            message.message_id,
             user_id,
             message.message_type,
             text,

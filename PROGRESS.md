@@ -1,6 +1,6 @@
 # walkie-dokie — Progress
 
-更新时间：2026-08-12（Asia/Shanghai）
+更新时间：2026-08-13（Asia/Shanghai）
 
 ## 当前结论
 
@@ -20,25 +20,30 @@ PlatformAdapter → Session coordination → LangGraph control plane
 
 ## 已验证
 
-- `pytest` 与 `pytest tests/`：**84 passed**。套件不联网、不调用真实飞书/DeepSeek/Claude/Codex。
+- `pytest` 与 `pytest tests/`：全量离线套件通过。套件不联网、不调用真实飞书/DeepSeek/Claude/Codex。
 - MainAgent/ExecutionAgent 接口隔离；执行层只收 `TaskContract + input_path`，返回 `ExecutionReport`。
+- MainAgent 输出显式 `chat/document_task` 意图并与 `reply/propose_task` 交叉校验；知识问答、闲聊以及 Word/Excel 方法咨询直接回复，只有实际文件操作进入执行单元。
 - “你是小帮”即使被模型错误输出成合法 `name=小帮`，也会因缺少第一人称当前原文证据被 repository 拒绝。
-- memory 只接受四个白名单字段、set/delete、逐字 evidence；旧消息不能冒充当前证据；清洗后相同的两个用户 ID 不会再碰撞。通过校验的操作也只是一份候选，普通对话需用户回复“记住”，文档任务需回复“是并记住”才会落盘；单独回复“是”只执行任务。
+- memory 只接受四个白名单字段、set/delete、当前原文逐字 evidence 与第一人称字段语义；支持“我是浮瓜，是这个项目的开发者”等中文连续陈述。校验通过后隐式写入并透明回显，不再二次确认；精确命令 `/long-term-memory` 确定性返回全部档案，不经过模型。
 - 输入附件先写 `var/inputs/`，checkpoint 只保存 plain JSON reference；输出同样只保存 `var/workspaces/` 引用，不保存文件 bytes。
 - 确认阶段附件通过单个可序列化 `Command(resume={text,file})` 恢复，不再使用 `aupdate_state` 的隐式 `as_node` 推断。
-- runner 只把真实 `snapshot.interrupts` 且节点为 `ask_confirm/ask_memory` 当成可恢复确认；失败节点的 `next` 不会吞掉下一条用户消息或自动重跑 execute。
+- runner 只把真实 `snapshot.interrupts` 且节点为 `ask_confirm`（或升级前遗留的 `ask_memory`）当成可恢复确认；失败节点的 `next` 不会吞掉下一条用户消息或自动重跑 execute。
 - 生产入口所有 fresh/resume invoke 都显式使用 `durability="sync"`；`prepare_execution` 的 execution ID/workdir checkpoint 完成后才进入执行。独立元数据区的 started/report marker 会在未知结果时拒绝自动重跑，并覆盖“报告已返回但后置 checkpoint 失败”的常见窗口。
 - 主 Agent/执行 Agent 的业务异常都结束为明确失败回合；turn log 失败不再把成功执行变成 pending execute。
 - 上一轮输出 artifact 可由 MainAgent 通过 `use_previous_artifact` 显式选入下一任务，“继续修改刚才文件”不再只有文字上下文却拿不到文件。
 - 确认词使用完整匹配；“好像不对”“可以先别做”“是，不过先改”不会误执行。
 - 标准 `pytest` 不再收集时启动真实 backend smoke script；两个脚本已有 `__main__` guard，pytest 配置限定 `tests/`。
+- ExecutionAgent prompt-injection 权限边界已收紧：Claude 使用 fail-closed Bash sandbox，Codex 使用最小 permission profile；两者都无执行网络、无 MCP/skills/子 Agent、无应用 secret 环境变量，只能写本轮 workspace。Codex profile 已在宿主 Linux 实测不能读取项目 README 或独立 CODEX_HOME，同时能写指定 workspace 并加载 python-docx/openpyxl。
+- `.docx/.xlsx` 在执行前后经过确定性 OOXML 校验；宏、嵌入对象、外部关系、危险字段/公式、异常 ZIP 会被拒绝。graph 会再次验证执行报告和产物，不信任 backend 自报路径。
+- 当前全量离线测试为 110 passed。
 
 ## 尚未验证
 
 - v2 尚未在正常部署 OS 上跑完真实 `DeepSeek → AsyncSqliteSaver → Claude → 飞书` 全链路。
 - 当前 Codex 受管 sandbox 禁止 asyncio socketpair/self-pipe 唤醒；历史同步图因此看似卡死，`aiosqlite` 的 worker thread 在这里也受影响。离线 `InMemorySaver` 通过不能替代生产 SQLite 冒烟。
 - memory 的 fake-client contract 与确定性 policy 已测，但真实 DeepSeek 的多轮 adversarial/golden eval 尚未完成。
-- Claude/Codex 对真实 docx/xlsx 的质量、超时、取消后的子进程/远端状态需要重新冒烟。
+- Claude 真实冒烟当前被账户月度额度上限拒绝，尚未进入工具调用；安全配置和错误路径已加载，但正常 docx/xlsx 生成、超时、取消后的子进程/远端状态仍需在额度恢复后重新冒烟。
+- Codex 最小权限 profile 已做本地命令隔离测试，但独立 `var/codex_home` 尚未登录，真实模型文档任务仍未冒烟。
 - 飞书重投、发送半成功、进程在 checkpoint/投递边界崩溃尚无端到端故障注入测试。
 
 ## 当前数据流
@@ -54,17 +59,14 @@ PlatformAdapter → Session coordination → LangGraph control plane
   main_agent：
       输入 task context、当前用户原文、附件/上一产物文件名、短期历史、白名单档案
       输出 reply/propose_task、用户话术、TaskContract、memory operations + evidence
-      repository 保守校验 → ask_memory/任务确认展示候选
-      用户明确同意后才落盘，并透明回显实际变更
+      repository 保守校验 → 通过后隐式落盘，并透明回显实际变更
 
   reply → END
   propose_task → ask_confirm interrupt
       补充/否定 → collect → main_agent
-      “是” → prepare_execution → execute（不保存 memory 候选）
-      “是并记住” → 保存候选 → prepare_execution → execute
+      “是” → prepare_execution → execute
 
-  reply + memory candidate → ask_memory interrupt
-      “记住” → 保存并 END；“不用记” → 丢弃并 END
+  精确命令 /long-term-memory → 确定性读取当前用户全部长期档案
 
   execute：ExecutionAgent 只收自包含 task + 可选 input path
       → ExecutionReport(summary/artifact/warnings)
@@ -80,7 +82,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 1. 在正常 OS 上跑真实 v2 闭环，并验证 SQLite 进程重启后的 ask-confirm 恢复。当前 sandbox 不能完成这项证明。
 2. 增加持久 inbox/outbox：`InboundEvent.event_id` 去重；文件与文字分别记录 delivery ack/retry。现在图成功后平台发送失败会丢结果，文件成功而文字失败会半投递。
 3. 将 execution idempotency 扩展到 backend 边界。started marker 会在结果未知时拒绝自动重跑，但无法判断 coding agent 是否已经完成，只能转人工恢复；这仍不是 exactly-once。
-4. 公开给开发者本人以外的人之前，移除 `bypassPermissions`/订阅登录风险，采用合规 API key 与真正 OS/container 沙箱。
+4. 公开给开发者本人以外的人之前，将当前订阅登录改为合规服务鉴权，并把已启用的进程级 OS sandbox 再放进专用服务账号 + container/cgroup，补齐 CPU、内存、进程数和磁盘配额。
 
 ### P1：状态和部署边界
 
@@ -103,7 +105,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 新增 `main_agent/`：普通 chat 模型、MainAgent contracts、memory policy/repository。
 - 新增 `artifacts.py`：输入/输出 artifact reference 的落盘、解析和边界校验。
 - 重写 `orchestrator/graph.py`：LangGraph 只做控制流；所有 node/route 为 async；加入 prepare/marker、严格 interrupt 恢复、跨轮 active artifact。
-- 收窄 `agents/`：只执行任务并返回内部报告；输入由 bytes 改为 path；graph 会重新验证产物确属本轮 workdir；Codex schema 保留名冲突已消除。
+- 收窄 `agents/`：只执行任务并返回内部报告；输入由 bytes 改为 path；graph 会重新验证产物确属本轮 workdir；Codex schema 保留名冲突已消除；Claude/Codex 的最小权限沙箱与 Office 主动内容校验已加入。
 - 更新 `run_mvp.py`：复合 session key 贯穿 debounce/lock/thread，附件入图前落盘，只按真实 interrupt resume。
 - 更新 README、TECHNICAL、DECISION、PITFALLS 与 LangGraph 教学提示词。
 

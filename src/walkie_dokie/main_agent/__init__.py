@@ -7,6 +7,7 @@
 
 from walkie_dokie.main_agent.base import (
     DialogueContext,
+    DialogueIntent,
     FinalizeContext,
     MainAgent,
     MainAgentDecision,
@@ -16,19 +17,24 @@ from walkie_dokie.main_agent.base import (
 from walkie_dokie.main_agent.deepseek import DeepSeekMainAgent
 from walkie_dokie.main_agent.memory import (
     JsonMemoryRepository,
+    LONG_TERM_MEMORY_COMMAND,
     MemoryRepository,
     render_memory_proposal,
+    render_memory_snapshot,
 )
 
 __all__ = [
     "DeepSeekMainAgent",
     "DialogueContext",
+    "DialogueIntent",
     "FinalizeContext",
     "JsonMemoryRepository",
+    "LONG_TERM_MEMORY_COMMAND",
     "MainAgent",
     "MainAgentDecision",
     "MemoryOperation",
     "MemoryRepository",
     "render_memory_proposal",
+    "render_memory_snapshot",
     "TaskContract",
 ]

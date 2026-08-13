@@ -28,6 +28,8 @@ class TurnRecord:
     output_filename: str | None
     duration_ms: int | None
     success: bool
+    # conversation 记录真实平台输入/输出；execution 记录文档执行单元运行。
+    record_type: str = "execution"
     error: str | None = None
 
 

@@ -5,7 +5,13 @@ from scripts.run_mvp import (
     _invoke_from_event,
     _waiting_for_confirmation,
     deliver_graph_output,
+    dispatch_fresh,
+    handle_event,
 )
+from walkie_dokie.main_agent.base import MemoryOperation
+from walkie_dokie.main_agent.memory import JsonMemoryRepository
+from walkie_dokie.orchestrator.locks import UserLocks
+from walkie_dokie.platforms.base import InboundEvent
 
 
 class FakePlatform:
@@ -80,3 +86,77 @@ async def test_artifact_is_delivered_before_main_agent_text(monkeypatch, tmp_pat
     assert platform.sent[0][1].file.filename == "result.docx"
     assert platform.sent[0][1].file.content == b"document"
     assert platform.sent[1][1].text == "已经处理好了。"
+
+
+async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatch):
+    class Graph:
+        async def aget_state(self, config):
+            return SimpleNamespace(next=(), interrupts=())
+
+        async def ainvoke(self, value, config, durability=None):
+            return {
+                "result": {
+                    "artifact": None,
+                    "reply_text": "我是小帮。",
+                    "success": True,
+                }
+            }
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    platform = FakePlatform()
+    await dispatch_fresh(
+        Graph(),
+        platform,
+        "test",
+        "u1",
+        "你是谁？",
+        None,
+        UserLocks(),
+    )
+
+    assert len(records) == 1
+    assert records[0].record_type == "conversation"
+    assert records[0].input_text == "你是谁？"
+    assert records[0].output_text == "我是小帮。"
+    assert records[0].success is True
+
+
+async def test_long_term_memory_command_bypasses_graph_and_debounce(
+    monkeypatch, tmp_path
+):
+    class MustNotRun:
+        def __getattr__(self, name):
+            raise AssertionError(f"{name} should not be called")
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    memory = JsonMemoryRepository(tmp_path / "memory")
+    memory.apply(
+        "test",
+        "u1",
+        (MemoryOperation("set", "name", "浮瓜", "我是浮瓜"),),
+        source_text="我是浮瓜",
+    )
+    platform = FakePlatform()
+
+    await handle_event(
+        MustNotRun(),
+        platform,
+        MustNotRun(),
+        UserLocks(),
+        memory,
+        InboundEvent("test", "u1", " /long-term-memory ", None),
+    )
+
+    assert platform.sent[0][1].text == "当前保存的长期记忆：\n姓名：浮瓜"
+    assert records[0].record_type == "conversation"
+    assert records[0].success is True

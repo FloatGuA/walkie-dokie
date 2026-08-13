@@ -30,7 +30,7 @@ class SessionState(TypedDict):
     # 固定上限避免 checkpoint 无限膨胀。确认中的当前任务由 pending_* 表达，
     # 不提前写入 history，避免补充说明时重复。
     recent_messages: list[dict[str, str]]
-    # 主 Agent 的结构化决策：action/user_message/task/memory_operations。确认通过后
+    # 主 Agent 的结构化决策：intent/action/user_message/task/memory_operations。确认通过后
     # 只把 task contract 交给执行 Agent，不把对话历史或整份长期档案倾倒过去。
     decision: dict | None
     # dict 而不是 ExecutionReport dataclass 直接存——checkpointer 序列化自定义类会报
@@ -40,5 +40,6 @@ class SessionState(TypedDict):
     # 本回合实际落盘的 memory set/delete 操作。透明回显已经并进主 Agent 的
     # user_message；保留此字段用于诊断/测试，不跨回合复用。
     memory_changes: list[dict] | None
-    # 用户确认后的 memory 持久化结果，用于任务执行完成时透明反馈；不跨回合复用。
+    # 仅用于恢复旧版“确认后保存”checkpoint；新回合会隐式保存长期记忆，并把
+    # 确定性结果直接追加到 decision.user_message。不跨回合复用。
     memory_feedback: str | None

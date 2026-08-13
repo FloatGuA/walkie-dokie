@@ -1,5 +1,6 @@
 import logging
 import logging.handlers
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +13,22 @@ LOG_FILE = _VAR_ROOT / "logs" / "walkie-dokie.log"
 # connected/disconnected/reconnecting，够用了。这里只按 logger 名字调粗，
 # 不影响我们自己模块（walkie_dokie.*）和其他第三方库的 DEBUG 粒度。
 _QUIET_LOGGERS = ["websockets", "aiosqlite"]
+# 飞书 SDK 会给 Lark logger 自己挂一个 stdout handler，同时又向 root
+# propagate，造成同一行打印两遍；更重要的是，它自己的 formatter 绕过了
+# 下方的凭证脱敏。清掉直接 handler 后仍由 root 正常记录连接状态。
+_ROOT_ONLY_LOGGERS = ["Lark"]
+
+# 飞书 SDK 的连接成功日志会打印完整 WebSocket URL，其中包含短期 access_key
+# 和 ticket。连接状态值得保留，但凭证绝不能跟着落盘。
+_SECRET_QUERY_VALUE_RE = re.compile(
+    r"(?i)([?&](?:access_key|ticket|app_secret|tenant_access_token)=)[^&\s]+"
+)
+
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        return _SECRET_QUERY_VALUE_RE.sub(r"\1<redacted>", rendered)
 
 
 def setup_logging(console_level: int = logging.INFO, file_level: int = logging.DEBUG) -> None:
@@ -28,7 +45,7 @@ def setup_logging(console_level: int = logging.INFO, file_level: int = logging.D
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
 
-    fmt = logging.Formatter(
+    fmt = _RedactingFormatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
 
@@ -47,6 +64,11 @@ def setup_logging(console_level: int = logging.INFO, file_level: int = logging.D
     root.setLevel(min(console_level, file_level))
     root.addHandler(console_handler)
     root.addHandler(file_handler)
+
+    for name in _ROOT_ONLY_LOGGERS:
+        direct_logger = logging.getLogger(name)
+        direct_logger.handlers.clear()
+        direct_logger.propagate = True
 
     for name in _QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.INFO)

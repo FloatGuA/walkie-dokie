@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -23,12 +24,18 @@ from langgraph.types import Command
 from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
 from walkie_dokie.artifacts import resolve_artifact_reference, store_incoming_file
 from walkie_dokie.logging_config import setup_logging
-from walkie_dokie.main_agent import DeepSeekMainAgent, JsonMemoryRepository
+from walkie_dokie.main_agent import (
+    DeepSeekMainAgent,
+    JsonMemoryRepository,
+    LONG_TERM_MEMORY_COMMAND,
+    render_memory_snapshot,
+)
 from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.debounce import Debouncer
 from walkie_dokie.orchestrator.locks import UserLocks
 from walkie_dokie.platforms.base import IncomingFile, InboundEvent, OutboundMessage
 from walkie_dokie.platforms.feishu import FeishuAdapter
+from walkie_dokie.turn_log import TurnRecord, log_turn
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +97,15 @@ async def _invoke_from_event(
     )
 
 
-async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dict) -> None:
+async def deliver_graph_output(
+    platform: FeishuAdapter, user_id: str, state: dict
+) -> tuple[str | None, str | None, bool]:
     if "__interrupt__" in state:
         # 给用户的话来自 MainAgent；task contract 只给 ExecutionAgent，不能混用。
         payload = state["__interrupt__"][0].value
+        logger.info("图输出等待用户确认 user_id=%s", user_id)
         await platform.send(user_id, OutboundMessage(text=payload["user_message"]))
-        return
+        return payload["user_message"], None, True
 
     result = state.get("result")
     if result is None:
@@ -109,8 +119,21 @@ async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dic
                     text=f"收到文件「{pending_file['filename']}」了，请告诉我需要我做什么。"
                 ),
             )
-        return
+            return (
+                f"收到文件「{pending_file['filename']}」了，请告诉我需要我做什么。",
+                None,
+                True,
+            )
+        else:
+            logger.info("图输出为空 user_id=%s", user_id)
+        return None, None, True
 
+    logger.info(
+        "图输出完成 user_id=%s success=%s artifact=%r",
+        user_id,
+        result.get("success"),
+        result.get("artifact") and result["artifact"].get("filename"),
+    )
     if result["artifact"] is not None:
         reference = result["artifact"]
         artifact = resolve_artifact_reference(reference)
@@ -125,6 +148,46 @@ async def deliver_graph_output(platform: FeishuAdapter, user_id: str, state: dic
             ),
         )
     await platform.send(user_id, OutboundMessage(text=result["reply_text"]))
+    return (
+        result["reply_text"],
+        result.get("artifact") and result["artifact"].get("filename"),
+        bool(result.get("success")),
+    )
+
+
+async def _log_conversation_turn(
+    *,
+    platform_name: str,
+    user_id: str,
+    input_text: str | None,
+    input_filename: str | None,
+    output_text: str | None,
+    output_filename: str | None,
+    duration_ms: int,
+    success: bool,
+    error: str | None = None,
+) -> None:
+    """Best-effort platform input/output evidence; never changes business outcome."""
+
+    try:
+        await log_turn(
+            TurnRecord(
+                platform=platform_name,
+                user_id=user_id,
+                run_id=None,
+                input_text=input_text,
+                input_filename=input_filename,
+                backend=None,
+                output_text=output_text,
+                output_filename=output_filename,
+                duration_ms=duration_ms,
+                success=success,
+                record_type="conversation",
+                error=error,
+            )
+        )
+    except Exception:
+        logger.exception("写 conversation turn log 失败，但不改变本轮业务结果")
 
 
 async def dispatch_fresh(
@@ -137,7 +200,15 @@ async def dispatch_fresh(
     locks: UserLocks,
 ) -> None:
     session_key = _session_key(platform_name, user_id)
+    started = time.monotonic()
+    logger.info(
+        "开始处理防抖回合 session=%s text_chars=%d file=%r",
+        session_key,
+        len(combined_text),
+        file and file.filename,
+    )
     async with locks.get(session_key):
+        fallback_text = "处理失败，稍后再试一下"
         try:
             state = await _invoke_from_event(
                 graph,
@@ -147,29 +218,96 @@ async def dispatch_fresh(
                 text=combined_text,
                 file=file,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("orchestrator 处理失败 user_id=%s", user_id)
-            await platform.send(user_id, OutboundMessage(text="处理失败，稍后再试一下"))
+            await platform.send(user_id, OutboundMessage(text=fallback_text))
+            await _log_conversation_turn(
+                platform_name=platform_name,
+                user_id=user_id,
+                input_text=combined_text or None,
+                input_filename=file.filename if file else None,
+                output_text=fallback_text,
+                output_filename=None,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                success=False,
+                error=str(exc),
+            )
             return
+        output_text = None
+        output_filename = None
+        output_success = False
+        delivery_error = None
         try:
             # MVP 先把同 session 的状态推进与对应网络投递放在同一顺序域；正式版
             # 应改为 durable outbox，而不是长期持锁等待平台网络。
-            await deliver_graph_output(platform, user_id, state)
-        except Exception:
+            output_text, output_filename, output_success = await deliver_graph_output(
+                platform, user_id, state
+            )
+        except Exception as exc:
+            delivery_error = str(exc)
             # 文件可能已经成功而文字失败；不能再追加一条“处理失败”制造更多
             # 不确定投递。持久 outbox 实现前只记录并保留 workspace 供人工恢复。
             logger.exception(
                 "投递图输出失败 platform=%s user_id=%s", platform_name, user_id
             )
+        finally:
+            await _log_conversation_turn(
+                platform_name=platform_name,
+                user_id=user_id,
+                input_text=combined_text or None,
+                input_filename=file.filename if file else None,
+                output_text=output_text,
+                output_filename=output_filename,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                success=output_success and delivery_error is None,
+                error=delivery_error,
+            )
+            logger.info(
+                "防抖回合处理结束 session=%s duration_ms=%d",
+                session_key,
+                int((time.monotonic() - started) * 1000),
+            )
 
 
 async def handle_event(
-    graph, platform: FeishuAdapter, debouncer: Debouncer, locks: UserLocks, event: InboundEvent
+    graph,
+    platform: FeishuAdapter,
+    debouncer: Debouncer,
+    locks: UserLocks,
+    memory_repository: JsonMemoryRepository,
+    event: InboundEvent,
 ) -> None:
     if not event.text and event.file is None:
         return
 
     session_key = _session_key(event.platform, event.user_id)
+    if event.file is None and (event.text or "").strip() == LONG_TERM_MEMORY_COMMAND:
+        started = time.monotonic()
+        async with locks.get(session_key):
+            try:
+                output_text = render_memory_snapshot(
+                    memory_repository.load(event.platform, event.user_id)
+                )
+                await platform.send(event.user_id, OutboundMessage(text=output_text))
+                error = None
+            except Exception as exc:
+                logger.exception("查询长期记忆失败 user_id=%s", event.user_id)
+                output_text = "长期记忆这次没有读取成功，请稍后再试。"
+                error = str(exc)
+                await platform.send(event.user_id, OutboundMessage(text=output_text))
+            await _log_conversation_turn(
+                platform_name=event.platform,
+                user_id=event.user_id,
+                input_text=event.text,
+                input_filename=None,
+                output_text=output_text,
+                output_filename=None,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                success=error is None,
+                error=error,
+            )
+        return
+
     resumed_state = None
     # 查询状态和决定“resume 还是防抖新回合”也必须和 ainvoke 使用同一把锁。
     # 否则 execute 正好结束/进入 interrupt 的边界上仍有 TOCTOU 窗口。
@@ -178,7 +316,15 @@ async def handle_event(
             snapshot = await graph.aget_state(
                 config={"configurable": {"thread_id": session_key}}
             )
+            logger.info(
+                "事件路由 session=%s waiting_confirmation=%s next=%r",
+                session_key,
+                _waiting_for_confirmation(snapshot),
+                snapshot.next,
+            )
             if _waiting_for_confirmation(snapshot):
+                started = time.monotonic()
+                logger.info("恢复确认中的回合 session=%s", session_key)
                 config = {"configurable": {"thread_id": session_key}}
                 file_reference = (
                     store_incoming_file(event.platform, event.user_id, event.file)
@@ -192,10 +338,34 @@ async def handle_event(
                     config=config,
                     durability="sync",
                 )
+                output_text = None
+                output_filename = None
+                output_success = False
+                delivery_error = None
                 try:
-                    await deliver_graph_output(platform, event.user_id, resumed_state)
-                except Exception:
+                    output_text, output_filename, output_success = await deliver_graph_output(
+                        platform, event.user_id, resumed_state
+                    )
+                except Exception as exc:
+                    delivery_error = str(exc)
                     logger.exception("恢复后投递失败 user_id=%s", event.user_id)
+                finally:
+                    await _log_conversation_turn(
+                        platform_name=event.platform,
+                        user_id=event.user_id,
+                        input_text=event.text,
+                        input_filename=event.file.filename if event.file else None,
+                        output_text=output_text,
+                        output_filename=output_filename,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        success=output_success and delivery_error is None,
+                        error=delivery_error,
+                    )
+                    logger.info(
+                        "确认回合处理结束 session=%s duration_ms=%d",
+                        session_key,
+                        int((time.monotonic() - started) * 1000),
+                    )
             elif snapshot.interrupts:
                 raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
             elif snapshot.next:
@@ -260,7 +430,14 @@ async def main():
 
         async def _handle_safely(event: InboundEvent) -> None:
             try:
-                await handle_event(graph, platform, debouncer, locks, event)
+                await handle_event(
+                    graph,
+                    platform,
+                    debouncer,
+                    locks,
+                    memory_repository,
+                    event,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -285,4 +462,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

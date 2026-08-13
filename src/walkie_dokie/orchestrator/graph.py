@@ -5,10 +5,11 @@ LangGraph 在这里是控制平面，不是主 Agent：它只负责累积跨消�
 记忆候选；ExecutionAgent 只执行已经确认的文档任务契约。
 
     collect -> main_agent --+-- reply ---------------------------> END
-                             +-- ask_memory --+-- save/discard ---> END
-                             |                +-- collect --------...
                              +-- ask_confirm -+-- prepare -> execute -> END
                                               +-- collect --------...
+
+``ask_memory`` 相关节点仅保留用于恢复升级前已经暂停的 checkpoint；新回合的
+长期记忆在确定性证据校验通过后隐式写入，不再要求用户二次确认。
 
 所有注册给 LangGraph 的节点和条件路由都使用 ``async def``。当前受管 Linux
 环境禁止工作线程通过 asyncio 的 socketpair 唤醒事件循环；同步节点在 ainvoke
@@ -34,6 +35,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from walkie_dokie.agents.base import ExecutionAgent, ExecutionReport, resolve_output_file
+from walkie_dokie.agents.security import validate_office_artifact, validate_report_text
 from walkie_dokie.artifacts import (
     output_artifact_reference,
     resolve_artifact_reference,
@@ -47,9 +49,10 @@ from walkie_dokie.main_agent.base import (
     task_from_dict,
 )
 from walkie_dokie.main_agent.memory import (
+    LONG_TERM_MEMORY_COMMAND,
     MemoryRepository,
     render_memory_notice,
-    render_memory_proposal,
+    render_memory_snapshot,
 )
 from walkie_dokie.orchestrator.state import SessionState
 from walkie_dokie.turn_log import TurnRecord, log_turn
@@ -78,6 +81,10 @@ _MEMORY_REJECT_RE = re.compile(
 _TASK_AND_MEMORY_CONFIRM_RE = re.compile(
     r"^(?:是并记住|是，?并记住|确认并记住|执行并记住)[\s!！。．.]*$"
 )
+_MEMORY_PERSISTENCE_CLAIM_RE = re.compile(
+    r"(?:记住|记下|保存|记录)(?:了|好|下来|成功|到(?:档案|资料)里)?",
+    re.IGNORECASE,
+)
 
 
 def _is_confirmation(reply: str) -> bool:
@@ -88,6 +95,31 @@ def _is_confirmation(reply: str) -> bool:
     """
 
     return bool(_CONFIRM_RE.fullmatch(reply.strip()))
+
+
+def _remove_unverified_memory_claim(
+    decision, *, had_memory_candidates: bool
+):
+    """Never let model prose claim a memory write before control-plane commit.
+
+    For direct identity turns with candidates, use a deterministic neutral reply;
+    the validated proposal and confirmation instructions are appended later.  This
+    also covers candidates rejected by the repository, which was the path that once
+    told a user "我记住了" while persisting nothing.
+    """
+
+    has_claim = bool(_MEMORY_PERSISTENCE_CLAIM_RE.search(decision.user_message))
+    if decision.action == "reply" and (had_memory_candidates or has_claim):
+        if has_claim:
+            logger.warning("移除未经落盘验证的记忆成功话术")
+        return replace(decision, user_message="谢谢你告诉我。")
+    if decision.action == "propose_task" and has_claim:
+        logger.warning("移除任务确认话术中未经落盘验证的记忆成功声明")
+        return replace(
+            decision,
+            user_message=f"我理解为：{decision.task.instruction}\n请回复“是”确认是否执行。",
+        )
+    return decision
 
 
 def _completed_turn_history(
@@ -181,8 +213,12 @@ def _validate_execution_report(
     workdir: Path, report: ExecutionReport
 ) -> ExecutionReport:
     """Re-establish trust at the plugin boundary for this exact execution cwd."""
+    summary = validate_report_text(report.summary, field="summary")
+    warnings = tuple(
+        validate_report_text(item, field="warnings") for item in report.warnings
+    )
     if report.artifact_path is None:
-        return report
+        return ExecutionReport(summary, None, None, warnings)
     assert report.result_filename is not None  # enforced by ExecutionReport
     expected = resolve_output_file(workdir, report.result_filename)
     if report.artifact_path.resolve() != expected:
@@ -190,12 +226,13 @@ def _validate_execution_report(
             "执行 Agent 返回了其他工作目录的 artifact："
             f"{report.artifact_path}（本轮期望 {expected}）"
         )
+    validate_office_artifact(expected, role="执行产物")
     # Keep only the path reconstructed from trusted workdir + validated basename.
     return ExecutionReport(
-        summary=report.summary,
+        summary=summary,
         artifact_path=expected,
         result_filename=report.result_filename,
-        warnings=report.warnings,
+        warnings=warnings,
     )
 
 
@@ -227,10 +264,18 @@ async def _has_instruction(state: SessionState) -> str:
 
 
 async def _route_after_decision(state: SessionState) -> str:
+    logger.info(
+        "意图分流 platform=%s user_id=%s intent=%s action=%s route=%s",
+        state["platform"],
+        state["user_id"],
+        state["decision"].get("intent"),
+        state["decision"]["action"],
+        "execution_confirmation"
+        if state["decision"]["action"] == "propose_task"
+        else "main_agent_reply",
+    )
     if state["decision"]["action"] == "propose_task":
         return "ask_confirm"
-    if state["decision"].get("memory_operations"):
-        return "ask_memory"
     return "reply"
 
 
@@ -342,6 +387,20 @@ def build_graph(
         active_artifact = state.get("active_artifact")
         try:
             known_facts = memory_repository.load(platform, user_id)
+            if (
+                state["pending_instruction"].strip() == LONG_TERM_MEMORY_COMMAND
+                and file is None
+            ):
+                return {
+                    "decision": {
+                        "intent": "chat",
+                        "action": "reply",
+                        "user_message": render_memory_snapshot(known_facts),
+                        "task": None,
+                        "memory_operations": [],
+                    },
+                    "memory_changes": None,
+                }
             async with asyncio.timeout(60):
                 decision = await main_agent.decide(
                     DialogueContext(
@@ -361,6 +420,7 @@ def build_graph(
             logger.exception("主 Agent 决策失败")
             return {
                 "decision": {
+                    "intent": "chat",
                     "action": "reply",
                     "user_message": "我这次没能理解你的请求，请稍后再发一次。",
                     "task": None,
@@ -369,25 +429,38 @@ def build_graph(
                 "memory_changes": None,
             }
 
+        had_memory_candidates = bool(decision.memory_operations)
         validated_operations = memory_repository.validate(
             decision.memory_operations,
             source_text=state.get("current_user_text") or "",
         )
         decision = replace(decision, memory_operations=validated_operations)
+        decision = _remove_unverified_memory_claim(
+            decision, had_memory_candidates=had_memory_candidates
+        )
+        changes: list[dict] = []
         if validated_operations:
-            proposal = render_memory_proposal(validated_operations)
-            instruction = (
-                "回复“是”只执行任务；回复“是并记住”执行任务并保存上述资料。"
-                if decision.action == "propose_task"
-                else "回复“记住”才会保存；回复“不用记”不会保存。"
-            )
+            try:
+                changes = memory_repository.apply(
+                    platform,
+                    user_id,
+                    validated_operations,
+                    source_text=state.get("current_user_text") or "",
+                )
+                memory_notice = (
+                    render_memory_notice(changes)
+                    or "这些长期资料已经是最新的。"
+                )
+            except Exception:
+                logger.exception("长期记忆隐式写入失败")
+                memory_notice = "长期资料这次没有保存成功，请稍后再告诉我一次。"
             decision = replace(
                 decision,
-                user_message=f"{decision.user_message}\n\n{proposal}\n{instruction}",
+                user_message=f"{decision.user_message}\n\n{memory_notice}",
             )
         return {
             "decision": decision_to_dict(decision),
-            "memory_changes": None,
+            "memory_changes": changes or None,
         }
 
     def _apply_confirmed_memory(state: SessionState) -> list[dict]:
@@ -584,6 +657,7 @@ def build_graph(
                         output_filename=report.result_filename if report else None,
                         duration_ms=int((time.monotonic() - started) * 1000),
                         success=error is None,
+                        record_type="execution",
                         error=error,
                     )
                 )
@@ -641,7 +715,6 @@ def build_graph(
         _route_after_decision,
         {
             "ask_confirm": "ask_confirm",
-            "ask_memory": "ask_memory",
             "reply": "reply",
         },
     )

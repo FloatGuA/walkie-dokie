@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _VAR_ROOT = Path(__file__).parent.parent.parent.parent / "var"
 MEMORY_DIR = _VAR_ROOT / "memory"
+LONG_TERM_MEMORY_COMMAND = "/long-term-memory"
 
 FIELD_LABELS = {
     "name": "姓名",
@@ -73,7 +74,7 @@ def _set_evidence_pattern(field: str, value: str) -> re.Pattern[str]:
     prefixes = {
         "name": (
             r"(?:我(?:的)?(?:名字|姓名)(?:叫|是|改成|改为)?|我叫|"
-            r"本人(?:的)?(?:名字|姓名)?(?:叫|是)|my\s+name\s+is|i\s+am)"
+            r"我是|本人(?:的)?(?:名字|姓名)?(?:叫|是)|my\s+name\s+is|i\s+am)"
         ),
         "department": (
             r"(?:我(?:的)?部门(?:是|改成|改为)?|我(?:在|属于|来自)|"
@@ -93,9 +94,69 @@ def _set_evidence_pattern(field: str, value: str) -> re.Pattern[str]:
     )
 
 
-def _operation_has_user_evidence(
-    operation: MemoryOperation, source_text: str
+def _normalized_grounding(value: str) -> str:
+    """Normalize only harmless Chinese possessive/spacing differences.
+
+    Models commonly canonicalize ``这个项目的开发者`` to ``项目开发者``.  We
+    permit that small normalization, but do not perform synonym expansion or fuzzy
+    matching: every meaningful character still has to occur in the quoted evidence.
+    """
+
+    return re.sub(r"[\s的]", "", value)
+
+
+def _value_is_grounded(value: str, evidence: str) -> bool:
+    if value in evidence:
+        return True
+    normalized_value = _normalized_grounding(value)
+    return bool(
+        normalized_value
+        and normalized_value in _normalized_grounding(evidence)
+    )
+
+
+def _has_elliptical_first_person_context(
+    field: str, evidence: str, source_text: str, start: int
 ) -> bool:
+    """Accept a Chinese continuation clause whose subject is an earlier ``我``.
+
+    Example: ``我是浮瓜，是这个项目的开发者``.  The second clause omits ``我``;
+    it is still a first-person assertion because it immediately continues the same
+    sentence after a comma.  Strong sentence boundaries deliberately break context.
+    """
+
+    if field not in {"department", "job_title"} or start <= 0:
+        # The model may quote the whole sentence rather than only the continuation
+        # clause.  Accept that stronger evidence when the same quote contains both
+        # the explicit first-person clause and the comma continuation.
+        continuation = {
+            "department": r"[，,]\s*(?:也)?(?:在|属于|来自)",
+            "job_title": r"[，,]\s*(?:也)?(?:是|担任|做)",
+        }.get(field)
+        return bool(
+            continuation
+            and re.search(r"(?:^|[，,])\s*我(?:叫|是|在|属于|来自|担任|做)", evidence)
+            and re.search(continuation, evidence)
+        )
+    prefix = source_text[:start]
+    if not prefix.endswith(("，", ",")):
+        return False
+    sentence_start = max(
+        (prefix.rfind(boundary) for boundary in "。！？；;\n"), default=-1
+    ) + 1
+    prior_clause = prefix[sentence_start:]
+    if not re.search(r"(?:^|[，,])\s*我(?:叫|是|在|属于|来自|担任|做)", prior_clause):
+        return False
+    continuation_patterns = {
+        "department": r"^(?:也)?(?:在|属于|来自)",
+        "job_title": r"^(?:也)?(?:是|担任|做)",
+    }
+    return bool(re.search(continuation_patterns[field], evidence.strip()))
+
+
+def _evidence_rejection_reason(
+    operation: MemoryOperation, source_text: str
+) -> str | None:
     """Conservatively check that a candidate is grounded in this user turn.
 
     This is intentionally stricter than a model prompt.  A false negative merely means
@@ -103,34 +164,45 @@ def _operation_has_user_evidence(
     """
 
     evidence = (operation.evidence or "").strip()
-    if not evidence or evidence not in source_text:
-        return False
+    if not evidence:
+        return "evidence 为空"
+    if evidence not in source_text:
+        return "evidence 不是当前用户消息的逐字片段"
     if operation.action == "delete":
         if source_text.rstrip().endswith(("?", "？")) or _NEGATED_DELETE.search(
             source_text
         ):
-            return False
-        return bool(
-            _DELETE_TERMS.search(evidence)
-            and _FIELD_DELETE_TERMS[operation.field].search(evidence)
-        )
+            return "删除表达是疑问或否定指令"
+        if not _DELETE_TERMS.search(evidence):
+            return "evidence 缺少明确删除动作"
+        if not _FIELD_DELETE_TERMS[operation.field].search(evidence):
+            return "evidence 没有点名要删除的字段"
+        return None
     value = (operation.value or "").strip()
-    if not value or value not in evidence:
-        return False
+    if not value:
+        return "set value 为空"
+    if not _value_is_grounded(value, evidence):
+        return "value 无法从 evidence 逐字或仅去除“的”后得到"
     if source_text.rstrip().endswith(("?", "？")):
-        return False
+        return "当前用户消息是疑问句"
     start = source_text.find(evidence)
     context_through_evidence = source_text[: start + len(evidence)]
     if _NON_ASSERTION_CONTEXT.search(context_through_evidence):
-        return False
+        return "证据位于引用、示例、文档或假设语境"
     opening_quotes = {'"', "'", "“", "‘", "「", "『"}
     closing_quotes = {'"', "'", "”", "’", "」", "』"}
     before = source_text[start - 1] if start else ""
     after_index = start + len(evidence)
     after = source_text[after_index] if after_index < len(source_text) else ""
     if before in opening_quotes and after in closing_quotes:
-        return False
-    return bool(_set_evidence_pattern(operation.field, value).search(evidence))
+        return "证据只是被引用的内容"
+    if _set_evidence_pattern(operation.field, value).search(evidence):
+        return None
+    if _has_elliptical_first_person_context(
+        operation.field, evidence, source_text, start
+    ):
+        return None
+    return "evidence 不符合该字段的第一人称表达"
 
 
 class MemoryRepository(ABC):
@@ -212,13 +284,20 @@ class JsonMemoryRepository(MemoryRepository):
             if operation.field not in FIELD_LABELS:
                 logger.warning("拒绝未知 memory 字段 field=%r", operation.field)
                 continue
-            if not _operation_has_user_evidence(operation, source_text):
+            rejection_reason = _evidence_rejection_reason(operation, source_text)
+            if rejection_reason is not None:
                 logger.warning(
-                    "拒绝缺少当前用户原文证据的 memory 操作 field=%s evidence=%r",
+                    "拒绝 memory 操作 field=%s evidence=%r reason=%s",
                     operation.field,
                     operation.evidence,
+                    rejection_reason,
                 )
                 continue
+            logger.info(
+                "memory 证据校验通过 field=%s evidence=%r",
+                operation.field,
+                operation.evidence,
+            )
             if operation.action == "set":
                 value = (operation.value or "").strip()
                 if not value or len(value) > 200:
@@ -325,3 +404,16 @@ def render_memory_proposal(operations: tuple[MemoryOperation, ...]) -> str:
         else:
             lines.append(f"忘记：{label}")
     return "建议保存的长期资料：\n" + "\n".join(lines)
+
+
+def render_memory_snapshot(facts: dict[str, str]) -> str:
+    """Render all stored long-term facts in stable, user-facing field order."""
+
+    lines = [
+        f"{label}：{facts[field]}"
+        for field, label in FIELD_LABELS.items()
+        if field in facts
+    ]
+    if not lines:
+        return "目前还没有保存任何长期记忆。"
+    return "当前保存的长期记忆：\n" + "\n".join(lines)

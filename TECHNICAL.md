@@ -21,7 +21,6 @@ InboundEvent
       collect
         → main_agent.decide
           ├─ reply → END
-          ├─ ask_memory(interrupt) → 保存/丢弃候选 → END
           └─ ask_confirm(interrupt)
                ├─ 补充/否定 → collect → main_agent
                └─ 确认 → prepare_execution → execute → END
@@ -36,7 +35,7 @@ InboundEvent
 
 接口位于 `main_agent/base.py`：
 
-1. `decide(DialogueContext) -> MainAgentDecision` 只能直接回复或提出文档任务。
+1. `decide(DialogueContext) -> MainAgentDecision` 输出显式 `intent`：`chat` 必须对应 `action=reply`，由 MainAgent 直接回答；`document_task` 必须对应 `action=propose_task`，经确认后才进入 ExecutionAgent。控制平面拒绝不一致的协议结果。
 2. `TaskContract.instruction` 必须自包含；缺失信息采用什么默认值或占位符由主 Agent 写进契约，graph 不追加业务 prompt。
 3. `use_previous_artifact` 只有主 Agent 能根据“继续修改刚才的文件”等语义设置。执行层不会自行猜测上一轮文件。
 4. `finalize(FinalizeContext) -> str` 把内部执行报告改写成用户回复。finalize 失败时使用确定性完成文案，不重新执行已经产生的副作用。
@@ -52,7 +51,7 @@ InboundEvent
 - 用户文件键包含原始 ID 的 hash，清洗后相同的两个 ID 不会串档案；
 - 写入使用同目录临时文件加 `os.replace`，实际变更会透明回显。
 
-校验通过不等于立即写入：普通对话会进入 `ask_memory`，用户回复“记住”才保存，回复“不用记”则丢弃；文档任务回复“是”只执行，回复“是并记住”才同时保存。这样 regex/模型误判只会产生可拒绝候选，不会静默污染档案。这仍不等于形式化语义证明；真实模型需做 golden eval，未来更强方案是带 `turn_id/source` 的可撤销 ledger。
+校验通过后会立即、幂等地写入，并透明回显实际变更；不再要求二次确认。安全边界因此依赖“当前原文逐字 evidence + 字段语义规则 + 白名单 + 用户可见回显”，而不是模型输出本身。精确命令 `/long-term-memory` 由入口层优先处理，并在同一用户锁内读取全部档案；图内也有确定性兜底，不经过 MainAgent。升级前已停在 `ask_memory` 的 checkpoint 仍可恢复，但新回合不会再进入该节点。这仍不等于形式化语义证明；更强方案是带 `turn_id/source` 的可撤销 ledger。
 
 `pending_instruction` 可能累积确认前多条消息；`current_user_text` 单独保存最后一条用户原文，只有后者可以作为记忆证据。
 
@@ -64,6 +63,16 @@ InboundEvent
 4. 输入名被收窄为 basename。执行器输出必须是工作目录内现存的单个普通文件；绝对路径、`..`、子目录、越界 symlink、目录冒充文件都会被拒绝。
 5. `ExecutionReport(summary, artifact_path, result_filename, warnings)` 有运行时不变量：path/filename 同时存在或同时为空，名字一致，path 指向普通文件，warnings 是字符串 tuple。graph 在插件边界还会按本轮 workdir + basename 重建路径并要求与报告一致，拒绝 sibling workspace 产物。
 6. Codex 的内部 output schema 位于保留子目录 `.walkie-dokie/`，不会覆盖同名用户上传文件。
+
+### 不可信文档与 prompt injection 边界
+
+- 用户指令、文件名、Office 文档内容和执行报告都视为不可信数据；提示词会明确标注这一点，但提示词本身不作为安全边界。
+- Claude 只开放 `Bash`，关闭 WebFetch/WebSearch、MCP、skills、子 Agent、auto-memory 与配置源；Bash 必须进入 fail-closed OS sandbox，不能申请 unsandboxed fallback。沙箱只读 Python 运行时、只读写本轮 workdir，拒绝其他 home/tmp、网络、Unix socket、本地监听和应用凭证环境变量。
+- Codex 不使用传统 `workspace-write` 的广泛读取模型，而加载 app-owned permission profile：`:minimal` 与 Codex/Python runtime 只读，本轮 workspace root 可写，网络关闭；独立 `CODEX_HOME` 不在命令可读范围内。执行为 non-interactive、ephemeral，不加载用户 config、rules、skills 或 web search。
+- Office 输入复制前与输出发布前都会解析 OOXML ZIP：只接受 `.docx/.xlsx`，限制压缩/解压体积和成员数，拒绝路径穿越、加密、宏、ActiveX、OLE/嵌入对象、外部关系、危险 Word 字段与会访问外部资源的 Excel 公式。
+- graph 在插件边界重新验证 report 长度、artifact basename/真实路径与 Office 内容；MainAgent finalize 没有 shell/文件工具，并把 report 字段当不可信数据。
+
+这些措施限制的是 prompt injection 能获得的能力，不是完整的租户虚拟机隔离。CPU/内存/进程数配额、恶意解析库 0-day 与强制过期清理仍应由容器/cgroup、专用服务账号和生命周期策略补齐。
 
 本地 path 只适合单机持久卷。多机部署必须换成对象存储 ID/URI，不能把某台机器的绝对路径当分布式 artifact 标识。
 
@@ -85,7 +94,7 @@ InboundEvent
 
 - 生产 checkpointer 是 `AsyncSqliteSaver`，分区键为 `thread_id="{platform}:{user_id}"`。`thread_id` 是运行配置 namespace，不是 state 字段本身。
 - `Checkpoint`、checkpoint metadata、`CheckpointTuple.pending_writes` 与面向调用者的 `StateSnapshot` 是不同层次，不能统称一个 dict。
-- `StateSnapshot.next` 表示该快照待执行的节点，不等于“正在等用户确认”。runner 只在 `snapshot.interrupts` 非空且 next 是已知的 `ask_confirm` 或 `ask_memory` 时 resume。
+- `StateSnapshot.next` 表示该快照待执行的节点，不等于“正在等用户确认”。runner 只在 `snapshot.interrupts` 非空且 next 是已知的 `ask_confirm`，或升级前遗留的 `ask_memory` 时 resume。
 - `interrupt(value)` 不是普通 return，也不保存 Python 栈。恢复时被中断节点从头运行，到同一 interrupt 序号取得 resume 值；payload/resume 必须可序列化，不能捕获框架内部中断异常，也不能在重跑时随意改变多个 interrupt 的顺序。
 - 确认回复使用一个可序列化 resume object：`{"text": ..., "file": ArtifactReference | null}`。附件不再通过 `aupdate_state` 插入暂停点，因此没有隐式 `as_node` 推断和两次调用之间的崩溃窗口。
 - 项目文件名 `checkpoints-v2.db` 中的 v2 是本项目 state schema 版本，与 LangGraph `ainvoke(version="v2")` 返回格式无关；当前仍使用默认 v1 输出并读取 `state["__interrupt__"]`。

@@ -159,6 +159,70 @@ def test_evidence_must_be_an_exact_quote_from_current_user_turn(tmp_path):
     assert changes == []
 
 
+def test_common_chinese_identity_and_elliptical_job_clause_are_grounded(tmp_path):
+    repository = JsonMemoryRepository(tmp_path)
+    source = "我是浮瓜，是这个项目的开发者。"
+
+    changes = repository.apply(
+        "test",
+        "u1",
+        (
+            MemoryOperation("set", "name", "浮瓜", "我是浮瓜"),
+            # Mirrors the real model output: value omits the possessive “的” and
+            # the continuation clause inherits its first-person subject.
+            MemoryOperation(
+                "set", "job_title", "项目开发者", "是这个项目的开发者"
+            ),
+        ),
+        source_text=source,
+    )
+
+    assert {change["field"] for change in changes} == {"name", "job_title"}
+    assert repository.load("test", "u1") == {
+        "name": "浮瓜",
+        "job_title": "项目开发者",
+    }
+
+    # The stronger full-sentence quote requested by the MainAgent prompt is valid too.
+    assert repository.validate(
+        (
+            MemoryOperation(
+                "set",
+                "job_title",
+                "项目开发者",
+                "我是浮瓜，是这个项目的开发者",
+            ),
+        ),
+        source_text=source,
+    )
+
+
+def test_elliptical_clause_requires_same_sentence_first_person_context(tmp_path):
+    repository = JsonMemoryRepository(tmp_path)
+    changes = repository.apply(
+        "test",
+        "u1",
+        (
+            MemoryOperation(
+                "set", "job_title", "项目开发者", "是这个项目的开发者"
+            ),
+        ),
+        source_text="浮瓜。是这个项目的开发者。",
+    )
+    assert changes == []
+
+
+def test_memory_value_must_still_be_grounded_in_evidence(tmp_path):
+    repository = JsonMemoryRepository(tmp_path)
+    changes = repository.apply(
+        "test",
+        "u1",
+        (MemoryOperation("set", "name", "西瓜", "我是浮瓜"),),
+        source_text="我是浮瓜",
+    )
+    assert changes == []
+
+
 @pytest.mark.parametrize(
     "source,evidence,field,value",
     [
