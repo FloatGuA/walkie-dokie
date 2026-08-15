@@ -1,1 +1,0 @@
-"""Contract-intelligence test package."""

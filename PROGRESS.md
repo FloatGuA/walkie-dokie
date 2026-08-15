@@ -1,26 +1,12 @@
 # walkie-dokie — Progress
 
-更新时间：2026-08-14（Asia/Shanghai）
+更新时间：2026-08-15（Asia/Shanghai）
 
-## 合同智能 Data Spike 第一批
+## 合同智能已拆分
 
-- **当前主线（2026-08-14）**：MVP 已拆为仅面向 PDF/Word 的链路 A（Agentic RAG）与面向 Excel 工程量清单结构化入库的链路 B。链路 A 暂停新增开发，当前只推进链路 B；两个显式 BOQ profile 已分别打通 XLSX/XLS → Evidence → Staging SQL，Admin 已可按同一甲方归属跨项目检索相似历史报价。
-- 新增 Django 本地管理入口及合同智能领域模型，覆盖项目、不可变文件版本、原始文件哈希、ParserRun、Evidence、Retrieval Trace、人工最终稿声明和 IndexBuild 草稿。
-- 新增 DOCX/XLSX 原生 baseline parser 与 PDF 文字层 baseline；未知或不可靠能力以 warning/失败显式暴露，不静默猜测。
-- 新增 Chunk/Evidence 检查页和中文 BM25 Retrieval Test；检索候选、分词、阶段分数及稳定证据 ID 均可检查和回放。
-- 第二批继续打通发布、合同问答、价格查询、飞书绑定和 Golden Dataset：发布有 Evidence Manifest 门禁；问答有原子 claim verifier 和一次受限重搜；价格采用白名单 MappingSpec → Staging → 人工 Trusted → 固定查询 → Decimal 计算；飞书私聊选择项目、群聊固定项目。
-- 完成首轮代码审查修复：一次问题固定一个 IndexBuild 快照和唯一 QuestionRun，Planner 失败及选路 trace 可审计；飞书同一私聊用户/群聊会话串行处理并记录异常；已准备/发布的 IndexBuild 与既有 MappingSpec 在 Admin 中只读；合同 Django 测试不再污染无关 pytest invocation。
-- 完成首批真实样例基线验证：XLSX 共 18 个 sheet、582 个非空行块和 1,075 个可读公式缓存；修复“一个隐藏列导致整行排除”后，默认排除行由 270 降为 0，隐藏列仍保留单元格级元数据。
-- 新增 `crland_general_v1` 工程量清单导入：不变的 `BoqImportSpec` 携带项目/甲方上下文，18 个 sheet 保留快照，实体清单与综合单价分析合并为同一明细事实，开办费/附表/计日工与项目汇总分别进入 Staging；Admin 可批量 Trusted/Rejected。
-- 真实 XLSX 已导入正式 `admin.db`（2026-08-14）：甲方按用户确认的原文保存为“华润”，314 条明细（实体 136、开办费 29、开办费附表 18、计日工 131）、11 条汇总和 18 个 sheet 快照全部落库；导入运行成功并通过清单/单价分析一一对应、成本分解、塔楼小计、不含税总计、税额和含税总价闭合校验。反查确认项目/甲方上下文唯一，全部保持 Staging，Trusted 为 0，待人工审核。
-- 新增 `crland_lighting_xls_v1` 并完成第二份真实旧版 XLS 导入（2026-08-14）：原始甲方保存为“华润置地（深圳）有限公司”，人工归属为“华润”；217 条行证据、99 条明细（实体 52、开办费 31、安全文明施工附表 16）、6 条汇总和 7 个 sheet 快照进入正式 `admin.db`。不含税 5,305,209.07、税额 477,468.82、含税 5,782,677.89 均由叶子明细独立闭合；18 个未识别公式函数只作为 warning，全部记录保持 Staging。
-- 新增 Admin 跨项目相似报价检索（2026-08-14）：查询限定同一 `party_a_group` 且排除当前项目，名称/型号/规格采用模糊评分，单位归一后硬匹配，功率/色温默认 ±10% 且可调整；用户指定数值而候选缺失时直接排除。真实数据以 `LED灯带 + m + 16.5W + 3000K` 验证，10% 命中另一项目 `安装LED灯带LL02`（15W、2700K、270.99 元/m），9% 不命中；默认 Trusted-only 为 0，显式勾选后才检查 Staging。
-- 完成逐行相似报价入口与 Admin 数值收敛（2026-08-14）：每条 BOQ 明细都有“查相似报价”按钮，搜索页固定当前项目、展示源项并预填名称、标签化型号、完整规格及可唯一提取的功率/色温；只有用户勾选的参数参与搜索，单位始终硬匹配，候选保持同一 BOQ 类型。数据库与计算保留原始 `Decimal`，列表和结果常用数值只显示 3 位小数。定向测试 8 passed，全仓离线套件 154 passed。
-- 完成灯具参数浮层查询（2026-08-14）：确认真实清单包含灯带、洗墙灯等灯具实体；新增带单位和原文的确定性参数提取，支持功率/功率密度、色温范围、光束角、电压、光效等独立数值容差，以及 IP、DMX、Ra/R9/SDCM、材质、颜色等可选模糊文本条件。明细列表表头固定，行按钮通过 Admin JSON API 在当前页浮层展示参数和结果表，不再跳转；长度/面积清单中按计价单位兼容 `W` 与 `W/m`、`W/m²` 的灯带写法。全仓离线套件 159 passed；本轮已用正式数据库洗墙灯/灯带行完成 HTTP API 冒烟，浏览器点击交互仍待真机确认。
-- 补充工程量名称规格解析（2026-08-15）：名称与描述分开标记来源；`矩形洞孔0.10 m2以内` 解析为 `area_m2` 上限 0.10，`0.10-0.30 m2` 解析为上下限。名称规格目前只展示和留痕，不进入相似报价筛选，等待业务确认连续/离散语义。定向 BOQ 测试 12 passed。
-- 完成两份真实 PDF 的只读诊断：318 页合同有 302 页文字层（94.97%），511 页合同有 446 页文字层（87.28%）；后者第 307–342 页为完整的 36 页扫描工程量清单，可与 XLSX sheet 结构对应。当前 PDF parser 只足够做文字层/扫描页预检，不足以作为最终版面和条款解析器。
-- 全仓离线套件现为 161 passed；另验证 `pytest tests/test_graph.py` 可在不初始化合同 Django 设置的情况下独立通过（36 passed）。
-- 链路 B 尚未完成正式数据 Trusted 审核、飞书查询入口、更多样本 profile 验证和面向报价决策的结果解释；链路 A 的 MinerU/Docling/PaddleOCR、Dense/Reranker 和 Phoenix 均按当前范围决策暂停。
+原 "合同智能 Data Spike" 进度记录已随 `contract_intelligence`/`contract_admin` 于
+2026-08-15 拆分到独立仓库 [contract-intelligence](../contract-intelligence)（保留在该
+仓库自己的 PROGRESS.md 中）。
 
 ## 当前结论
 
@@ -55,7 +41,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 标准 `pytest` 不再收集时启动真实 backend smoke script；两个脚本已有 `__main__` guard，pytest 配置限定 `tests/`。
 - ExecutionAgent prompt-injection 权限边界已收紧：Claude 使用 fail-closed Bash sandbox，Codex 使用最小 permission profile；两者都无执行网络、无 MCP/skills/子 Agent、无应用 secret 环境变量，只能写本轮 workspace。Codex profile 已在宿主 Linux 实测不能读取项目 README 或独立 CODEX_HOME，同时能写指定 workspace 并加载 python-docx/openpyxl。
 - `.docx/.xlsx` 在执行前后经过确定性 OOXML 校验；宏、嵌入对象、外部关系、危险字段/公式、异常 ZIP 会被拒绝。graph 会再次验证执行报告和产物，不信任 backend 自报路径。
-- 当前全量离线测试为 154 passed。
+- 当前全量离线测试为 110 passed（2026-08-15 `contract_intelligence` 拆分到独立仓库后，只统计 walkie-dokie 自身套件；拆分前含合同智能共 161 passed）。
 
 ## 尚未验证
 

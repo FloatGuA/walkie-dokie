@@ -128,12 +128,5 @@
 
 **判据**：测试移动前能导入 `scripts.*`，移动到嵌套目录后仅在 collection 阶段报同一模块不存在，先检查从 `tests/` 到测试文件之间的 package 层级是否连续，不要先修改生产代码的 import。
 
-## `xlrd` 读取 BIFF8 `.xls` 的缓存值成功，不等于它已理解全部公式
-
-**现象**：`xlrd 2.0.2` 能打开旧版 Excel 97–2003 工程量清单，返回的单价、合价、税额和总价看起来都正常；但解析时同时输出 `formula/tFunc unknown FuncID:257`。如果只看 cell value，很容易误以为公式也已被完整解析。
-
-**真因**：BIFF 文件保存了 Excel 上次计算的公式缓存值；`xlrd` 可以返回这些数值，但对样例中的某类函数 ID 没有完整的公式语义支持。“有数值”只能证明有可读缓存，不能证明系统能重算或验证原公式。
-
-**正确做法**：保留原始 `.xls` 和哈希；公式缓存只进入 Staging。导入 profile 必须用 `Decimal` 从叶子明细独立复算分项小计、不含税合计、税额和含税总价；需要验证公式文本或受控重算时，必须换用能保留该能力的工具链，不能用缓存值假冒重算结果。
-
-**判据**：旧版 `.xls` 解析时看到 `unknown FuncID`、但 cell value 仍然有数字，就应将它标记为“缓存值可读/公式未完整理解”，而不是“公式校验通过”。
+`xlrd`/BOQ 相关的坑已随 `contract_intelligence` 拆分到独立仓库
+[contract-intelligence](../contract-intelligence) 自己的 PITFALLS.md。
