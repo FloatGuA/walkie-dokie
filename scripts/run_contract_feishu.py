@@ -1,6 +1,7 @@
 """Dedicated Feishu entry point for published contract/price factual QA."""
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -25,10 +26,12 @@ from walkie_dokie.contract_intelligence.bindings import (
     select_user_project,
 )
 from walkie_dokie.logging_config import setup_logging
+from walkie_dokie.orchestrator.locks import UserLocks
 from walkie_dokie.platforms.base import InboundEvent, OutboundMessage
 from walkie_dokie.platforms.feishu import FeishuAdapter
 
 _PREFIX = "/contract"
+logger = logging.getLogger(__name__)
 
 
 def _render_answer(result: dict) -> str:
@@ -105,7 +108,18 @@ async def _private_command(event: InboundEvent, platform: FeishuAdapter) -> bool
     return False
 
 
-async def handle_contract_event(event: InboundEvent, platform: FeishuAdapter) -> None:
+def _contract_session_key(event: InboundEvent) -> str:
+    if event.conversation_type == "group":
+        if not event.conversation_id:
+            raise ValueError("群聊事件缺少 conversation_id")
+        return f"{event.platform}:contract:chat:{event.conversation_id}"
+    return f"{event.platform}:contract:user:{event.user_id}"
+
+
+async def _handle_contract_event_unlocked(
+    event: InboundEvent,
+    platform: FeishuAdapter,
+) -> None:
     if event.file is not None:
         await platform.send(event.reply_target, OutboundMessage(text="合同知识库文件只能由管理员 Web 上传。"))
         return
@@ -135,19 +149,49 @@ async def handle_contract_event(event: InboundEvent, platform: FeishuAdapter) ->
     except LookupError as exc:
         reply = f"当前无法查询合同项目：{exc}"
     except Exception:
-        reply = "本次合同查询失败，系统没有生成未经验证的答案。请联系管理员查看 QuestionRun。"
+        logger.exception(
+            "合同问答处理失败 platform=%s user_id=%s conversation_id=%s",
+            event.platform,
+            event.user_id,
+            event.conversation_id,
+        )
+        reply = "本次合同查询失败，系统没有生成未经验证的答案。请联系管理员查看运行日志或 QuestionRun。"
     await platform.send(event.reply_target, OutboundMessage(text=reply))
+
+
+async def handle_contract_event(
+    event: InboundEvent,
+    platform: FeishuAdapter,
+    locks: UserLocks,
+) -> None:
+    async with locks.get(_contract_session_key(event)):
+        await _handle_contract_event_unlocked(event, platform)
 
 
 async def main() -> None:
     setup_logging()
     platform = FeishuAdapter(os.environ["FEISHU_APP_ID"], os.environ["FEISHU_APP_SECRET"])
+    locks = UserLocks()
     platform.start()
     tasks: set[asyncio.Task] = set()
+
+    async def _handle_safely(event: InboundEvent) -> None:
+        try:
+            await handle_contract_event(event, platform, locks)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "未捕获的合同事件异常 platform=%s user_id=%s conversation_id=%s",
+                event.platform,
+                event.user_id,
+                event.conversation_id,
+            )
+
     try:
         while True:
             event = await platform.receive()
-            task = asyncio.create_task(handle_contract_event(event, platform))
+            task = asyncio.create_task(_handle_safely(event))
             tasks.add(task)
             task.add_done_callback(tasks.discard)
     finally:

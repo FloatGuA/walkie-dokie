@@ -1,0 +1,154 @@
+{% extends "admin/change_list.html" %}
+
+{% block extrastyle %}
+  {{ block.super }}
+  <style>
+    #result_list thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--body-bg, #fff);
+      box-shadow: 0 1px 0 var(--hairline-color, #ddd);
+    }
+    .similar-modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      background: rgba(0, 0, 0, .35);
+      align-items: flex-start;
+      justify-content: center;
+      padding: 5vh 2vw;
+      box-sizing: border-box;
+    }
+    .similar-modal-backdrop.is-open { display: flex; }
+    .similar-modal {
+      width: min(1100px, 96vw);
+      max-height: 90vh;
+      overflow: auto;
+      background: var(--body-bg, #fff);
+      border-radius: 5px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, .3);
+      padding: 20px 24px;
+      box-sizing: border-box;
+    }
+    .similar-modal-header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+    .similar-modal-close { border: 0; background: transparent; font-size: 24px; cursor: pointer; }
+    .similar-source { background: var(--darkened-bg, #f5f5f5); padding: 10px 14px; margin: 12px 0; }
+    .similar-parameter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 8px 16px; }
+    .similar-parameter { border: 1px solid var(--hairline-color, #ddd); padding: 8px; border-radius: 3px; }
+    .similar-parameter label { display: flex; gap: 6px; align-items: center; font-weight: bold; }
+    .similar-parameter .parameter-value { color: var(--body-quiet-color, #666); font-weight: normal; }
+    .similar-parameter input[type="number"] { width: 88px; }
+    .similar-parameter input[type="range"] { width: 130px; vertical-align: middle; }
+    .similar-results { margin-top: 16px; overflow-x: auto; }
+    .similar-results table { min-width: 850px; }
+    .similar-error { color: #ba2121; padding: 8px 0; }
+    .similar-loading { color: var(--body-quiet-color, #666); padding: 8px 0; }
+  </style>
+{% endblock %}
+
+{% block object-tools-items %}
+  <li>
+    <a href="{% url 'admin:contract_boq_similar_search' %}">跨项目相似报价搜索</a>
+  </li>
+  {{ block.super }}
+{% endblock %}
+
+{% block content %}
+  {{ block.super }}
+  <div id="similar-modal-backdrop" class="similar-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="similar-modal-title">
+    <div class="similar-modal">
+      <div class="similar-modal-header">
+        <h2 id="similar-modal-title">跨项目相似报价</h2>
+        <button type="button" class="similar-modal-close" aria-label="关闭">×</button>
+      </div>
+      <div id="similar-modal-body"><div class="similar-loading">请选择一条清单项。</div></div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      "use strict";
+      const backdrop = document.getElementById("similar-modal-backdrop");
+      const body = document.getElementById("similar-modal-body");
+      const close = () => { backdrop.classList.remove("is-open"); };
+      document.querySelector(".similar-modal-close").addEventListener("click", close);
+      backdrop.addEventListener("click", (event) => { if (event.target === backdrop) close(); });
+      document.addEventListener("keydown", (event) => { if (event.key === "Escape") close(); });
+
+      function escapeHtml(value) {
+        return String(value == null ? "" : value).replace(/[&<>\"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[char]));
+      }
+      function parameterControl(parameter, index) {
+        const id = `similar-parameter-${index}`;
+        if (parameter.searchable === false) {
+          const valueText = parameter.value !== null ? parameter.value : `${parameter.minimum || ""}-${parameter.maximum || ""}`;
+          return `<div class="similar-parameter"><label><input type="checkbox" disabled> ${escapeHtml(parameter.label)} <span class="parameter-value">${escapeHtml(valueText)} ${escapeHtml(parameter.unit)}</span></label><small>已解析；匹配规则待定义（来源：${escapeHtml(parameter.source)}）</small></div>`;
+        }
+        if (parameter.kind === "numeric") {
+          const isRange = parameter.value === null && parameter.minimum !== null && parameter.maximum !== null;
+          const valueText = isRange ? `${parameter.minimum}-${parameter.maximum}` : parameter.value;
+          return `<div class="similar-parameter">
+            <label><input type="checkbox" class="js-numeric-enabled" data-index="${index}" checked>
+              ${escapeHtml(parameter.label)} <span class="parameter-value">${escapeHtml(valueText)} ${escapeHtml(parameter.unit)}</span></label>
+            <div>容差 <input type="range" class="js-numeric-tolerance-range" data-index="${index}" min="0" max="50" step="0.5" value="10">
+              <input type="number" class="js-numeric-tolerance" data-index="${index}" min="0" max="100" step="0.5" value="10"> %</div>
+            <input type="hidden" class="js-numeric-value" data-index="${index}" value="${escapeHtml(parameter.value || "")}">
+            <input type="hidden" class="js-numeric-minimum" data-index="${index}" value="${escapeHtml(parameter.minimum || "")}">
+            <input type="hidden" class="js-numeric-maximum" data-index="${index}" value="${escapeHtml(parameter.maximum || "")}">
+            <input type="hidden" class="js-numeric-unit" data-index="${index}" value="${escapeHtml(parameter.unit)}">
+            <input type="hidden" class="js-numeric-key" data-index="${index}" value="${escapeHtml(parameter.key)}">
+          </div>`;
+        }
+        return `<div class="similar-parameter">
+          <label><input type="checkbox" class="js-text-enabled" data-index="${index}"> ${escapeHtml(parameter.label)} <span class="parameter-value">${escapeHtml(parameter.text)}</span></label>
+          <input type="hidden" class="js-text-key" data-index="${index}" value="${escapeHtml(parameter.key)}">
+          <input type="hidden" class="js-text-value" data-index="${index}" value="${escapeHtml(parameter.text)}">
+        </div>`;
+      }
+      function renderResults(data) {
+        const rows = data.matches.map((match) => `<tr>
+          <td><strong>${escapeHtml(Number(match.score).toFixed(3))}</strong></td>
+          <td>${escapeHtml(match.project_name)}<br><small>${escapeHtml(match.party_a_name)}</small></td>
+          <td><a href="${escapeHtml(match.change_url)}">${escapeHtml(match.item_name)}</a><br><small>${escapeHtml(match.item_code || "-")} / ${escapeHtml(match.unit)}</small><details><summary>特征描述</summary><pre>${escapeHtml(match.description)}</pre></details></td>
+          <td>${match.matched_parameters.map((item) => `${escapeHtml(item.key)}=${escapeHtml(item.value)}（${escapeHtml(item.delta_percent)}%）`).join("<br>") || "-"}</td>
+          <td>${escapeHtml(Number(match.unit_price).toFixed(3))} CNY / ${escapeHtml(match.unit)}</td>
+          <td>${escapeHtml(match.status)}</td>
+          <td>${escapeHtml(match.source_sheet)} 第 ${escapeHtml(match.source_row)} 行<br><a href="${escapeHtml(match.evidence_url)}">查看行证据</a></td>
+        </tr>`).join("");
+        return `<div class="similar-results"><p>甲方归属：<strong>${escapeHtml(data.party_a_group)}</strong>；预筛候选 ${escapeHtml(data.considered_count)} 条；返回 ${escapeHtml(data.matches.length)} 条。</p><table id="similar-result-table"><thead><tr><th>总分</th><th>项目 / 甲方</th><th>清单项</th><th>参数差异</th><th>不含税单价</th><th>状态</th><th>证据</th></tr></thead><tbody>${rows || "<tr><td colspan=\"7\">没有符合条件的其他项目报价。</td></tr>"}</tbody></table></div>`;
+      }
+      async function openModal(url) {
+        backdrop.classList.add("is-open");
+        body.innerHTML = "<div class=\"similar-loading\">正在读取源记录参数…</div>";
+        const response = await fetch(url, {headers: {"X-Requested-With": "XMLHttpRequest"}});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "读取参数失败");
+        body.innerHTML = `<div class="similar-source"><strong>${escapeHtml(data.source.project_name)} / ${escapeHtml(data.source.item_name)}</strong><br>单位：${escapeHtml(data.source.unit)}；当前不含税单价：${escapeHtml(data.source.unit_price || "-")}<br><small>${escapeHtml(data.source.party_a_name)}</small><details><summary>完整特征描述</summary><pre>${escapeHtml(data.source.description)}</pre></details></div>
+          <form id="similar-parameter-form"><div class="similar-parameter-grid">${data.parameters.map(parameterControl).join("")}</div><div style="margin-top:12px"><button type="submit" class="default">搜索相似报价</button> <label>默认容差 <input name="default_tolerance" type="number" min="0" max="100" step="0.5" value="10"> %</label> <label><input name="include_staging" type="checkbox"> 包含 Staging 待审核数据</label></div></form><div id="similar-result-container"></div>`;
+        body.querySelectorAll(".js-numeric-tolerance-range").forEach((range) => range.addEventListener("input", () => { body.querySelector(`.js-numeric-tolerance[data-index="${range.dataset.index}"]`).value = range.value; }));
+        body.querySelectorAll(".js-numeric-tolerance").forEach((input) => input.addEventListener("input", () => { body.querySelector(`.js-numeric-tolerance-range[data-index="${input.dataset.index}"]`).value = input.value; }));
+        body.querySelector("#similar-parameter-form").addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const numeric = [];
+          body.querySelectorAll(".js-numeric-enabled:checked").forEach((checkbox) => { const index = checkbox.dataset.index; const value = body.querySelector(`.js-numeric-value[data-index="${index}"]`).value; const minimum = body.querySelector(`.js-numeric-minimum[data-index="${index}"]`).value; const maximum = body.querySelector(`.js-numeric-maximum[data-index="${index}"]`).value; numeric.push({key: body.querySelector(`.js-numeric-key[data-index="${index}"]`).value, value: value || null, minimum: minimum || null, maximum: maximum || null, unit: body.querySelector(`.js-numeric-unit[data-index="${index}"]`).value, tolerance: body.querySelector(`.js-numeric-tolerance[data-index="${index}"]`).value}); });
+          const text = [];
+          body.querySelectorAll(".js-text-enabled:checked").forEach((checkbox) => { const index = checkbox.dataset.index; text.push({key: body.querySelector(`.js-text-key[data-index="${index}"]`).value, value: body.querySelector(`.js-text-value[data-index="${index}"]`).value}); });
+          const params = new URLSearchParams({search: "1", numeric: JSON.stringify(numeric), text: JSON.stringify(text), tolerance: body.querySelector("[name=default_tolerance]").value, include_staging: body.querySelector("[name=include_staging]").checked ? "1" : "0"});
+          const resultContainer = body.querySelector("#similar-result-container");
+          resultContainer.innerHTML = "<div class=\"similar-loading\">正在搜索…</div>";
+          const resultResponse = await fetch(`${url}?${params.toString()}`, {headers: {"X-Requested-With": "XMLHttpRequest"}});
+          const resultData = await resultResponse.json();
+          if (!resultResponse.ok) { resultContainer.innerHTML = `<div class="similar-error">${escapeHtml(resultData.error || "搜索失败")}</div>`; return; }
+          resultContainer.innerHTML = renderResults(resultData);
+        });
+      }
+      document.addEventListener("click", (event) => {
+        const link = event.target.closest(".js-similar-search");
+        if (!link) return;
+        event.preventDefault();
+        openModal(link.dataset.similarUrl).catch((error) => { body.innerHTML = `<div class="similar-error">${escapeHtml(error.message)}</div>`; });
+      });
+    }());
+  </script>
+{% endblock %}

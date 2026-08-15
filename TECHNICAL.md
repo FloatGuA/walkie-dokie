@@ -109,12 +109,38 @@ checkpoint 保存工作流短期状态，不保存或事务性覆盖：长期档
 - 平台投递当前没有持久 outbox；文件成功但文字失败会形成半投递。平台事件也尚无持久 inbox/event-id 去重。这两项是对外使用前的可靠性待办。
 - `recent_messages` 同时按 12 条、单条 2,000 字符、总计 12,000 字符截断；它不是无限对话历史。
 
+## 合同智能问答的快照与审计边界
+
+合同问答入口先在服务端校验项目权限，并且只解析一次当时的 Published IndexBuild；随后创建唯一 QuestionRun。Planner、合同检索、证据 hydration 和结构化价格查询都接收该固定 build ID，不再各自读取 `current_index_build`。即使管理员在问题执行期间发布新版本，本轮仍使用开始时的不可变快照，RetrievalTrace 与 QuestionRun 也必须指向同一版本；已经退役的 build 仅允许完成此前已开始的查询。权威实现见 `contract_intelligence/question_runs.py`、`search.py`、`pricing.py`、`workflow.py` 与 `agent.py`。
+
+顶层 Agent 拥有整轮运行的审计生命周期：Planner 失败、Tool 失败和验证失败都会把同一 QuestionRun 标记为 FAILED；成功、拒答或澄清会同时保存 Tool trace 与 Planner 的 provider、选路和原因。直接调用合同或价格入口时也复用同一生命周期协议，不产生双份运行记录。
+
+IndexBuild 从 READY 开始即冻结，PUBLISHED/RETIRED 状态继续保持不可变，其 through-document 快照也不能增删改；PriceMappingSpec 修改必须创建新版本。Admin 只提供对应的只读视图，不能依靠捕获 model save 异常来模拟表单校验。飞书合同入口本身不保存问答上下文，但为了保证私聊项目切换与后续查询的先后关系，以及群聊回复顺序，私聊按用户、群聊按 conversation 串行化；不同会话仍可并发。
+
+## 工程量清单的确定性入库边界
+
+链路 B 不经过 LLM/RAG。XLSX 或 Excel 97–2003 XLS 先由对应 baseline parser 生成带 sheet/row/cell 锚点的 Evidence，再由不可变的导入配置固定模板版本、项目名称、原文件甲方名称和人工维护的甲方归属。显式 profile 对 sheet 集合/顺序、表头、记录类型、清单与综合单价分析的一一对应及金额闭合做 fail-fast 校验；整批通过后才在一个事务中写入 Staging。旧版 XLS 只能读取公式缓存值时，系统必须显式保留 warning，并从叶子明细独立复算，不能把缓存值描述为受控重算。
+
+```text
+XLSX/XLS SourceFile
+  → baseline ParserRun / row Evidence
+  → immutable BoqImportSpec（profile + 项目 + 原始甲方 + 甲方归属）
+  → deterministic profile validation / arithmetic reconciliation
+  → Sheet Snapshot + Staging Item/Summary
+  → Admin 人工 Trusted / Rejected
+  → 跨项目确定性 SQL 预筛 + 模糊评分
+```
+
+综合单价分析不作为第二份价格事实重复入库，而是与实体清单明细合并，同时保留两边的 Evidence。空表只生成 sheet 快照，不伪造零价业务记录。跨项目检索始终先在调用方已授权 queryset 内确定当前项目唯一甲方归属，再限定同归属、其他项目和实体明细：Trusted 是默认边界，Admin 可显式纳入 Staging；单位经别名归一后硬匹配，名称/型号/规格只参与模糊评分，用户明确指定的功率或色温则按可调容差硬过滤，候选缺少该数值即排除。结果保留项目、价格、差异百分比和源行 Evidence，只表示“相似历史报价”，不自动给出推荐价。
+
+字段和约束的权威定义见 `contract_intelligence/models.py` 及对应迁移；两类导入规则见 `contract_intelligence/boq.py`、`boq_xls.py`，相似检索规则见 `boq_search.py`。此处不复制 schema 或评分常量。
+
 ## 为什么当前 sandbox 曾让 `ainvoke()` 看似卡死
 
 历史同步图在这次 Codex 受管 Linux sandbox 中会卡住，但根因不是 LangGraph 1.2.11 或 `InMemorySaver` 死锁：该环境对 Unix `socketpair.send()` 返回 `EPERM`。asyncio 的 `call_soon_threadsafe()` 依赖 selector self-pipe 唤醒；LangGraph/`langchain-core` 又用 executor 适配同步节点和同步 route。worker 已经计算完成，却无法唤醒 event loop，于是 await 一直 pending。纯 `asyncio.to_thread()` 也可复现，说明 LangGraph、interrupt、InMemorySaver 都不是这个现象的必要条件。
 
-当前所有图节点和 route 都是 `async def`，所以 `InMemorySaver` 离线流程正常。但 `aiosqlite` 自身使用 worker thread；当前受限 sandbox 仍不能代表生产 runner 能启动。正常部署 OS 必须允许跨线程 event-loop 唤醒，并需重新做真实 `AsyncSqliteSaver + DeepSeek + Claude + 飞书` 冒烟。
+当前所有图节点和 route 都是 `async def`，所以 `InMemorySaver` 离线流程正常。但 `aiosqlite` 以及 Django ORM 的 `sync_to_async()` 都使用 worker thread；当前受限 sandbox 中后者也会出现 SQL 已完成而 Future 未唤醒。相关集成测试只在测试侧提供 event-loop heartbeat 或以内联 fake 隔离线程桥接；生产代码不轮询掩盖环境问题。正常部署 OS 必须允许跨线程 event-loop 唤醒，并需重新做真实 `AsyncSqliteSaver + DeepSeek + Claude + 飞书` 冒烟。
 
 ## 测试边界
 
-`pytest` 通过 `testpaths=["tests"]` 只收集离线套件；两个真实 backend smoke script 有 `__main__` guard，不会在 collection 时启动外部 Agent。图测试使用 `InMemorySaver`、fake agents 和临时 Artifact/Memory/Workspace 根目录。它能验证协议和状态流，但不能替代真实模型语义 eval、生产 SQLite、平台重投/半投递或 sandbox 安全测试。
+`pytest` 通过 `testpaths=["tests"]` 只收集离线套件；合同 Django 测试位于 `tests/contract_intelligence/`，仅在收集该目录时由局部 `conftest.py` 初始化 Django，运行无关测试不依赖合同后台 import health。两个真实 backend smoke script 有 `__main__` guard，不会在 collection 时启动外部 Agent。图测试使用 `InMemorySaver`、fake agents 和临时 Artifact/Memory/Workspace 根目录。它能验证协议和状态流，但不能替代真实模型语义 eval、生产 SQLite、平台重投/半投递或 sandbox 安全测试。

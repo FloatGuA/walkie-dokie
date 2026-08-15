@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from typing import Protocol, TypedDict
 
 from asgiref.sync import sync_to_async
-from django.utils import timezone
 from langgraph.graph import END, START, StateGraph
 
 from .answering import (
@@ -21,10 +19,13 @@ from .deepseek import DeepSeekContractAnswerProvider, DeepSeekEvidenceVerifier
 from .models import (
     EvidenceUnit,
     IndexBuildDocument,
-    KnowledgeProject,
-    QuestionRun,
 )
-from .search import search_published_project
+from .question_runs import (
+    complete_question_run,
+    fail_question_run,
+    start_question_run,
+)
+from .search import search_index_build
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,9 +39,10 @@ class ContractSearchTool(Protocol):
 
 
 class DjangoPublishedContractSearch:
-    """Hydrate only evidence from the server-selected published IndexBuild."""
+    """Hydrate evidence from the immutable build pinned for this question."""
 
-    def __init__(self, *, actor_user=None):
+    def __init__(self, *, index_build_id: str, actor_user=None):
+        self._index_build_id = index_build_id
         self._actor_user = actor_user
 
     async def search(self, *, project_id: str, query: str, top_k: int) -> SearchBundle:
@@ -49,17 +51,15 @@ class DjangoPublishedContractSearch:
         )
 
     def _search_sync(self, *, project_id: str, query: str, top_k: int) -> SearchBundle:
-        result, trace = search_published_project(
+        result, trace = search_index_build(
             project_id,
+            self._index_build_id,
             query=query,
             top_k=top_k,
             actor_user=self._actor_user,
         )
-        project = KnowledgeProject.objects.select_related("current_index_build").get(
-            pk=project_id
-        )
         run_ids = IndexBuildDocument.objects.filter(
-            index_build=project.current_index_build
+            index_build_id=trace.index_build_id
         ).values_list("parser_run_id", flat=True)
         candidate_ids = [candidate.evidence_id for candidate in result.candidates]
         rows = EvidenceUnit.objects.filter(
@@ -344,6 +344,61 @@ def build_contract_qa_graph(
     return builder.compile()
 
 
+async def run_contract_question(
+    *,
+    authorized_project_id: str,
+    index_build_id: str,
+    question: str,
+    actor_user=None,
+    max_attempts: int = 2,
+    top_k: int = 12,
+    search_tool: ContractSearchTool | None = None,
+    answer_provider: ContractAnswerProvider | None = None,
+    verifier: EvidenceVerifier | None = None,
+) -> dict:
+    if not question.strip():
+        raise ValueError("question 不能为空")
+    if not 1 <= max_attempts <= 3:
+        raise ValueError("max_attempts 必须位于 1 到 3")
+
+    answer = answer_provider or DeepSeekContractAnswerProvider()
+    evidence_verifier = verifier or DeepSeekEvidenceVerifier()
+    graph = build_contract_qa_graph(
+        search_tool=search_tool
+        or DjangoPublishedContractSearch(
+            index_build_id=index_build_id,
+            actor_user=actor_user,
+        ),
+        answer_provider=answer,
+        verifier=evidence_verifier,
+    )
+    state = await graph.ainvoke(
+        {
+            "authorized_project_id": authorized_project_id,
+            "question": question.strip(),
+            "current_query": question.strip(),
+            "previous_queries": [],
+            "attempt": 0,
+            "max_attempts": max_attempts,
+            "top_k": top_k,
+            "current_evidence": [],
+            "accumulated_evidence": [],
+            "retrieval_trace_ids": [],
+            "rewrite_exhausted": False,
+        }
+    )
+    result = state["result"]
+    trace = {
+        "answer_provider": f"{answer.name}@{answer.version}",
+        "verifier": f"{evidence_verifier.name}@{evidence_verifier.version}",
+        "queries": state.get("previous_queries", []),
+        "attempts": state.get("attempt", 0),
+        "retrieval_trace_ids": state.get("retrieval_trace_ids", []),
+        "verification": state.get("verification", {}),
+    }
+    return {**result, "trace": trace}
+
+
 async def ask_contract_question(
     *,
     authorized_project_id: str,
@@ -357,75 +412,39 @@ async def ask_contract_question(
     answer_provider: ContractAnswerProvider | None = None,
     verifier: EvidenceVerifier | None = None,
 ) -> dict:
-    if not question.strip():
-        raise ValueError("question 不能为空")
     if not 1 <= max_attempts <= 3:
         raise ValueError("max_attempts 必须位于 1 到 3")
-
-    project = await sync_to_async(
-        KnowledgeProject.objects.select_related("current_index_build").get,
-        thread_sensitive=True,
-    )(pk=authorized_project_id, is_active=True)
-    if project.current_index_build is None:
-        raise LookupError("项目没有 Published IndexBuild")
-    run = await sync_to_async(QuestionRun.objects.create, thread_sensitive=True)(
-        project=project,
-        index_build=project.current_index_build,
-        actor_user=actor_user if getattr(actor_user, "is_authenticated", False) else None,
+    context = await start_question_run(
+        authorized_project_id=authorized_project_id,
+        question=question,
+        actor_user=actor_user,
         platform=platform,
-        actor_key_hash=(
-            hashlib.sha256(actor_key.encode("utf-8")).hexdigest() if actor_key else ""
-        ),
-        question=question.strip(),
-    )
-    answer = answer_provider or DeepSeekContractAnswerProvider()
-    evidence_verifier = verifier or DeepSeekEvidenceVerifier()
-    graph = build_contract_qa_graph(
-        search_tool=search_tool or DjangoPublishedContractSearch(actor_user=actor_user),
-        answer_provider=answer,
-        verifier=evidence_verifier,
+        actor_key=actor_key,
     )
     try:
-        state = await graph.ainvoke(
-            {
-                "authorized_project_id": str(project.id),
-                "question": question.strip(),
-                "current_query": question.strip(),
-                "previous_queries": [],
-                "attempt": 0,
-                "max_attempts": max_attempts,
-                "top_k": top_k,
-                "current_evidence": [],
-                "accumulated_evidence": [],
-                "retrieval_trace_ids": [],
-                "rewrite_exhausted": False,
-            }
+        result = await run_contract_question(
+            authorized_project_id=context.project_id,
+            index_build_id=context.index_build_id,
+            question=question,
+            actor_user=actor_user,
+            max_attempts=max_attempts,
+            top_k=top_k,
+            search_tool=search_tool,
+            answer_provider=answer_provider,
+            verifier=verifier,
         )
-        result = state["result"]
-        status = {
-            "answered": QuestionRun.Status.ANSWERED,
-            "refused": QuestionRun.Status.REFUSED,
-            "clarification": QuestionRun.Status.CLARIFICATION,
-        }[result["status"]]
-        trace = {
-            "answer_provider": f"{answer.name}@{answer.version}",
-            "verifier": f"{evidence_verifier.name}@{evidence_verifier.version}",
-            "queries": state.get("previous_queries", []),
-            "attempts": state.get("attempt", 0),
-            "retrieval_trace_ids": state.get("retrieval_trace_ids", []),
-            "verification": state.get("verification", {}),
-        }
-        await sync_to_async(QuestionRun.objects.filter(pk=run.pk).update, thread_sensitive=True)(
-            status=status,
-            answer_payload=result,
+        trace = result["trace"]
+        answer_payload = {key: value for key, value in result.items() if key != "trace"}
+        await complete_question_run(
+            context,
+            result=answer_payload,
             workflow_trace=trace,
-            finished_at=timezone.now(),
         )
-        return {**result, "question_run_id": str(run.id), "trace": trace}
+        return {
+            **answer_payload,
+            "question_run_id": context.question_run_id,
+            "trace": trace,
+        }
     except Exception as exc:
-        await sync_to_async(QuestionRun.objects.filter(pk=run.pk).update, thread_sensitive=True)(
-            status=QuestionRun.Status.FAILED,
-            error=f"{type(exc).__name__}: {exc}"[:8_000],
-            finished_at=timezone.now(),
-        )
+        await fail_question_run(context, exc)
         raise

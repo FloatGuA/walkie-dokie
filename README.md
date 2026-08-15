@@ -64,7 +64,7 @@ python scripts/run_mvp.py
 
 ## 合同智能 Data Spike 管理台
 
-仓库内已经加入独立的 `contract_intelligence` 领域模块。当前第一刀用于接收真实 DOCX/XLSX/PDF 样例并检查结构，不会把尚未接入的 Dense/Reranker/OCR 冒充为完整 Hybrid RAG。
+仓库内已经加入独立的 `contract_intelligence` 领域模块。当前第一刀用于接收真实 DOCX/XLS/XLSX/PDF 样例并检查结构，不会把尚未接入的 Dense/Reranker/OCR 冒充为完整 Hybrid RAG。
 
 初始化本地管理数据库并创建管理员：
 
@@ -77,6 +77,7 @@ python scripts/manage_contracts.py runserver 127.0.0.1:8000
 打开 `http://127.0.0.1:8000/admin/`，依次创建知识库项目、逻辑文档和不可变文档版本，在版本页上传结构化原件及正式 PDF。回到版本列表执行“baseline ingestion”，随后通过“Chunk / Evidence”查看：
 
 - DOCX 条款、标题和表格行及其 source anchor；
+- Excel 97–2003 XLS 的 sheet/行/单元格锚点、缓存值和公式能力限制；
 - XLSX sheet、行、单元格、公式、缓存值、隐藏区域和合并区域；
 - PDF 物理页、印刷页标签以及无文字层/OCR 待办；
 - Parser warning、原件/PDF baseline 一致性报告；
@@ -89,6 +90,15 @@ python scripts/manage_contracts.py runserver 127.0.0.1:8000
 - 每次查询持久化 `QuestionRun`、Retrieval Trace、Provider 版本和 verifier 结果。
 - `GoldenCase` 可标注回答/拒答/澄清、期望证据和数值结果；评估输出 Retrieval Recall@K、Answer/Citation/Numeric Accuracy 与 Hallucination Rate。未接 Reranker 时该指标明确为空。
 
+当前 MVP 主线已转为 Excel 工程量清单结构化入库，PDF/Word Agentic RAG 暂停新增开发。在上传与 profile 对应的 XLSX 或 XLS 并完成 baseline ingestion 后：
+
+1. 在 Admin 创建“工程量清单导入配置”，选择已验证 profile，填写项目全称、原文件甲方全称和人工维护的甲方归属（例如原名“华润置地（深圳）有限公司”、归属“华润”）。
+2. 执行“按已验证模板导入工程量清单到 Staging”。项目名称与封皮不一致、甲方为空、表头漂移、公式无缓存、清单/单价分析不对应或金额不闭合时，整批失败。
+3. 通过“工程量清单 Sheet 快照”、“工程量清单明细”和“工程量清单汇总记录”检查导入结果，只将人工复核通过的记录批量标为 Trusted。
+4. 在“工程量清单明细”列表中，直接点击目标行的“查相似报价”。当前页浮层会展示源项和带原文的技术参数：功率/功率密度、色温（含范围）、光束角、电压、光效等数值可逐项启用并独立调整容差；IP、型号、DMX、Ra/R9/SDCM、材质、颜色等离散属性可选模糊文本匹配。名称中的工程规格（例如 `0.10 m2以内`、`0.10-0.30 m2`）也会解析并标记来源，但在匹配语义确认前不会参与筛选。长度/面积计价的灯带会兼容 `W` 与 `W/m`、`W/m²` 的常见写法。结果仍只查同一甲方归属下其他项目、同一 BOQ 类型的 Trusted 明细，单位始终硬匹配，默认数值容差 10% 且可调整；管理员需要检查未审核数据时可显式勾选“包含 Staging”。列表表头固定，列表和结果显示 3 位小数，数据库仍保留原始精度。
+
+现有 profile 只支持已用真实样例验证的 18-sheet XLSX 模板和 7-sheet 商业泛光照明 XLS 模板。其他工程量清单格式应新增显式 profile，不会模糊猜列。相似搜索返回历史事实、参数差异和源行证据，不等于系统推荐价。
+
 飞书合同入口使用独立进程：
 
 ```bash
@@ -99,7 +109,7 @@ python scripts/run_contract_feishu.py
 
 SQLite 只用于本地 Data Spike。设置 `CONTRACT_DB_ENGINE=postgresql` 后可切 PostgreSQL；安装驱动使用 `pip install -e ".[postgres]"`。Django 开发服务器只适合本机调试，不是生产部署方式。
 
-当前仍是样例前 MVP：合同召回只有 BM25，没有 Dense/Reranker；PDF 只有文字层解析，没有 OCR；后台 ingestion 目前同步执行，没有 Celery；尚未接 RAGFlow/Phoenix。管理端会明确显示这些限制，不能把当前结果表述为已经达到最终 Hybrid RAG 精度。
+工程量清单后台 ingestion 目前同步执行，没有 Celery；跨项目相似报价当前仅在 Admin 提供，飞书尚未接入且未来只允许查询 Trusted。合同链路仍只有 BM25 和 PDF 文字层解析，没有 Dense/Reranker/OCR；RAGFlow/Phoenix 也尚未接入，且按当前范围决策暂停。
 
 ## 架构边界
 

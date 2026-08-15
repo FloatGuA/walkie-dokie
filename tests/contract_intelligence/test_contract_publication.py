@@ -20,6 +20,7 @@ from walkie_dokie.contract_intelligence.publication import (
     prepare_index_build,
     publish_index_build,
 )
+from walkie_dokie.contract_intelligence.search import search_index_build
 
 
 def _source_bytes() -> bytes:
@@ -81,3 +82,44 @@ def test_prepare_refuses_version_without_authority_review(settings, tmp_path):
 
     with pytest.raises(ValidationError, match="人工最终稿确认"):
         prepare_index_build(build.pk)
+
+
+@pytest.mark.django_db
+def test_contract_search_can_finish_against_build_pinned_before_republication(
+    settings, tmp_path
+):
+    project, _, pinned_build = _draft_build(settings, tmp_path)
+    prepare_index_build(pinned_build.pk)
+    publish_index_build(pinned_build.pk)
+    replacement = IndexBuild.objects.create(
+        project=project,
+        name="replacement",
+        status=IndexBuild.Status.PUBLISHED,
+    )
+    IndexBuild.objects.filter(pk=pinned_build.pk).update(status=IndexBuild.Status.RETIRED)
+    KnowledgeProject.objects.filter(pk=project.pk).update(current_index_build=replacement)
+
+    result, trace = search_index_build(
+        project.pk,
+        pinned_build.pk,
+        query="服务费",
+        top_k=3,
+    )
+
+    assert trace.index_build_id == pinned_build.id
+    assert result.candidates
+    assert "服务费" in result.candidates[0].text
+
+
+@pytest.mark.django_db
+def test_prepared_build_and_its_document_snapshot_are_immutable(settings, tmp_path):
+    _, _, build = _draft_build(settings, tmp_path)
+    link = build.indexbuilddocument_set.get()
+    prepare_index_build(build.pk)
+
+    build.refresh_from_db()
+    build.name = "attempted overwrite"
+    with pytest.raises(ValidationError, match="不允许原地修改"):
+        build.save()
+    with pytest.raises(ValidationError, match="不允许修改文档快照"):
+        link.delete()

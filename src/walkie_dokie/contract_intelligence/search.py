@@ -5,6 +5,7 @@ from __future__ import annotations
 from django.db import transaction
 
 from .models import (
+    IndexBuild,
     IndexBuildDocument,
     KnowledgeProject,
     ParserRun,
@@ -96,6 +97,50 @@ def search_published_project(
     build = project.current_index_build
     if build is None or build.status != build.Status.PUBLISHED:
         raise LookupError("项目没有已发布的 IndexBuild")
+    return _search_index_build(
+        project=project,
+        build=build,
+        query=query,
+        top_k=top_k,
+        actor_user=actor_user,
+        provider=provider,
+    )
+
+
+def search_index_build(
+    authorized_project_id,
+    index_build_id,
+    *,
+    query: str,
+    top_k: int = 10,
+    actor_user=None,
+    provider: RetrievalProvider | None = None,
+) -> tuple[RetrievalResult, RetrievalTrace]:
+    """Search one immutable build snapshot pinned when the question started."""
+
+    project = KnowledgeProject.objects.get(pk=authorized_project_id, is_active=True)
+    build = IndexBuild.objects.get(pk=index_build_id, project=project)
+    if build.status not in {IndexBuild.Status.PUBLISHED, IndexBuild.Status.RETIRED}:
+        raise ValueError("问答只能查询已发布或已退役的 IndexBuild 快照")
+    return _search_index_build(
+        project=project,
+        build=build,
+        query=query,
+        top_k=top_k,
+        actor_user=actor_user,
+        provider=provider,
+    )
+
+
+def _search_index_build(
+    *,
+    project: KnowledgeProject,
+    build: IndexBuild,
+    query: str,
+    top_k: int,
+    actor_user,
+    provider: RetrievalProvider | None,
+) -> tuple[RetrievalResult, RetrievalTrace]:
     run_ids = IndexBuildDocument.objects.filter(index_build=build).values_list(
         "parser_run_id", flat=True
     )

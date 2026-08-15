@@ -200,11 +200,15 @@ class SourceFile(models.Model):
         super().clean()
         filename = self.file.name if self.file else self.original_name
         suffix = Path(filename).suffix.casefold()
-        allowed = {".docx", ".xlsx", ".pdf"}
+        allowed = {".docx", ".xls", ".xlsx", ".pdf"}
         if suffix not in allowed:
-            raise ValidationError({"file": "MVP 只接受 DOCX、XLSX 或 PDF"})
-        if self.role == self.Role.STRUCTURED_SOURCE and suffix not in {".docx", ".xlsx"}:
-            raise ValidationError({"file": "结构化原件必须是 DOCX 或 XLSX"})
+            raise ValidationError({"file": "MVP 只接受 DOCX、XLS、XLSX 或 PDF"})
+        if self.role == self.Role.STRUCTURED_SOURCE and suffix not in {
+            ".docx",
+            ".xls",
+            ".xlsx",
+        }:
+            raise ValidationError({"file": "结构化原件必须是 DOCX、XLS 或 XLSX"})
         if self.role in {self.Role.EXECUTED_COPY, self.Role.DERIVED_RENDER} and suffix != ".pdf":
             raise ValidationError({"file": "正式副本或渲染快照必须是 PDF"})
         if self.document_version_id and self.document_version.status == DocumentVersion.Status.PUBLISHED:
@@ -590,6 +594,378 @@ class PriceRecord(models.Model):
         return f"{self.product_name} / {self.unit_price} {self.currency}"
 
 
+class BoqImportSpec(models.Model):
+    """Immutable import context for one explicitly supported BOQ workbook profile."""
+
+    class Profile(models.TextChoices):
+        CRLAND_GENERAL_V1 = "crland_general_v1", "华润通用工程清单 v1"
+        CRLAND_LIGHTING_XLS_V1 = (
+            "crland_lighting_xls_v1",
+            "华润商业泛光照明 XLS v1",
+        )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    document_version = models.ForeignKey(
+        DocumentVersion, on_delete=models.PROTECT, related_name="boq_import_specs"
+    )
+    source_file = models.ForeignKey(
+        SourceFile, on_delete=models.PROTECT, related_name="boq_import_specs"
+    )
+    name = models.CharField(max_length=200)
+    version = models.PositiveIntegerField(default=1)
+    profile = models.CharField(max_length=50, choices=Profile.choices)
+    project_name = models.CharField(max_length=500)
+    party_a_name = models.CharField(max_length=500)
+    party_a_group = models.CharField(max_length=500)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="created_boq_import_specs",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "工程量清单导入配置"
+        verbose_name_plural = "工程量清单导入配置"
+        ordering = ("-created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=("document_version", "name", "version"),
+                name="contract_unique_boq_import_spec_version",
+            )
+        ]
+
+    def clean(self) -> None:
+        super().clean()
+        if self.source_file_id:
+            if self.source_file.document_version_id != self.document_version_id:
+                raise ValidationError("工程量清单源文件必须属于同一 DocumentVersion")
+            expected_suffix = {
+                self.Profile.CRLAND_GENERAL_V1: ".xlsx",
+                self.Profile.CRLAND_LIGHTING_XLS_V1: ".xls",
+            }.get(self.profile)
+            if expected_suffix is None:
+                raise ValidationError("工程量清单 profile 不受支持")
+            actual_suffix = Path(self.source_file.original_name).suffix.casefold()
+            if actual_suffix != expected_suffix:
+                raise ValidationError(
+                    f"profile {self.profile!r} 要求 {expected_suffix.upper()} 源文件"
+                )
+        if not self.project_name.strip():
+            raise ValidationError("项目名称不能为空")
+        if not self.party_a_name.strip():
+            raise ValidationError("甲方名称不能为空；原文件未填写时必须人工确认")
+        if not self.party_a_group.strip():
+            raise ValidationError("甲方归属不能为空；跨项目查询按该字段隔离")
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("BoqImportSpec 不允许原地修改；请创建新版本")
+        return super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.document_version} / {self.name} v{self.version}"
+
+
+class BoqImportRun(models.Model):
+    class Status(models.TextChoices):
+        RUNNING = "running", "运行中"
+        SUCCEEDED = "succeeded", "成功"
+        FAILED = "failed", "失败"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    import_spec = models.ForeignKey(
+        BoqImportSpec, on_delete=models.PROTECT, related_name="import_runs"
+    )
+    status = models.CharField(max_length=20, choices=Status.choices)
+    imported_sheet_count = models.PositiveIntegerField(default=0)
+    imported_item_count = models.PositiveIntegerField(default=0)
+    imported_summary_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list)
+    error = models.TextField(blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "工程量清单导入运行"
+        verbose_name_plural = "工程量清单导入运行"
+        ordering = ("-started_at",)
+
+    def __str__(self) -> str:
+        return f"{self.import_spec} / {self.get_status_display()}"
+
+
+class BoqSheetSnapshot(models.Model):
+    class Kind(models.TextChoices):
+        MANIFEST = "manifest", "清单目录"
+        COVER = "cover", "封皮"
+        NOTES = "notes", "编制说明"
+        SUMMARY = "summary", "汇总表"
+        ENTITY = "entity", "实体工程量"
+        OPENING = "opening", "开办费"
+        OPENING_APPENDIX = "opening_appendix", "开办费附表"
+        MANAGEMENT = "management", "照管费"
+        DAYWORK = "daywork", "计日工"
+        PROVISIONAL = "provisional", "暂列清单"
+        UNIT_PRICE_ANALYSIS = "unit_price_analysis", "综合单价分析"
+
+    import_run = models.ForeignKey(
+        BoqImportRun, on_delete=models.PROTECT, related_name="sheet_snapshots"
+    )
+    source_sheet = models.CharField(max_length=200)
+    kind = models.CharField(max_length=40, choices=Kind.choices)
+    header_row = models.PositiveIntegerField(null=True, blank=True)
+    nonempty_row_count = models.PositiveIntegerField()
+    formula_count = models.PositiveIntegerField()
+    imported_record_count = models.PositiveIntegerField(default=0)
+    is_empty_template = models.BooleanField(default=False)
+    metadata = models.JSONField(default=dict)
+
+    class Meta:
+        verbose_name = "工程量清单 Sheet 快照"
+        verbose_name_plural = "工程量清单 Sheet 快照"
+        ordering = ("import_run", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("import_run", "source_sheet"),
+                name="contract_unique_boq_run_sheet",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.source_sheet} / {self.get_kind_display()}"
+
+
+class BoqItemRecord(models.Model):
+    class Status(models.TextChoices):
+        STAGING = "staging", "待人工确认"
+        TRUSTED = "trusted", "可信"
+        REJECTED = "rejected", "已拒绝"
+
+    class Kind(models.TextChoices):
+        ENTITY = "entity", "实体工程量"
+        OPENING = "opening", "开办费"
+        OPENING_APPENDIX = "opening_appendix", "开办费附表"
+        DAYWORK = "daywork", "计日工"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    import_run = models.ForeignKey(
+        BoqImportRun, on_delete=models.PROTECT, related_name="item_records"
+    )
+    document_version = models.ForeignKey(
+        DocumentVersion, on_delete=models.PROTECT, related_name="boq_item_records"
+    )
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.STAGING
+    )
+    project_name = models.CharField(max_length=500)
+    party_a_name = models.CharField(max_length=500)
+    party_a_group = models.CharField(max_length=500)
+    kind = models.CharField(max_length=40, choices=Kind.choices)
+    tower_name = models.CharField(max_length=100, blank=True)
+    section_code = models.CharField(max_length=200, blank=True)
+    section_name = models.CharField(max_length=500, blank=True)
+    source_item_id = models.CharField(max_length=200, blank=True)
+    source_parent_id = models.CharField(max_length=200, blank=True)
+    source_unique_id = models.CharField(max_length=200, blank=True)
+    source_sort_code = models.CharField(max_length=200, blank=True)
+    item_code = models.CharField(max_length=200, blank=True)
+    item_name = models.CharField(max_length=500, blank=True)
+    item_description = models.TextField(blank=True)
+    unit = models.CharField(max_length=100, blank=True)
+    quantity = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    unit_price = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    total_price = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    currency = models.CharField(max_length=20, default="CNY")
+    tax_included = models.BooleanField(default=False)
+    guide_price = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    adjustment_rate = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    labor_cost = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    material_cost = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    main_material_cost = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    main_material_loss_rate = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    loss_cost = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    auxiliary_material_cost = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    machinery_cost = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    management_cost = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    profit = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    notes = models.TextField(blank=True)
+    extensions = models.JSONField(default=dict)
+    source_sheet = models.CharField(max_length=200)
+    source_row = models.PositiveIntegerField()
+    source_cells = models.JSONField(default=dict)
+    row_evidence = models.ForeignKey(
+        EvidenceUnit, on_delete=models.PROTECT, related_name="boq_item_row_records"
+    )
+    header_evidence = models.ForeignKey(
+        EvidenceUnit, on_delete=models.PROTECT, related_name="boq_item_header_records"
+    )
+    analysis_source_sheet = models.CharField(max_length=200, blank=True)
+    analysis_source_row = models.PositiveIntegerField(null=True, blank=True)
+    analysis_source_cells = models.JSONField(default=dict)
+    analysis_evidence = models.ForeignKey(
+        EvidenceUnit,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="boq_item_analysis_records",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="reviewed_boq_item_records",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "工程量清单明细"
+        verbose_name_plural = "工程量清单明细"
+        ordering = ("project_name", "kind", "tower_name", "source_sheet", "source_row")
+        indexes = [
+            models.Index(fields=("document_version", "status", "item_code")),
+            models.Index(fields=("document_version", "status", "item_name")),
+            models.Index(fields=("project_name", "party_a_name")),
+            models.Index(
+                fields=("party_a_group", "status", "kind"),
+                name="contract_boq_party_st_kind",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("import_run", "source_sheet", "source_row"),
+                name="contract_unique_boq_item_source_row",
+            )
+        ]
+
+    def clean(self) -> None:
+        super().clean()
+        for evidence in (self.row_evidence, self.header_evidence, self.analysis_evidence):
+            if evidence is not None and evidence.document_version_id != self.document_version_id:
+                raise ValidationError("工程量清单证据必须属于同一 DocumentVersion")
+
+    def __str__(self) -> str:
+        return f"{self.project_name} / {self.item_code} {self.item_name}"
+
+
+class BoqSummaryRecord(models.Model):
+    class Status(models.TextChoices):
+        STAGING = "staging", "待人工确认"
+        TRUSTED = "trusted", "可信"
+        REJECTED = "rejected", "已拒绝"
+
+    class Kind(models.TextChoices):
+        COMPONENT = "component", "分项汇总"
+        SUBTOTAL = "subtotal", "子项小计"
+        PRE_TAX_TOTAL = "pre_tax_total", "不含税总价"
+        TAX_RATE = "tax_rate", "增值税率"
+        TAX_AMOUNT = "tax_amount", "增值税额"
+        TAX_INCLUDED_TOTAL = "tax_included_total", "含税总价"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    import_run = models.ForeignKey(
+        BoqImportRun, on_delete=models.PROTECT, related_name="summary_records"
+    )
+    document_version = models.ForeignKey(
+        DocumentVersion, on_delete=models.PROTECT, related_name="boq_summary_records"
+    )
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.STAGING
+    )
+    project_name = models.CharField(max_length=500)
+    party_a_name = models.CharField(max_length=500)
+    party_a_group = models.CharField(max_length=500)
+    kind = models.CharField(max_length=40, choices=Kind.choices)
+    summary_code = models.CharField(max_length=100, blank=True)
+    summary_name = models.CharField(max_length=500)
+    amount = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    rate = models.DecimalField(
+        max_digits=30, decimal_places=8, null=True, blank=True
+    )
+    currency = models.CharField(max_length=20, default="CNY")
+    tax_included = models.BooleanField(default=False)
+    notes = models.TextField(blank=True)
+    source_sheet = models.CharField(max_length=200)
+    source_row = models.PositiveIntegerField()
+    source_cells = models.JSONField(default=dict)
+    row_evidence = models.ForeignKey(
+        EvidenceUnit, on_delete=models.PROTECT, related_name="boq_summary_row_records"
+    )
+    header_evidence = models.ForeignKey(
+        EvidenceUnit, on_delete=models.PROTECT, related_name="boq_summary_header_records"
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="reviewed_boq_summary_records",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "工程量清单汇总记录"
+        verbose_name_plural = "工程量清单汇总记录"
+        ordering = ("project_name", "source_row")
+        indexes = [
+            models.Index(fields=("project_name", "party_a_name")),
+            models.Index(
+                fields=("party_a_group", "status"),
+                name="contract_boq_sum_party_st",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("import_run", "source_sheet", "source_row"),
+                name="contract_unique_boq_summary_source_row",
+            )
+        ]
+
+    def clean(self) -> None:
+        super().clean()
+        for evidence in (self.row_evidence, self.header_evidence):
+            if evidence.document_version_id != self.document_version_id:
+                raise ValidationError("工程量清单汇总证据必须属于同一 DocumentVersion")
+
+    def __str__(self) -> str:
+        return f"{self.project_name} / {self.summary_name}"
+
+
 class ExternalProjectBinding(models.Model):
     class SubjectType(models.TextChoices):
         USER = "user", "私聊用户"
@@ -838,9 +1214,23 @@ class IndexBuild(models.Model):
     def save(self, *args, **kwargs):
         if self.pk:
             old = type(self).objects.filter(pk=self.pk).only("status").first()
-            if old is not None and old.status == self.Status.PUBLISHED:
-                raise ValidationError("已发布 IndexBuild 不允许原地修改")
+            if old is not None and old.status in {
+                self.Status.READY,
+                self.Status.PUBLISHED,
+                self.Status.RETIRED,
+            }:
+                raise ValidationError("已准备或已发布的 IndexBuild 不允许原地修改")
         return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        status = (
+            type(self).objects.filter(pk=self.pk).values_list("status", flat=True).first()
+            if self.pk
+            else self.status
+        )
+        if status in {self.Status.READY, self.Status.PUBLISHED, self.Status.RETIRED}:
+            raise ValidationError("已准备或已发布的 IndexBuild 不允许删除")
+        return super().delete(*args, **kwargs)
 
     def __str__(self) -> str:
         return f"{self.project} / {self.name}"
@@ -872,3 +1262,18 @@ class IndexBuildDocument(models.Model):
             errors.append("只有成功的 ParserRun 可以进入 IndexBuild")
         if errors:
             raise ValidationError(errors)
+
+    def _validate_mutable_build(self) -> None:
+        status = IndexBuild.objects.filter(pk=self.index_build_id).values_list(
+            "status", flat=True
+        ).get()
+        if status not in {IndexBuild.Status.DRAFT, IndexBuild.Status.FAILED}:
+            raise ValidationError("已准备或已发布的 IndexBuild 不允许修改文档快照")
+
+    def save(self, *args, **kwargs):
+        self._validate_mutable_build()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        self._validate_mutable_build()
+        return super().delete(*args, **kwargs)

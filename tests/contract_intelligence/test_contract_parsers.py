@@ -5,8 +5,10 @@ from openpyxl import Workbook
 from pypdf import PdfWriter
 
 from walkie_dokie.contract_intelligence.domain import stable_evidence_id
+from walkie_dokie.contract_intelligence import parsers as parser_module
 from walkie_dokie.contract_intelligence.parsers import (
     NativeDocxParser,
+    NativeXlsParser,
     NativeXlsxParser,
     TextPdfParser,
     baseline_parser_registry,
@@ -56,6 +58,7 @@ def test_native_xlsx_parser_keeps_coordinates_formula_and_hidden_state(tmp_path)
     sheet.append(["商品", "含税价", "数量"])
     sheet.append(["甲", 10, 2])
     sheet["D2"] = "=B2*C2"
+    sheet.column_dimensions["A"].hidden = True
     sheet.row_dimensions[3].hidden = True
     sheet["A3"] = "隐藏价格"
     hidden = workbook.create_sheet("内部参数")
@@ -74,6 +77,9 @@ def test_native_xlsx_parser_keeps_coordinates_formula_and_hidden_state(tmp_path)
     formula_cell = next(
         cell for cell in price_row.metadata["cells"] if cell["coordinate"] == "D2"
     )
+    hidden_column_cell = next(
+        cell for cell in price_row.metadata["cells"] if cell["coordinate"] == "A2"
+    )
     hidden_row = next(
         block
         for block in result.blocks
@@ -81,9 +87,86 @@ def test_native_xlsx_parser_keeps_coordinates_formula_and_hidden_state(tmp_path)
         and block.source_anchor.get("row") == 3
     )
     assert formula_cell["formula"] == "=B2*C2"
+    assert hidden_column_cell["column_hidden"] is True
+    assert price_row.metadata["excluded_by_default"] is False
     assert hidden_row.metadata["excluded_by_default"] is True
     assert result.metadata["hidden_sheet_count"] == 1
     assert any("受控重算" in warning for warning in result.warnings)
+
+
+def test_native_xls_parser_preserves_row_coordinates_and_formula_limitation(
+    tmp_path, monkeypatch
+):
+    class FakeCell:
+        def __init__(self, value, ctype):
+            self.value = value
+            self.ctype = ctype
+
+    class FakeSheet:
+        name = "价目表"
+        nrows = 2
+        ncols = 2
+        visibility = 0
+        merged_cells = []
+        rowinfo_map = {}
+        colinfo_map = {}
+        rows = (
+            (
+                FakeCell("商品", parser_module.xlrd.XL_CELL_TEXT),
+                FakeCell("单价", parser_module.xlrd.XL_CELL_TEXT),
+            ),
+            (
+                FakeCell("洗墙灯", parser_module.xlrd.XL_CELL_TEXT),
+                FakeCell(100.0, parser_module.xlrd.XL_CELL_NUMBER),
+            ),
+        )
+
+        def row_len(self, row_index):
+            return len(self.rows[row_index])
+
+        def cell(self, row_index, column_index):
+            return self.rows[row_index][column_index]
+
+    class FakeWorkbook:
+        biff_version = 80
+        encoding = "utf_16_le"
+        datemode = 0
+
+        def __init__(self):
+            self.sheet = FakeSheet()
+
+        def sheet_names(self):
+            return [self.sheet.name]
+
+        def sheet_by_name(self, name):
+            assert name == self.sheet.name
+            return self.sheet
+
+        def unload_sheet(self, name):
+            assert name == self.sheet.name
+
+        def release_resources(self):
+            return None
+
+    monkeypatch.setattr(
+        parser_module.xlrd,
+        "open_workbook",
+        lambda *args, **kwargs: FakeWorkbook(),
+    )
+    path = tmp_path / "legacy.xls"
+    path.write_bytes(parser_module._COMPOUND_FILE_HEADER + b"test")
+
+    result = NativeXlsParser().parse(path)
+
+    price_row = result.blocks[1]
+    assert price_row.source_anchor == {
+        "type": "xls_row",
+        "sheet": "价目表",
+        "row": 2,
+        "cells": ["A2", "B2"],
+    }
+    assert price_row.metadata["formula_text_available"] is False
+    assert any("只可进入 Staging" in warning for warning in result.warnings)
 
 
 def test_pdf_without_text_layer_is_explicitly_flagged(tmp_path):
@@ -105,3 +188,7 @@ def test_baseline_registry_routes_by_explicit_file_type(tmp_path):
     _save_docx(path)
     provider = baseline_parser_registry().resolve(path)
     assert provider.name == "native_docx"
+
+    legacy_path = tmp_path / "prices.xls"
+    legacy_path.write_bytes(b"not parsed during registry routing")
+    assert baseline_parser_registry().resolve(legacy_path).name == "native_xls"

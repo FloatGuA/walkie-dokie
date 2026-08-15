@@ -22,6 +22,7 @@ from walkie_dokie.contract_intelligence.pricing import (
     PriceQuery,
     calculate_total,
     import_price_mapping,
+    query_index_build_prices,
     query_published_prices,
     trust_price_records,
     validate_mapping_spec,
@@ -121,6 +122,31 @@ def test_price_query_requests_missing_region_instead_of_guessing(settings, tmp_p
 
     assert lookup.status == "ambiguous"
     assert lookup.missing_dimension == "region"
+
+
+@pytest.mark.django_db
+def test_price_query_can_finish_against_the_build_pinned_before_republication(
+    settings, tmp_path
+):
+    project, _ = _published_prices(settings, tmp_path)
+    project.refresh_from_db()
+    pinned_build = project.current_index_build
+    replacement = IndexBuild.objects.create(
+        project=project,
+        name="replacement",
+        status=IndexBuild.Status.PUBLISHED,
+    )
+    IndexBuild.objects.filter(pk=pinned_build.pk).update(status=IndexBuild.Status.RETIRED)
+    KnowledgeProject.objects.filter(pk=project.pk).update(current_index_build=replacement)
+
+    lookup = query_index_build_prices(
+        project.pk,
+        pinned_build.pk,
+        PriceQuery(product_code="P001", region="上海"),
+    )
+
+    assert lookup.status == "found"
+    assert lookup.records[0].unit_price == Decimal("100.50000000")
 
 
 def test_mapping_spec_rejects_unknown_fields_or_executable_content():

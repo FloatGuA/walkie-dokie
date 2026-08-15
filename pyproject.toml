@@ -12,10 +12,12 @@ dependencies = [
     "openai",
     "pypdf>=6.14.2,<7",
     "python-dotenv",
+    "RapidFuzz>=3.14,<4",
     "lark-oapi",
     "python-docx",
     "rank-bm25==0.2.2",
     "openpyxl",
+    "xlrd==2.0.2",
 ]
 
 [project.optional-dependencies]
@@ -34,4 +36,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-DJANGO_SETTINGS_MODULE = "walkie_dokie.contract_admin.settings"

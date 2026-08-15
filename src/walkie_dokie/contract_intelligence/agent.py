@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -11,12 +10,15 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Protocol, TypedDict
 
 from asgiref.sync import sync_to_async
-from django.utils import timezone
 from langgraph.graph import END, START, StateGraph
 
-from .models import KnowledgeProject, QuestionRun
-from .pricing import PriceQuery, calculate_total, query_published_prices
-from .workflow import ask_contract_question
+from .pricing import PriceQuery, calculate_total, query_index_build_prices
+from .question_runs import (
+    complete_question_run,
+    fail_question_run,
+    start_question_run,
+)
+from .workflow import run_contract_question
 
 ToolName = Literal["search_contract", "query_price"]
 
@@ -146,8 +148,12 @@ def _format_price(record) -> str:
     return f"{record.product_name}的单价为 {record.unit_price} {currency}{unit}（{tax}）。"
 
 
-def _query_price_sync(project_id: str, price_query: PriceQuery) -> dict:
-    lookup = query_published_prices(project_id, price_query)
+def _query_price_sync(
+    project_id: str,
+    index_build_id: str,
+    price_query: PriceQuery,
+) -> dict:
+    lookup = query_index_build_prices(project_id, index_build_id, price_query)
     if lookup.status == "ambiguous":
         label = {
             "region": "地区",
@@ -217,6 +223,29 @@ def _query_price_sync(project_id: str, price_query: PriceQuery) -> dict:
     }
 
 
+async def run_price_question(
+    *,
+    authorized_project_id: str,
+    index_build_id: str,
+    question: str,
+    price_query: PriceQuery,
+    actor_user=None,
+) -> dict:
+    result = await sync_to_async(_query_price_sync, thread_sensitive=True)(
+        authorized_project_id,
+        index_build_id,
+        price_query,
+    )
+    trace = {
+        "tool": "query_price",
+        "price_query": {
+            field: str(value) if value is not None else None
+            for field, value in asdict(price_query).items()
+        },
+    }
+    return {**result, "trace": trace}
+
+
 async def ask_price_question(
     *,
     authorized_project_id: str,
@@ -226,56 +255,41 @@ async def ask_price_question(
     platform: str = "admin",
     actor_key: str | None = None,
 ) -> dict:
-    project = await sync_to_async(
-        KnowledgeProject.objects.select_related("current_index_build").get,
-        thread_sensitive=True,
-    )(pk=authorized_project_id, is_active=True)
-    if project.current_index_build is None:
-        raise LookupError("项目没有 Published IndexBuild")
-    run = await sync_to_async(QuestionRun.objects.create, thread_sensitive=True)(
-        project=project,
-        index_build=project.current_index_build,
-        actor_user=actor_user if getattr(actor_user, "is_authenticated", False) else None,
-        platform=platform,
-        actor_key_hash=(
-            hashlib.sha256(actor_key.encode("utf-8")).hexdigest() if actor_key else ""
-        ),
+    context = await start_question_run(
+        authorized_project_id=authorized_project_id,
         question=question,
+        actor_user=actor_user,
+        platform=platform,
+        actor_key=actor_key,
     )
     try:
-        result = await sync_to_async(_query_price_sync, thread_sensitive=True)(
-            str(project.id), price_query
+        result = await run_price_question(
+            authorized_project_id=context.project_id,
+            index_build_id=context.index_build_id,
+            question=question,
+            price_query=price_query,
+            actor_user=actor_user,
         )
-        status = {
-            "answered": QuestionRun.Status.ANSWERED,
-            "refused": QuestionRun.Status.REFUSED,
-            "clarification": QuestionRun.Status.CLARIFICATION,
-        }[result["status"]]
-        trace = {
-            "tool": "query_price",
-            "price_query": {
-                field: str(value) if value is not None else None
-                for field, value in asdict(price_query).items()
-            },
-        }
-        await sync_to_async(QuestionRun.objects.filter(pk=run.pk).update, thread_sensitive=True)(
-            status=status,
-            answer_payload=result,
+        trace = result["trace"]
+        answer_payload = {key: value for key, value in result.items() if key != "trace"}
+        await complete_question_run(
+            context,
+            result=answer_payload,
             workflow_trace=trace,
-            finished_at=timezone.now(),
         )
-        return {**result, "question_run_id": str(run.id), "trace": trace}
+        return {
+            **answer_payload,
+            "question_run_id": context.question_run_id,
+            "trace": trace,
+        }
     except Exception as exc:
-        await sync_to_async(QuestionRun.objects.filter(pk=run.pk).update, thread_sensitive=True)(
-            status=QuestionRun.Status.FAILED,
-            error=f"{type(exc).__name__}: {exc}"[:8_000],
-            finished_at=timezone.now(),
-        )
+        await fail_question_run(context, exc)
         raise
 
 
 class IntelligenceState(TypedDict, total=False):
     authorized_project_id: str
+    index_build_id: str
     question: str
     actor_user: Any
     platform: str
@@ -287,8 +301,8 @@ class IntelligenceState(TypedDict, total=False):
 def build_intelligence_agent_graph(
     *,
     planner: QuestionPlanner,
-    contract_tool=ask_contract_question,
-    price_tool=ask_price_question,
+    contract_tool=run_contract_question,
+    price_tool=run_price_question,
 ):
     async def plan(state: IntelligenceState) -> dict:
         return {"plan": await planner.plan(question=state["question"])}
@@ -296,10 +310,9 @@ def build_intelligence_agent_graph(
     async def contract(state: IntelligenceState) -> dict:
         result = await contract_tool(
             authorized_project_id=state["authorized_project_id"],
+            index_build_id=state.get("index_build_id"),
             question=state["question"],
             actor_user=state.get("actor_user"),
-            platform=state.get("platform", "admin"),
-            actor_key=state.get("actor_key"),
         )
         return {"result": result}
 
@@ -309,11 +322,10 @@ def build_intelligence_agent_graph(
             raise RuntimeError("query_price plan 缺少 PriceQuery")
         result = await price_tool(
             authorized_project_id=state["authorized_project_id"],
+            index_build_id=state.get("index_build_id"),
             question=state["question"],
             price_query=price_query,
             actor_user=state.get("actor_user"),
-            platform=state.get("platform", "admin"),
-            actor_key=state.get("actor_key"),
         )
         return {"result": result}
 
@@ -341,25 +353,45 @@ async def ask_intelligence_question(
     planner: QuestionPlanner | None = None,
 ) -> dict:
     active_planner = planner or DeepSeekQuestionPlanner()
-    graph = build_intelligence_agent_graph(
-        planner=active_planner
+    context = await start_question_run(
+        authorized_project_id=authorized_project_id,
+        question=question,
+        actor_user=actor_user,
+        platform=platform,
+        actor_key=actor_key,
     )
-    state = await graph.ainvoke(
-        {
-            "authorized_project_id": authorized_project_id,
-            "question": question,
-            "actor_user": actor_user,
-            "platform": platform,
-            "actor_key": actor_key,
-        }
-    )
-    result = state["result"]
-    return {
-        **result,
-        "trace": {
-            **result.get("trace", {}),
+    try:
+        graph = build_intelligence_agent_graph(planner=active_planner)
+        state = await graph.ainvoke(
+            {
+                "authorized_project_id": context.project_id,
+                "index_build_id": context.index_build_id,
+                "question": question.strip(),
+                "actor_user": actor_user,
+                "platform": platform,
+                "actor_key": actor_key,
+            }
+        )
+        tool_result = state["result"]
+        trace = {
+            **tool_result.get("trace", {}),
             "planner": f"{active_planner.name}@{active_planner.version}",
             "selected_tool": state["plan"].tool,
             "selection_reason": state["plan"].reason,
-        },
-    }
+        }
+        answer_payload = {
+            key: value for key, value in tool_result.items() if key != "trace"
+        }
+        await complete_question_run(
+            context,
+            result=answer_payload,
+            workflow_trace=trace,
+        )
+        return {
+            **answer_payload,
+            "question_run_id": context.question_run_id,
+            "trace": trace,
+        }
+    except Exception as exc:
+        await fail_question_run(context, exc)
+        raise

@@ -17,6 +17,7 @@ from openpyxl.utils.cell import column_index_from_string
 
 from .models import (
     EvidenceUnit,
+    IndexBuild,
     IndexBuildDocument,
     KnowledgeProject,
     PriceImportRun,
@@ -282,6 +283,24 @@ def query_published_prices(project_id, query: PriceQuery) -> PriceLookup:
     build = project.current_index_build
     if build is None or build.status != build.Status.PUBLISHED:
         raise LookupError("项目没有已发布 IndexBuild")
+    return _query_index_build_prices(build, query)
+
+
+def query_index_build_prices(
+    project_id,
+    index_build_id,
+    query: PriceQuery,
+) -> PriceLookup:
+    """Query the immutable build snapshot pinned when the question started."""
+
+    project = KnowledgeProject.objects.get(pk=project_id, is_active=True)
+    build = IndexBuild.objects.get(pk=index_build_id, project=project)
+    if build.status not in {IndexBuild.Status.PUBLISHED, IndexBuild.Status.RETIRED}:
+        raise ValueError("价格查询只能使用已发布或已退役的 IndexBuild 快照")
+    return _query_index_build_prices(build, query)
+
+
+def _query_index_build_prices(build: IndexBuild, query: PriceQuery) -> PriceLookup:
     version_ids = IndexBuildDocument.objects.filter(index_build=build).values_list(
         "document_version_id", flat=True
     )
