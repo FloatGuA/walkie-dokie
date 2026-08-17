@@ -1133,20 +1133,7 @@ Expected: FAIL——`DialogueContext` 第二个位置参数目前是 `input_file
 
 - [ ] **Step 3: 改 `main_agent/base.py`**
 
-第 42-51 行 `DialogueContext`：
-
-```python
-@dataclass(frozen=True)
-class DialogueContext:
-    user_text: str
-    input_filenames: tuple[str, ...] = ()
-    known_facts: dict[str, str] = None  # type: ignore[assignment]
-    recent_messages: tuple[dict[str, str], ...] = ()
-    active_artifact_filenames: tuple[str, ...] = ()
-    current_user_text: str | None = None
-```
-
-等一下——原来 `known_facts: dict[str, str]` 是没有默认值的必填字段，且排在 `input_filename` 之后；保持字段顺序和是否有默认值的现状，只改类型，不要顺手把 `known_facts` 也变成可选（不在这次改动范围内）：
+第 42-51 行 `DialogueContext`。原字段顺序和"哪些字段有默认值"保持不变，只把 `input_filename: str | None`（无默认值）改成 `input_filenames: tuple[str, ...]`（同样无默认值——"没有文件"用空 tuple 表达，不给隐式默认，逼调用方每次显式传），`active_artifact_filename: str | None = None` 改成 `active_artifact_filenames: tuple[str, ...] = ()`；`known_facts: dict[str, str]` 本来就没有默认值，保持不变，不要顺手给它加默认值（不在这次改动范围内）：
 
 ```python
 @dataclass(frozen=True)
