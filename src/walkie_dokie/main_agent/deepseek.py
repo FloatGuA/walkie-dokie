@@ -41,7 +41,7 @@ _DECIDE_SYSTEM_PROMPT = """你是“小帮”的主 Agent，是唯一负责理�
 
 intent 与 action 必须严格对应：
 - chat → action=reply：task 必须为 null，user_message 直接自然回答用户的问题或参与闲聊，不要推给执行单元。
-- document_task → action=propose_task：task.instruction 必须是客观、自包含、给执行单元看的文档任务；只带完成任务确实需要的用户事实，不要把整份长期档案倾倒给执行单元。task.missing_info 列出关键缺失项，并把确认后采用的默认值/占位策略直接写进 instruction，控制平面不会替你拼业务指令。只有用户明确引用“刚才生成的文件/继续修改上一份”等、且 active_artifact_filename 非空时，才设 use_previous_artifact=true。user_message 用面向用户的口吻复述理解并请用户回复“是”确认。
+- document_task → action=propose_task：task.instruction 必须是客观、自包含、给执行单元看的文档任务；只带完成任务确实需要的用户事实，不要把整份长期档案倾倒给执行单元。task.missing_info 列出关键缺失项，并把确认后采用的默认值/占位策略直接写进 instruction，控制平面不会替你拼业务指令。只有用户明确引用”刚才生成的文件/继续修改上一份”等、且 active_artifact_filenames 非空时，才设 use_previous_artifact=true。user_message 用面向用户的口吻复述理解并请用户回复”是”确认。
 
 只返回一个 JSON object，格式：
 {
@@ -103,10 +103,10 @@ class DeepSeekMainAgent(MainAgent):
             {
                 "task_context": context.user_text,
                 "current_user_message": context.current_user_text,
-                "input_filename": context.input_filename,
+                "input_filenames": list(context.input_filenames),
                 "known_facts": context.known_facts,
                 "recent_messages": list(context.recent_messages),
-                "active_artifact_filename": context.active_artifact_filename,
+                "active_artifact_filenames": list(context.active_artifact_filenames),
             },
         )
         intent = parsed.get("intent")
@@ -139,9 +139,9 @@ class DeepSeekMainAgent(MainAgent):
             use_previous = raw_task.get("use_previous_artifact", False)
             if not isinstance(use_previous, bool):
                 raise RuntimeError("task.use_previous_artifact 必须是 JSON boolean")
-            if use_previous and context.input_filename is not None:
+            if use_previous and context.input_filenames:
                 raise RuntimeError("已有当前附件时不能同时选择上一份 artifact")
-            if use_previous and context.active_artifact_filename is None:
+            if use_previous and not context.active_artifact_filenames:
                 raise RuntimeError("选择了上一份 artifact，但会话中没有可用 artifact")
             task = TaskContract(
                 instruction=raw_task["instruction"].strip(),
@@ -207,7 +207,7 @@ class DeepSeekMainAgent(MainAgent):
                 },
                 "execution_report": {
                     "summary": context.report.summary,
-                    "output_filename": context.report.result_filename,
+                    "output_filenames": [artifact.filename for artifact in context.report.artifacts],
                     "warnings": list(context.report.warnings),
                 },
             },

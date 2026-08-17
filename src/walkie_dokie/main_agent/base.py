@@ -41,10 +41,10 @@ class TaskContract:
 @dataclass(frozen=True)
 class DialogueContext:
     user_text: str
-    input_filename: str | None
+    input_filenames: tuple[str, ...]
     known_facts: dict[str, str]
     recent_messages: tuple[dict[str, str], ...] = ()
-    active_artifact_filename: str | None = None
+    active_artifact_filenames: tuple[str, ...] = ()
     # user_text 可以是确认前多条消息累积出的任务上下文；长期记忆证据只能来自
     # 最后一条真实用户文本，不能从旧消息或助手话术中重新抽取。
     current_user_text: str | None = None

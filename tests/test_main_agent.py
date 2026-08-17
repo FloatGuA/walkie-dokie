@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from walkie_dokie.agents.base import ExecutionReport
+from walkie_dokie.agents.base import ExecutionArtifact, ExecutionReport
 from walkie_dokie.main_agent.base import DialogueContext, FinalizeContext, TaskContract
 from walkie_dokie.main_agent.deepseek import DeepSeekMainAgent
 
@@ -53,7 +53,7 @@ async def test_decide_uses_toolless_main_agent_prompt_and_builds_task_contract()
     decision = await agent.decide(
         DialogueContext(
             "我叫张三，帮我写请假条",
-            None,
+            (),
             {},
             current_user_text="我叫张三，帮我写请假条",
         )
@@ -89,7 +89,7 @@ async def test_invalid_memory_operation_from_model_is_discarded():
         ]
     )
     decision = await DeepSeekMainAgent(client=client).decide(
-        DialogueContext("你叫小帮", None, {})
+        DialogueContext("你叫小帮", (), {})
     )
     assert decision.memory_operations == ()
 
@@ -109,7 +109,7 @@ async def test_informational_word_question_is_chat_not_document_execution():
     decision = await DeepSeekMainAgent(client=client).decide(
         DialogueContext(
             "Word 里怎么插入页码？",
-            None,
+            (),
             {},
             current_user_text="Word 里怎么插入页码？",
         )
@@ -139,7 +139,7 @@ async def test_intent_and_action_must_be_consistent():
     )
     with pytest.raises(RuntimeError, match="intent/action 不一致"):
         await DeepSeekMainAgent(client=client).decide(
-            DialogueContext("Word 是什么？", None, {})
+            DialogueContext("Word 是什么？", (), {})
         )
 
 
@@ -151,7 +151,7 @@ async def test_finalize_turns_internal_report_into_user_message(tmp_path):
     message = await agent.finalize(
         FinalizeContext(
             task=TaskContract("生成请假条"),
-            report=ExecutionReport("已生成 docx", artifact, "请假条.docx"),
+            report=ExecutionReport("已生成 docx", (ExecutionArtifact(artifact, "请假条.docx"),)),
         )
     )
     assert message == "请假条已经写好并发给你了。"
@@ -173,7 +173,7 @@ async def test_propose_task_requires_valid_task_contract():
     )
     with pytest.raises(RuntimeError, match="task.instruction"):
         await DeepSeekMainAgent(client=client).decide(
-            DialogueContext("写文档", None, {})
+            DialogueContext("写文档", (), {})
         )
 
 
@@ -192,7 +192,7 @@ async def test_memory_operation_without_verbatim_evidence_is_discarded():
         ]
     )
     decision = await DeepSeekMainAgent(client=client).decide(
-        DialogueContext("我叫张三", None, {}, current_user_text="我叫张三")
+        DialogueContext("我叫张三", (), {}, current_user_text="我叫张三")
     )
     assert decision.memory_operations == ()
 
@@ -216,9 +216,9 @@ async def test_previous_artifact_selection_is_part_of_task_contract():
     decision = await DeepSeekMainAgent(client=client).decide(
         DialogueContext(
             "继续修改刚才的文件",
-            None,
+            (),
             {},
-            active_artifact_filename="result.docx",
+            active_artifact_filenames=("result.docx",),
             current_user_text="继续修改刚才的文件",
         )
     )
@@ -244,5 +244,29 @@ async def test_previous_artifact_flag_must_be_real_json_boolean():
     )
     with pytest.raises(RuntimeError, match="JSON boolean"):
         await DeepSeekMainAgent(client=client).decide(
-            DialogueContext("修改文件", None, {})
+            DialogueContext("修改文件", (), {})
         )
+
+
+async def test_decide_passes_multiple_input_filenames_to_prompt_payload():
+    client, completions = fake_client(
+        [
+            {
+                "intent": "document_task",
+                "action": "propose_task",
+                "user_message": "我理解为要合并这两份文档，请回复是确认。",
+                "task": {"instruction": "合并 a.docx 和 b.docx", "missing_info": [], "use_previous_artifact": False},
+                "memory_operations": [],
+            }
+        ]
+    )
+    agent = DeepSeekMainAgent(client=client)
+    await agent.decide(
+        DialogueContext(
+            "合并这两份文档",
+            ("a.docx", "b.docx"),
+            {},
+        )
+    )
+    payload = json.loads(completions.calls[0]["messages"][1]["content"])
+    assert payload["input_filenames"] == ["a.docx", "b.docx"]
