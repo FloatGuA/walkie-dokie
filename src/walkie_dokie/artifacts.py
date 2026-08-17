@@ -22,6 +22,7 @@ class ArtifactReference(TypedDict):
     kind: Literal["input", "output"]
     path: str
     filename: str
+    display_filename: str | None
     mime_type: str
 
 
@@ -54,6 +55,7 @@ def store_incoming_file(
         "kind": "input",
         "path": str(path.resolve()),
         "filename": filename,
+        "display_filename": None,
         "mime_type": incoming.mime_type or "application/octet-stream",
     }
 
@@ -65,6 +67,7 @@ def output_artifact_reference(
         "kind": "output",
         "path": str(path.resolve()),
         "filename": filename,
+        "display_filename": None,
         "mime_type": mime_type,
     }
     # Validate before the reference becomes durable graph state.

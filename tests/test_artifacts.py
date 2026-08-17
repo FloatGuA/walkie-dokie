@@ -14,7 +14,7 @@ def test_incoming_bytes_are_persisted_outside_graph_state(monkeypatch, tmp_path)
         "u1",
         IncomingFile("../report.docx", b"secret", "application/test"),
     )
-    assert set(reference) == {"kind", "path", "filename", "mime_type"}
+    assert set(reference) == {"kind", "path", "filename", "display_filename", "mime_type"}
     assert reference["filename"] == "report.docx"
     assert "content" not in reference
     assert artifact_store.resolve_artifact_reference(reference).read_bytes() == b"secret"
@@ -50,3 +50,31 @@ def test_output_reference_validates_filename_and_regular_file(monkeypatch, tmp_p
         artifact_store.resolve_artifact_reference(
             {**reference, "filename": "different.docx"}
         )
+
+
+def test_reference_without_display_filename_still_resolves(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifact_store, "INPUT_ARTIFACTS_ROOT", tmp_path)
+    artifact = tmp_path / "a.docx"
+    artifact.write_bytes(b"x")
+    reference: artifact_store.ArtifactReference = {
+        "kind": "input",
+        "path": str(artifact.resolve()),
+        "filename": "a.docx",
+        "display_filename": None,
+        "mime_type": "application/octet-stream",
+    }
+    assert artifact_store.resolve_artifact_reference(reference) == artifact.resolve()
+
+
+def test_reference_missing_display_filename_key_still_resolves(tmp_path, monkeypatch):
+    """旧 checkpoint 里落盘的 reference 没有这个字段，必须能优雅兼容。"""
+    monkeypatch.setattr(artifact_store, "INPUT_ARTIFACTS_ROOT", tmp_path)
+    artifact = tmp_path / "a.docx"
+    artifact.write_bytes(b"x")
+    reference = {
+        "kind": "input",
+        "path": str(artifact.resolve()),
+        "filename": "a.docx",
+        "mime_type": "application/octet-stream",
+    }
+    assert artifact_store.resolve_artifact_reference(reference) == artifact.resolve()
