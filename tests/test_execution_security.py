@@ -1,3 +1,4 @@
+import asyncio
 import json
 import zipfile
 from pathlib import Path
@@ -8,9 +9,11 @@ from docx import Document
 from openpyxl import Workbook
 
 import walkie_dokie.agents.claude_agent as claude_module
+import walkie_dokie.agents.codex_agent as codex_module
 from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
 from walkie_dokie.agents.claude_agent import _execution_options
 from walkie_dokie.agents.codex_agent import (
+    CodexBackend,
     _PERMISSION_PROFILE_NAME,
     _execution_arguments,
     _permission_profile_text,
@@ -243,3 +246,50 @@ async def test_run_stages_multiple_inputs_and_reports_multiple_outputs(
     assert [item.filename for item in report.artifacts] == ["out1.docx", "out2.docx"]
     assert (workdir / "a.docx").is_file()
     assert (workdir / "b.docx").is_file()
+
+
+async def test_codex_backend_stages_multiple_inputs_and_reports_multiple_outputs(
+    monkeypatch, tmp_path
+):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    a = source_dir / "a.docx"
+    _write_docx(a)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            out = workdir / "out.docx"
+            _write_docx(out)
+            payload = json.dumps(
+                {"summary": "完成", "filenames": ["out.docx"], "warnings": []}
+            ).encode()
+            return payload, b""
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            pass
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        assert str(a) not in args  # 已经拷贝进 workdir，不该直接引用源目录路径
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        codex_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    backend = CodexBackend(
+        executable="/usr/bin/true", codex_home=tmp_path / "codex_home"
+    )
+    report = await backend.run(
+        instruction="处理这份文档",
+        input_paths=(a,),
+        input_filenames=("a.docx",),
+        workdir=workdir,
+    )
+    assert [item.filename for item in report.artifacts] == ["out.docx"]
+    assert (workdir / "a.docx").is_file()
