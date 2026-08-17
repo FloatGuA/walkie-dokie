@@ -1,16 +1,16 @@
 import asyncio
 import json
 import logging
-import shutil
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from .base import (
     ExecutionAgent,
+    ExecutionArtifact,
     ExecutionReport,
     resolve_output_file,
-    safe_input_filename,
+    stage_execution_inputs,
 )
 from .security import (
     claude_sandbox_settings,
@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 _SYSTEM_PROMPT_APPEND = (
     "你现在是 walkie-dokie 的文档处理执行单元，只做一件事：用 Python 代码"
     "（Word 用 python-docx，Excel 用 openpyxl）在当前工作目录里完成用户的文档请求"
-    "（生成、编辑或读取问答 Word/Excel 文件）。不要提及、也不要尝试使用任何跟这个"
-    "任务无关的能力（比如 Gmail、日历、云盘之类的连接器/授权流程）——那些在这个"
-    "环境里不存在也用不上，提了只会让用户困惑。"
+    "（生成、编辑或读取问答 Word/Excel 文件，输入可能是 0 个、1 个或多个）。不要提及、"
+    "也不要尝试使用任何跟这个任务无关的能力（比如 Gmail、日历、云盘之类的连接器/授权"
+    "流程）——那些在这个环境里不存在也用不上，提了只会让用户困惑。"
     "你不是面向用户的主 Agent：不要判断用户意图、维护长期记忆或自由地与用户"
     "对话，只执行已经确认的任务契约并返回客观内部报告。"
     "\n\n"
@@ -43,10 +43,10 @@ _OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "summary": {"type": "string"},
-        "filename": {"type": "string"},
+        "filenames": {"type": "array", "items": {"type": "string"}},
         "warnings": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["summary", "filename", "warnings"],
+    "required": ["summary", "filenames", "warnings"],
     "additionalProperties": False,
 }
 
@@ -64,8 +64,6 @@ def _execution_options(workdir: Path) -> ClaudeAgentOptions:
     }
     return ClaudeAgentOptions(
         cwd=str(workdir),
-        # Bash is the only capability needed to run local python-docx/openpyxl.
-        # It remains inside the fail-closed OS sandbox below.
         tools=["Bash"],
         allowed_tools=["Bash"],
         disallowed_tools=["WebFetch", "WebSearch", "Agent", "Skill"],
@@ -74,7 +72,6 @@ def _execution_options(workdir: Path) -> ClaudeAgentOptions:
         mcp_servers={},
         skills=[],
         output_format={"type": "json_schema", "schema": _OUTPUT_SCHEMA},
-        # Do not load developer/user settings, CLAUDE.md, skills, hooks, or MCPs.
         setting_sources=[],
         settings=json.dumps(settings),
         sandbox=claude_sandbox_settings(workdir),  # type: ignore[arg-type]
@@ -97,34 +94,32 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
     async def run(
         self,
         instruction: str,
-        input_path: Path | None,
+        input_paths: tuple[Path, ...],
+        input_filenames: tuple[str, ...],
         workdir: Path,
-        input_filename: str | None = None,
     ) -> ExecutionReport:
         logger.info(
-            "Claude Agent SDK 开始执行，instruction=%r input_filename=%r workdir=%s",
+            "Claude Agent SDK 开始执行，instruction=%r input_filenames=%r workdir=%s",
             instruction,
-            input_filename,
+            input_filenames,
             workdir,
         )
-        safe_filename = safe_input_filename(input_filename)
-        if input_path is not None:
-            if not input_path.is_file():
-                raise RuntimeError(f"执行输入不存在或不是普通文件：{input_path}")
-            validate_office_artifact(input_path, role="执行输入")
-            shutil.copyfile(input_path, workdir / safe_filename)
+        staged_names, stage_warnings = stage_execution_inputs(
+            input_paths, input_filenames, workdir
+        )
 
         prompt = (
             "你在当前工作目录里，需要用 Python 代码（Word 用 python-docx，"
             "Excel 用 openpyxl）完成下面这个文档操作请求，不要手动编辑。\n\n"
             f"用户请求：{instruction}\n"
         )
-        if input_path is not None:
-            prompt += f"\n工作目录下有用户提供的输入文件：{safe_filename}\n"
+        if staged_names:
+            file_list = "、".join(staged_names)
+            prompt += f"\n工作目录下有用户提供的 {len(staged_names)} 个输入文件：{file_list}\n"
         prompt += (
             "\n完成后把最终产出的文件保存在当前目录，返回 "
-            "summary（供主 Agent 阅读的客观内部执行摘要）、filename"
-            "（生成文件相对当前目录的文件名；如果没有生成文件，filename 留空字符串）"
+            "summary（供主 Agent 阅读的客观内部执行摘要）、filenames"
+            "（本次生成的文件相对当前目录的文件名列表；没有生成文件则为空数组）"
             "和 warnings（需要主 Agent 告知用户的限制或注意事项，没有则为空数组）。"
             "不要直接和用户对话，不要决定或讨论用户的长期记忆。"
         )
@@ -145,9 +140,6 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
         except TimeoutError as exc:
             raise RuntimeError("Claude Agent SDK 执行超过 15 分钟，已取消") from exc
         except Exception:
-            # Some SDK versions raise a second generic exception after already
-            # yielding an error ResultMessage. Preserve the actionable error and
-            # suppress that misleading cleanup/protocol noise.
             if execution_error is not None:
                 raise RuntimeError(
                     f"Claude Agent SDK 执行失败：{execution_error}"
@@ -160,19 +152,19 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
             logger.error("Claude Agent SDK 没有返回结构化结果")
             raise RuntimeError("Claude Agent SDK 没有返回结构化结果")
 
-        filename = structured.get("filename") or None
-        artifact_path = None
-        if filename:
+        filenames = structured.get("filenames") or []
+        artifacts = []
+        for filename in filenames:
             artifact_path = resolve_output_file(workdir, filename)
             validate_office_artifact(artifact_path, role="执行产物")
+            artifacts.append(ExecutionArtifact(artifact_path, filename))
 
-        logger.info("Claude Agent SDK 执行完成，filename=%r", filename)
+        logger.info("Claude Agent SDK 执行完成，filenames=%r", filenames)
         return ExecutionReport(
             summary=validate_report_text(structured["summary"], field="summary"),
-            artifact_path=artifact_path,
-            result_filename=filename,
+            artifacts=tuple(artifacts),
             warnings=tuple(
                 validate_report_text(item, field="warnings")
-                for item in structured.get("warnings", ())
+                for item in (*stage_warnings, *structured.get("warnings", ()))
             ),
         )

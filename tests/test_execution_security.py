@@ -1,5 +1,6 @@
 import json
 import zipfile
+from pathlib import Path
 
 import pytest
 from claude_agent_sdk import ResultMessage
@@ -20,6 +21,13 @@ from walkie_dokie.agents.security import (
     sensitive_environment_overrides,
     validate_office_artifact,
 )
+
+
+def _write_docx(path: Path) -> None:
+    """Helper to write a minimal DOCX file for testing."""
+    document = Document()
+    document.add_paragraph("安全内容")
+    document.save(path)
 
 
 def test_valid_docx_and_xlsx_pass_deterministic_validation(tmp_path):
@@ -184,7 +192,54 @@ async def test_claude_sdk_terminal_error_is_reported_without_protocol_noise(
     with pytest.raises(RuntimeError, match="quota exhausted") as caught:
         await ClaudeAgentSDKBackend().run(
             instruction="生成测试文档",
-            input_path=None,
+            input_paths=(),
+            input_filenames=(),
             workdir=tmp_path,
         )
     assert "misleading" not in str(caught.value)
+
+
+async def test_run_stages_multiple_inputs_and_reports_multiple_outputs(
+    monkeypatch, tmp_path
+):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    a = source_dir / "a.docx"
+    _write_docx(a)
+    b = source_dir / "b.docx"
+    _write_docx(b)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    async def fake_query(*, prompt, options):
+        assert "a.docx" in prompt
+        assert "b.docx" in prompt
+        out1 = workdir / "out1.docx"
+        _write_docx(out1)
+        out2 = workdir / "out2.docx"
+        _write_docx(out2)
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=False,
+            num_turns=1,
+            session_id="test",
+            result="ok",
+            structured_output={
+                "summary": "处理了两份文件",
+                "filenames": ["out1.docx", "out2.docx"],
+                "warnings": [],
+            },
+        )
+
+    monkeypatch.setattr(claude_module, "query", fake_query)
+    report = await ClaudeAgentSDKBackend().run(
+        instruction="合并这两份文档",
+        input_paths=(a, b),
+        input_filenames=("a.docx", "b.docx"),
+        workdir=workdir,
+    )
+    assert [item.filename for item in report.artifacts] == ["out1.docx", "out2.docx"]
+    assert (workdir / "a.docx").is_file()
+    assert (workdir / "b.docx").is_file()
