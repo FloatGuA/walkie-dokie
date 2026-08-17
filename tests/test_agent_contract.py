@@ -1,9 +1,12 @@
 import pytest
+from docx import Document
 
 from walkie_dokie.agents.base import (
+    ExecutionArtifact,
     ExecutionReport,
     resolve_output_file,
     safe_input_filename,
+    stage_execution_inputs,
 )
 
 
@@ -46,15 +49,101 @@ def test_output_must_be_a_regular_file(tmp_path):
         resolve_output_file(tmp_path, "directory")
 
 
-def test_execution_report_enforces_artifact_metadata_invariants(tmp_path):
+def test_execution_artifact_enforces_metadata_invariants(tmp_path):
     artifact = tmp_path / "result.docx"
     artifact.write_bytes(b"x")
-    report = ExecutionReport("done", artifact, artifact.name)
-    assert report.artifact_path == artifact
+    ea = ExecutionArtifact(artifact, artifact.name)
+    assert ea.path == artifact
 
-    with pytest.raises(ValueError, match="同时存在"):
-        ExecutionReport("done", artifact, None)
     with pytest.raises(ValueError, match="不一致"):
-        ExecutionReport("done", artifact, "other.docx")
+        ExecutionArtifact(artifact, "other.docx")
     with pytest.raises(ValueError, match="普通文件"):
-        ExecutionReport("done", tmp_path / "missing.docx", "missing.docx")
+        ExecutionArtifact(tmp_path / "missing.docx", "missing.docx")
+
+
+def test_execution_report_defaults_to_no_artifacts():
+    report = ExecutionReport("done")
+    assert report.artifacts == ()
+    assert report.warnings == ()
+
+
+def test_execution_report_accepts_multiple_artifacts(tmp_path):
+    a = tmp_path / "a.docx"
+    a.write_bytes(b"x")
+    b = tmp_path / "b.xlsx"
+    b.write_bytes(b"y")
+    report = ExecutionReport(
+        "done", artifacts=(ExecutionArtifact(a, "a.docx"), ExecutionArtifact(b, "b.xlsx"))
+    )
+    assert [item.filename for item in report.artifacts] == ["a.docx", "b.xlsx"]
+
+
+def test_execution_report_rejects_duplicate_artifact_filenames(tmp_path):
+    a = tmp_path / "a.docx"
+    a.write_bytes(b"x")
+    with pytest.raises(ValueError, match="重复"):
+        ExecutionReport(
+            "done", artifacts=(ExecutionArtifact(a, "a.docx"), ExecutionArtifact(a, "a.docx"))
+        )
+
+
+def test_execution_report_rejects_non_tuple_artifacts(tmp_path):
+    a = tmp_path / "a.docx"
+    a.write_bytes(b"x")
+    with pytest.raises(ValueError, match="tuple"):
+        ExecutionReport("done", artifacts=[ExecutionArtifact(a, "a.docx")])
+
+
+def _write_docx(path):
+    document = Document()
+    document.add_paragraph("安全内容")
+    document.save(path)
+
+
+def test_stage_execution_inputs_empty_is_not_an_error(tmp_path):
+    staged, warnings = stage_execution_inputs((), (), tmp_path)
+    assert staged == ()
+    assert warnings == ()
+
+
+def test_stage_execution_inputs_copies_valid_files(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    a = source_dir / "a.docx"
+    _write_docx(a)
+    staged, warnings = stage_execution_inputs((a,), ("a.docx",), workdir)
+    assert staged == ("a.docx",)
+    assert warnings == ()
+    assert (workdir / "a.docx").is_file()
+
+
+def test_stage_execution_inputs_excludes_invalid_file_and_continues(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    good = source_dir / "good.docx"
+    _write_docx(good)
+    bad = source_dir / "bad.docx"
+    bad.write_text("不是合法的 docx")
+    staged, warnings = stage_execution_inputs(
+        (good, bad), ("good.docx", "bad.docx"), workdir
+    )
+    assert staged == ("good.docx",)
+    assert len(warnings) == 1
+    assert "bad.docx" in warnings[0]
+    assert (workdir / "good.docx").is_file()
+    assert not (workdir / "bad.docx").exists()
+
+
+def test_stage_execution_inputs_all_invalid_raises(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    bad = source_dir / "bad.docx"
+    bad.write_text("不是合法的 docx")
+    with pytest.raises(RuntimeError, match="全部输入文件都未通过"):
+        stage_execution_inputs((bad,), ("bad.docx",), workdir)

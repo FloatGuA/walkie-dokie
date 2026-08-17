@@ -1,6 +1,23 @@
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+
+from walkie_dokie.agents.security import validate_office_artifact
+
+
+@dataclass(frozen=True)
+class ExecutionArtifact:
+    """执行 Agent 产出的单个文件，path 必须是 filename 指向的同一个普通文件。"""
+
+    path: Path
+    filename: str
+
+    def __post_init__(self) -> None:
+        if self.path.name != self.filename:
+            raise ValueError("ExecutionArtifact.path 与 filename 不一致")
+        if not self.path.is_file():
+            raise ValueError("ExecutionArtifact.path 必须指向普通文件")
 
 
 @dataclass(frozen=True)
@@ -8,8 +25,7 @@ class ExecutionReport:
     """执行 Agent 的内部报告，不是给终端用户的自由对话回复。"""
 
     summary: str
-    artifact_path: Path | None
-    result_filename: str | None
+    artifacts: tuple[ExecutionArtifact, ...] = ()
     warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -19,17 +35,17 @@ class ExecutionReport:
             isinstance(item, str) for item in self.warnings
         ):
             raise ValueError("ExecutionReport.warnings 必须是字符串 tuple")
-        if (self.artifact_path is None) != (self.result_filename is None):
-            raise ValueError("artifact_path 与 result_filename 必须同时存在或同时为空")
-        if self.artifact_path is not None:
-            if self.artifact_path.name != self.result_filename:
-                raise ValueError("artifact_path 与 result_filename 不一致")
-            if not self.artifact_path.is_file():
-                raise ValueError("ExecutionReport.artifact_path 必须指向普通文件")
+        if not isinstance(self.artifacts, tuple) or not all(
+            isinstance(item, ExecutionArtifact) for item in self.artifacts
+        ):
+            raise ValueError("ExecutionReport.artifacts 必须是 ExecutionArtifact tuple")
+        filenames = [item.filename for item in self.artifacts]
+        if len(set(filenames)) != len(filenames):
+            raise ValueError("ExecutionReport.artifacts 内 filename 不允许重复")
 
 
 class ExecutionAgent(ABC):
-    """执行后端的统一接口：拿自然语言指令 + 可选附件，跑代码，产出结果。
+    """执行后端的统一接口：拿自然语言指令 + 一批可选输入文件，跑代码，产出结果。
 
     Claude Agent SDK / Codex 两个后端都实现这个接口，orchestrator 只认接口，
     不关心具体是哪个在跑、也不关心它内部怎么写代码操作文档。
@@ -43,9 +59,9 @@ class ExecutionAgent(ABC):
     async def run(
         self,
         instruction: str,
-        input_path: Path | None,
+        input_paths: tuple[Path, ...],
+        input_filenames: tuple[str, ...],
         workdir: Path,
-        input_filename: str | None = None,
     ) -> ExecutionReport: ...
 
 
@@ -56,11 +72,49 @@ def safe_input_filename(filename: str | None) -> str:
     name = Path(filename.replace("\\", "/")).name.strip()
     if name in {"", ".", ".."}:
         return "input"
-    # `.walkie-dokie` 是执行元数据保留名。用户文件若同名则稳定重命名，避免
-    # 后端内部目录/marker 与上传内容发生文件-目录冲突。
     if name.casefold() == ".walkie-dokie":
         return "input-.walkie-dokie"
     return name
+
+
+def stage_execution_inputs(
+    input_paths: tuple[Path, ...],
+    input_filenames: tuple[str, ...],
+    workdir: Path,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """校验并拷贝一批输入文件到 workdir，供两个执行后端共用。
+
+    返回 (拷贝到 workdir 后的目标文件名列表, 被排除文件的 warning 列表)。
+    input_paths 为空（任务本身不需要输入文件）返回 ((), ())，不是错误。
+    input_paths 非空但全部未通过 Office 内容校验时抛 RuntimeError，调用方不应
+    再继续调用 backend。
+    """
+
+    if len(input_paths) != len(input_filenames):
+        raise RuntimeError("input_paths 与 input_filenames 长度必须一致")
+    if not input_paths:
+        return (), ()
+
+    staged: list[str] = []
+    warnings: list[str] = []
+    for path, filename in zip(input_paths, input_filenames):
+        if not path.is_file():
+            raise RuntimeError(f"执行输入不存在或不是普通文件：{path}")
+        try:
+            validate_office_artifact(path, role="执行输入")
+        except RuntimeError as exc:
+            warnings.append(f"文件「{filename}」未通过安全校验，已跳过：{exc}")
+            continue
+        safe_name = safe_input_filename(filename)
+        shutil.copyfile(path, workdir / safe_name)
+        staged.append(safe_name)
+
+    if not staged:
+        raise RuntimeError(
+            "本轮全部输入文件都未通过安全校验，没有可执行的输入："
+            + "；".join(warnings)
+        )
+    return tuple(staged), tuple(warnings)
 
 
 def resolve_output_file(workdir: Path, filename: str) -> Path:
