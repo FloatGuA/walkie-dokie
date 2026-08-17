@@ -13,16 +13,20 @@ class SessionState(TypedDict):
     user_id: str
     # 输入文件在入图前落盘；这里只保存 plain dict artifact reference，不保存 bytes
     # 或自定义 dataclass，避免 SQLite checkpoint 膨胀和序列化兼容风险。
-    pending_file: dict | None
+    pending_files: tuple[dict, ...]
+    # Debouncer 批量派发的新文件，只在 collect 消费时并入 pending_files；
+    # ask_confirm/ask_memory 恢复时的单文件补充仍走下面的 new_file，两条路径
+    # 分开是因为确认阶段的追加文件本来就不是这次多文件设计要处理的范围。
+    new_files: tuple[dict, ...]
     pending_instruction: str | None
     new_text: str | None
     new_file: dict | None
     # 本次 collect 消费的最后一条用户原文，专供 memory evidence；不同于可能跨
     # 多条消息累积的 pending_instruction。
     current_user_text: str | None
-    # 最近一个可复用输入/输出 artifact。主 Agent 可显式在 TaskContract 中选择它，
+    # 最近可复用的输入/输出 artifact 集合。主 Agent 可显式在 TaskContract 中选择它，
     # 支持“继续修改刚才生成的文件”，但执行层不会自行猜测。
-    active_artifact: dict | None
+    active_artifacts: tuple[dict, ...]
     # 已确认执行的稳定标识与工作目录；prepare 节点先 checkpoint，再进入有副作用
     # 的 execute 节点，便于用落盘 report marker 抵御 checkpoint 后置失败的重跑。
     execution: dict | None
@@ -35,7 +39,7 @@ class SessionState(TypedDict):
     decision: dict | None
     # dict 而不是 ExecutionReport dataclass 直接存——checkpointer 序列化自定义类会报
     # deprecation 警告（未注册类型），存 plain dict 更省心。这里是给平台投递的结果：
-    # reply_text / artifact / success；artifact 是引用，不是大块文件 bytes。
+    # reply_text / artifacts / success；artifacts 是引用列表，不是大块文件 bytes。
     result: dict | None
     # 本回合实际落盘的 memory set/delete 操作。透明回显已经并进主 Agent 的
     # user_message；保留此字段用于诊断/测试，不跨回合复用。
