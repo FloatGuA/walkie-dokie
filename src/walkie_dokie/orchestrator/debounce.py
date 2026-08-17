@@ -5,7 +5,9 @@
 scripts/run_mvp.py 里对 snapshot.interrupts 的判断。
 
 文字和文件都会被这个窗口攒住：用户可能先发文件再说要干什么，也可能反过来，
-窗口到期时把攒到的文字拼成一段、文件取最后收到的那个一起交给 on_ready。
+窗口到期时把攒到的文字拼成一段、文件按到达顺序全部交给 on_ready（不是只留
+最后一个——早前实现只留最后收到的文件，窗口内连发多个文件时前面的会被静默
+覆盖丢弃，是已知修过的缺口，见 DECISION.md 2026-08-18）。
 """
 
 import asyncio
@@ -21,12 +23,12 @@ class Debouncer:
     def __init__(
         self,
         window_seconds: float,
-        on_ready: Callable[[str, str, str, IncomingFile | None], Awaitable[None]],
+        on_ready: Callable[[str, str, str, tuple[IncomingFile, ...]], Awaitable[None]],
     ):
         self._window = window_seconds
         self._on_ready = on_ready
         self._buffers: dict[tuple[str, str], list[str]] = {}
-        self._files: dict[tuple[str, str], IncomingFile] = {}
+        self._files: dict[tuple[str, str], list[IncomingFile]] = {}
         self._tasks: dict[tuple[str, str], asyncio.Task] = {}
 
     def add(
@@ -40,16 +42,16 @@ class Debouncer:
         if text:
             self._buffers.setdefault(key, []).append(text)
         if file is not None:
-            self._files[key] = file
+            self._files.setdefault(key, []).append(file)
         if key in self._tasks:
             self._tasks[key].cancel()
         self._tasks[key] = asyncio.create_task(self._fire_after_delay(key))
         logger.info(
-            "防抖窗口重置 platform=%s user_id=%s，累计 %d 条文字待处理，file=%r",
+            "防抖窗口重置 platform=%s user_id=%s，累计 %d 条文字 + %d 个文件待处理",
             platform,
             user_id,
             len(self._buffers.get(key, [])),
-            self._files.get(key, None) and self._files[key].filename,
+            len(self._files.get(key, [])),
         )
 
     async def _fire_after_delay(self, key: tuple[str, str]) -> None:
@@ -59,15 +61,18 @@ class Debouncer:
             return
         platform, user_id = key
         messages = self._buffers.pop(key, [])
-        file = self._files.pop(key, None)
+        files = tuple(self._files.pop(key, []))
         self._tasks.pop(key, None)
-        if not messages and file is None:
+        if not messages and not files:
             return
         combined = "\n".join(messages)
         logger.info(
-            "防抖窗口到期 user_id=%s，%d 条文字 + file=%r 合并派发", user_id, len(messages), file and file.filename
+            "防抖窗口到期 user_id=%s，%d 条文字 + %d 个文件合并派发",
+            user_id,
+            len(messages),
+            len(files),
         )
-        await self._on_ready(platform, user_id, combined, file)
+        await self._on_ready(platform, user_id, combined, files)
 
     async def close(self) -> None:
         """Cancel pending windows so application shutdown can drain cleanly."""
