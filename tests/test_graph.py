@@ -608,6 +608,38 @@ async def test_attachment_during_confirmation_is_not_dropped(tmp_path, execution
     assert execution_agent.calls == []
 
 
+async def test_confirm_resume_race_merges_full_files_batch_with_dedup(
+    tmp_path, execution_agent
+):
+    """回归 Finding 1（graph 侧）：`_invoke_from_event` 的竞态恢复分支用复数
+    ``files`` 键 resume（防抖窗口攒下的一整批，可能不止一个）；``_ask_confirm``
+    必须把整批都合并进 `pending_files`，碰撞文件名按 `_merge_pending_files`
+    的规则去重，而不是像单数 ``file`` 键那样只能带一个文件、其余静默丢失。"""
+    main_agent = FakeMainAgent([task_decision(), task_decision("总结两份新文件")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我总结",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    ref_1 = input_reference("报价单.xlsx", b"1")
+    ref_2 = input_reference("报价单.xlsx", b"2")
+    state = await graph.ainvoke(
+        Command(resume={"text": "", "files": (ref_1, ref_2)}), config=config()
+    )
+    assert "__interrupt__" in state
+    assert main_agent.decide_calls[1].input_filenames == (
+        "报价单.xlsx",
+        "报价单-2.xlsx",
+    )
+    assert execution_agent.calls == []
+
+
 async def test_previous_output_can_be_selected_by_next_task(tmp_path):
     main_agent = FakeMainAgent(
         [
@@ -841,6 +873,32 @@ async def test_filename_collision_in_same_window_gets_display_filename_suffix(
         config=config(),
     )
     assert main_agent.decide_calls[0].input_filenames == ("报价单.xlsx", "报价单-2.xlsx")
+
+
+async def test_deduped_display_names_reach_execution_backend_on_collision(
+    tmp_path, execution_agent
+):
+    """回归 Finding 4：碰撞去重后的 display_filename 不仅要让主 Agent 看到，还要
+    实际落到执行后端收到的 input_filenames 上，而不是仅停在 DialogueContext。"""
+    main_agent = FakeMainAgent()
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    file_1 = input_reference("报价单.xlsx", b"1")
+    file_2 = input_reference("报价单.xlsx", b"2")
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "都看一下",
+            "new_files": (file_1, file_2),
+        },
+        config=config(),
+    )
+    await graph.ainvoke(Command(resume="是"), config=config())
+
+    call = execution_agent.calls[0]
+    assert len(set(call["input_paths"])) == 2
+    assert call["input_filenames"] == ("报价单.xlsx", "报价单-2.xlsx")
 
 
 async def test_execute_produces_multiple_artifacts_in_result(tmp_path):

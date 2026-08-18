@@ -22,7 +22,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
-from walkie_dokie.artifacts import resolve_artifact_reference, store_incoming_file
+from walkie_dokie.artifacts import (
+    display_name,
+    resolve_artifact_reference,
+    store_incoming_file,
+)
 from walkie_dokie.logging_config import setup_logging
 from walkie_dokie.main_agent import (
     DeepSeekMainAgent,
@@ -65,17 +69,23 @@ async def _invoke_from_event(
     platform_name: str,
     user_id: str,
     text: str,
-    file: IncomingFile | None = None,
     files: tuple[IncomingFile, ...] = (),
 ):
-    """Re-check durable state at dispatch time, then resume or start atomically."""
+    """Re-check durable state at dispatch time, then resume or start atomically.
+
+    ``files`` is the whole debounced batch (possibly several files). If the graph
+    raced ahead to ``ask_confirm``/``ask_memory`` while this batch was in flight,
+    every file in the batch must still reach the graph via the resume payload's
+    plural ``files`` key — dropping any of them here is exactly the silent-loss
+    failure class this multi-file design exists to eliminate.
+    """
     snapshot = await graph.aget_state(config=config)
+    file_references = tuple(
+        store_incoming_file(platform_name, user_id, item) for item in files
+    )
     if _waiting_for_confirmation(snapshot):
-        file_reference = (
-            store_incoming_file(platform_name, user_id, file) if file else None
-        )
         return await graph.ainvoke(
-            Command(resume={"text": text, "file": file_reference}),
+            Command(resume={"text": text, "files": file_references}),
             config=config,
             durability="sync",
         )
@@ -83,9 +93,6 @@ async def _invoke_from_event(
         raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
     if snapshot.next:
         raise RuntimeError(f"会话存在非 interrupt 的未完成任务 next={snapshot.next!r}")
-    file_references = tuple(
-        store_incoming_file(platform_name, user_id, item) for item in files
-    )
     return await graph.ainvoke(
         {
             "platform": platform_name,
@@ -114,7 +121,7 @@ async def deliver_graph_output(
         if pending_files:
             # 飞书发文件时不能带文字，只能分开发——收到文件但还没指令是正常情况，
             # 得主动回一句，不能沉默，不然用户不知道文件收到没有。
-            names = "、".join(ref["filename"] for ref in pending_files)
+            names = "、".join(display_name(ref) for ref in pending_files)
             text = f"收到文件「{names}」了，请告诉我需要我做什么。"
             await platform.send(user_id, OutboundMessage(text=text))
             return text, None, True

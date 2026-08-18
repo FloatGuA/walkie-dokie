@@ -57,11 +57,11 @@ InboundEvent
 
 ## Artifact 与 ExecutionAgent 契约
 
-1. 平台附件在入图前写入 `var/inputs/`，`SessionState.pending_file/new_file` 只保存 plain JSON `ArtifactReference(kind,path,filename,mime_type)`。
-2. 输出保存在 `var/workspaces/{platform_user}/{date}/{run_id}/`。图状态同样只保存引用，不保存 docx/xlsx bytes。
-3. `ExecutionAgent.run(instruction, input_path, workdir, input_filename)` 接受路径，不接受附件 bytes；后端把输入复制进自己的工作目录。
-4. 输入名被收窄为 basename。执行器输出必须是工作目录内现存的单个普通文件；绝对路径、`..`、子目录、越界 symlink、目录冒充文件都会被拒绝。
-5. `ExecutionReport(summary, artifact_path, result_filename, warnings)` 有运行时不变量：path/filename 同时存在或同时为空，名字一致，path 指向普通文件，warnings 是字符串 tuple。graph 在插件边界还会按本轮 workdir + basename 重建路径并要求与报告一致，拒绝 sibling workspace 产物。
+1. 平台附件在入图前写入 `var/inputs/`，`SessionState.pending_files/active_artifacts` 保存 plain JSON `ArtifactReference(kind,path,filename,display_filename,mime_type)` 的 tuple；`display_filename` 仅在同一防抖窗口内文件名碰撞时才被赋值（如 `报价单-2.xlsx`），否则为 `None`，此时展示名回退到 `filename`。
+2. 输出保存在 `var/workspaces/{platform_user}/{date}/{run_id}/`。图状态同样只保存引用，不保存 docx/xlsx bytes；一次执行可以产出多个文件。
+3. `ExecutionAgent.run(instruction, input_paths, input_filenames, workdir)` 接受两个等长的 tuple（路径、对应文件名），不接受附件 bytes；后端把输入复制进自己的工作目录。两个 backend 共用 `agents/base.py` 的 `stage_execution_inputs()` 做校验+拷贝，不再各自重复实现。
+4. 输入名被收窄为 basename。执行器输出必须是工作目录内现存的普通文件（可以是多个）；绝对路径、`..`、子目录、越界 symlink、目录冒充文件都会被拒绝。
+5. `ExecutionReport(summary, artifacts, warnings)` 中 `artifacts: tuple[ExecutionArtifact, ...]`，`ExecutionArtifact(path, filename)` 的运行时不变量是 `path.name == filename` 且 `path` 指向普通文件；`ExecutionReport` 还要求 `artifacts` 内 `filename` 不重复，`artifacts=()` 合法代表无产出，`warnings` 是字符串 tuple。graph 在插件边界会对每个 artifact 按本轮 workdir + basename 重建路径并要求与报告一致，拒绝 sibling workspace 产物。
 6. Codex 的内部 output schema 位于保留子目录 `.walkie-dokie/`，不会覆盖同名用户上传文件。
 
 ### 不可信文档与 prompt injection 边界
@@ -96,7 +96,7 @@ InboundEvent
 - `Checkpoint`、checkpoint metadata、`CheckpointTuple.pending_writes` 与面向调用者的 `StateSnapshot` 是不同层次，不能统称一个 dict。
 - `StateSnapshot.next` 表示该快照待执行的节点，不等于“正在等用户确认”。runner 只在 `snapshot.interrupts` 非空且 next 是已知的 `ask_confirm`，或升级前遗留的 `ask_memory` 时 resume。
 - `interrupt(value)` 不是普通 return，也不保存 Python 栈。恢复时被中断节点从头运行，到同一 interrupt 序号取得 resume 值；payload/resume 必须可序列化，不能捕获框架内部中断异常，也不能在重跑时随意改变多个 interrupt 的顺序。
-- 确认回复使用一个可序列化 resume object：`{"text": ..., "file": ArtifactReference | null}`。附件不再通过 `aupdate_state` 插入暂停点，因此没有隐式 `as_node` 推断和两次调用之间的崩溃窗口。
+- 确认回复使用一个可序列化 resume object：`{"text": ..., "file": ArtifactReference | null}`（用户在确认阶段的即时回复，一条平台消息最多带一个附件）或 `{"text": ..., "files": [ArtifactReference, ...]}`（防抖批次在派发前发现图已经进入确认态，携带这一整批文件）；`ask_confirm`/`ask_memory` 归一接受两种形状，统一并入 `SessionState.new_files`。附件不再通过 `aupdate_state` 插入暂停点，因此没有隐式 `as_node` 推断和两次调用之间的崩溃窗口。
 - 项目文件名 `checkpoints-v2.db` 中的 v2 是本项目 state schema 版本，与 LangGraph `ainvoke(version="v2")` 返回格式无关；当前仍使用默认 v1 输出并读取 `state["__interrupt__"]`。
 
 checkpoint 保存工作流短期状态，不保存或事务性覆盖：长期档案、ArtifactStore、turn log、防抖 buffer、平台投递确认。默认 durability 也不应被描述成“每个节点返回时已经同步事务提交”。

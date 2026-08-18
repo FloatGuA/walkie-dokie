@@ -78,3 +78,25 @@ def test_reference_missing_display_filename_key_still_resolves(tmp_path, monkeyp
         "mime_type": "application/octet-stream",
     }
     assert artifact_store.resolve_artifact_reference(reference) == artifact.resolve()
+
+
+def test_display_name_prefers_deduped_display_filename():
+    reference = {
+        "kind": "input",
+        "path": "/tmp/x",
+        "filename": "报价单.xlsx",
+        "display_filename": "报价单-2.xlsx",
+        "mime_type": "application/octet-stream",
+    }
+    assert artifact_store.display_name(reference) == "报价单-2.xlsx"
+
+
+def test_display_name_falls_back_to_filename_when_no_collision():
+    reference = {
+        "kind": "input",
+        "path": "/tmp/x",
+        "filename": "报价单.xlsx",
+        "display_filename": None,
+        "mime_type": "application/octet-stream",
+    }
+    assert artifact_store.display_name(reference) == "报价单.xlsx"

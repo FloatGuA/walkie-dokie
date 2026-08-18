@@ -75,6 +75,11 @@ def output_artifact_reference(
     return reference
 
 
+def display_name(reference: ArtifactReference | dict) -> str:
+    """用户/模型可见的文件名：优先用同批次去重后的 display_filename。"""
+    return reference.get("display_filename") or reference["filename"]
+
+
 def resolve_artifact_reference(reference: ArtifactReference | dict) -> Path:
     """Resolve a durable reference and re-check its storage boundary and metadata."""
 

@@ -18,15 +18,17 @@ async def main():
     workdir = create_workspace_dir("smoketest", "claude")
     result = await backend.run(
         instruction="生成一份 docx 文档，标题是《测试》，正文写一句话：你好，这是 walkie-dokie 的第一次测试。",
-        input_path=None,
+        input_paths=(),
+        input_filenames=(),
         workdir=workdir,
     )
     print(f"summary: {result.summary}")
     print(f"warnings: {result.warnings}")
-    print(f"result_filename: {result.result_filename}")
-    if result.artifact_path is not None:
-        print(f"result_file 大小: {result.artifact_path.stat().st_size} bytes")
-        print(f"已写入 {result.artifact_path}")
+    if result.artifacts:
+        for artifact in result.artifacts:
+            print(f"artifact filename: {artifact.filename}")
+            print(f"artifact 大小: {artifact.path.stat().st_size} bytes")
+            print(f"已写入 {artifact.path}")
     else:
         print("没有生成文件")
 

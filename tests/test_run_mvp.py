@@ -56,9 +56,47 @@ async def test_debounced_dispatch_rechecks_and_resumes_new_interrupt():
         platform_name="test",
         user_id="u1",
         text="是",
-        file=None,
     )
-    assert graph.input.resume == {"text": "是", "file": None}
+    assert graph.input.resume == {"text": "是", "files": ()}
+    assert graph.durability == "sync"
+
+
+async def test_debounced_batch_survives_confirm_race_with_multiple_files(
+    monkeypatch, tmp_path
+):
+    """回归 Finding 1：确认竞态发生时，整批文件必须全部随 resume 送达图，
+    而不是被静默丢弃（只有 text 被当成确认回复送过去）。"""
+
+    root = tmp_path / "inputs"
+    monkeypatch.setattr(artifact_store, "INPUT_ARTIFACTS_ROOT", root)
+
+    class Graph:
+        def __init__(self):
+            self.input = None
+            self.durability = None
+
+        async def aget_state(self, config):
+            return SimpleNamespace(next=("ask_confirm",), interrupts=(object(),))
+
+        async def ainvoke(self, value, config, durability=None):
+            self.input = value
+            self.durability = durability
+            return {"result": None}
+
+    graph = Graph()
+    file_a = IncomingFile("a.docx", b"a", "application/octet-stream")
+    file_b = IncomingFile("b.docx", b"b", "application/octet-stream")
+    await _invoke_from_event(
+        graph,
+        config={"configurable": {"thread_id": "test:u1"}},
+        platform_name="test",
+        user_id="u1",
+        text="是",
+        files=(file_a, file_b),
+    )
+    assert graph.input.resume["text"] == "是"
+    resumed_files = graph.input.resume["files"]
+    assert [ref["filename"] for ref in resumed_files] == ["a.docx", "b.docx"]
     assert graph.durability == "sync"
 
 
@@ -206,3 +244,30 @@ async def test_pending_files_notice_lists_all_filenames(monkeypatch, tmp_path):
     )
     assert "a.docx" in platform.sent[0][1].text
     assert "b.docx" in platform.sent[0][1].text
+
+
+async def test_pending_files_notice_uses_deduped_display_name():
+    """回归 Finding 5：碰撞文件名要展示去重后的 display_filename，不能重复展示
+    原始 filename（“收到文件「报价单.xlsx、报价单.xlsx」了”这种误导性文案）。"""
+
+    reference_1 = {
+        "kind": "input",
+        "path": "/tmp/does-not-matter-1",
+        "filename": "报价单.xlsx",
+        "display_filename": None,
+        "mime_type": "application/octet-stream",
+    }
+    reference_2 = {
+        "kind": "input",
+        "path": "/tmp/does-not-matter-2",
+        "filename": "报价单.xlsx",
+        "display_filename": "报价单-2.xlsx",
+        "mime_type": "application/octet-stream",
+    }
+    platform = FakePlatform()
+    await deliver_graph_output(
+        platform, "u1", {"pending_files": (reference_1, reference_2)}
+    )
+    text = platform.sent[0][1].text
+    assert text.count("报价单.xlsx") == 1
+    assert "报价单-2.xlsx" in text

@@ -42,6 +42,7 @@ from walkie_dokie.agents.base import (
 )
 from walkie_dokie.agents.security import validate_office_artifact, validate_report_text
 from walkie_dokie.artifacts import (
+    display_name,
     output_artifact_reference,
     resolve_artifact_reference,
 )
@@ -253,7 +254,7 @@ def _dedupe_display_filename(existing_names: set[str], filename: str) -> str | N
 
 
 def _merge_pending_files(existing: tuple[dict, ...], incoming: tuple[dict, ...]) -> tuple[dict, ...]:
-    used = {ref.get("display_filename") or ref["filename"] for ref in existing}
+    used = {display_name(ref) for ref in existing}
     merged = list(existing)
     for ref in incoming:
         resolve_artifact_reference(ref)
@@ -338,6 +339,37 @@ async def _reply(state: SessionState) -> dict:
     }
 
 
+def _parse_resume_reply(reply, *, field: str) -> tuple[str | None, tuple[dict, ...]]:
+    """归一化 ask_confirm/ask_memory 中断恢复时的 resume 载荷。
+
+    resume 有两种来源：``handle_event`` 直接恢复用户在确认阶段的即时回复（一条
+    平台消息最多带一个附件，用单数 ``file`` 键）；``_invoke_from_event`` 的竞态
+    恢复分支（防抖窗口累积的一整批文件，在派发前发现图已经进入确认态，用复数
+    ``files`` 键携带全部文件）。这里把两种形状统一归并成 ``new_files`` 元组，
+    下游节点不再区分来源。
+    """
+    if isinstance(reply, dict):
+        text = reply.get("text")
+        if text is not None and not isinstance(text, str):
+            raise RuntimeError(f"{field} resume.text 必须是字符串")
+        files = reply.get("files")
+        if files is not None:
+            if not isinstance(files, (list, tuple)) or not all(
+                isinstance(item, dict) for item in files
+            ):
+                raise RuntimeError(f"{field} resume.files 必须是 artifact reference 列表")
+            new_files = tuple(files)
+        else:
+            file = reply.get("file")
+            if file is not None and not isinstance(file, dict):
+                raise RuntimeError(f"{field} resume.file 必须是 artifact reference")
+            new_files = (file,) if file is not None else ()
+        return text or None, new_files
+    if not isinstance(reply, str):
+        raise RuntimeError(f"{field} resume 必须是字符串或 {{text,file/files}} object")
+    return reply or None, ()
+
+
 async def _ask_confirm(state: SessionState) -> dict:
     decision = state["decision"]
     reply = interrupt(
@@ -346,17 +378,8 @@ async def _ask_confirm(state: SessionState) -> dict:
             "task": decision["task"],
         }
     )
-    if isinstance(reply, dict):
-        text = reply.get("text")
-        file = reply.get("file")
-        if text is not None and not isinstance(text, str):
-            raise RuntimeError("确认 resume.text 必须是字符串")
-        if file is not None and not isinstance(file, dict):
-            raise RuntimeError("确认 resume.file 必须是 artifact reference")
-        return {"new_text": text or None, "new_file": file}
-    if not isinstance(reply, str):
-        raise RuntimeError("确认 resume 必须是字符串或 {text,file} object")
-    return {"new_text": reply or None, "new_file": None}
+    text, new_files = _parse_resume_reply(reply, field="确认")
+    return {"new_text": text, "new_files": new_files}
 
 
 async def _ask_memory(state: SessionState) -> dict:
@@ -366,23 +389,14 @@ async def _ask_memory(state: SessionState) -> dict:
             "memory_operations": state["decision"]["memory_operations"],
         }
     )
-    if isinstance(reply, dict):
-        text = reply.get("text")
-        file = reply.get("file")
-        if text is not None and not isinstance(text, str):
-            raise RuntimeError("memory resume.text 必须是字符串")
-        if file is not None and not isinstance(file, dict):
-            raise RuntimeError("memory resume.file 必须是 artifact reference")
-        return {"new_text": text or None, "new_file": file}
-    if not isinstance(reply, str):
-        raise RuntimeError("memory resume 必须是字符串或 {text,file} object")
-    return {"new_text": reply or None, "new_file": None}
+    text, new_files = _parse_resume_reply(reply, field="memory")
+    return {"new_text": text, "new_files": new_files}
 
 
 async def _route_confirm(state: SessionState) -> str:
-    # 确认阶段又收到附件时，把它当任务补充重新交给主 Agent；不能像旧 runner
-    # 那样丢掉文件，也不能一边换附件一边按“是”执行旧任务。
-    if state.get("new_file") is not None:
+    # 确认阶段又收到附件时（可能是一整批），把它当任务补充重新交给主 Agent；
+    # 不能像旧 runner 那样丢掉文件，也不能一边换附件一边按“是”执行旧任务。
+    if state.get("new_files"):
         return "collect"
     reply = state.get("new_text") or ""
     if state["decision"].get("memory_operations") and _TASK_AND_MEMORY_CONFIRM_RE.fullmatch(
@@ -393,7 +407,7 @@ async def _route_confirm(state: SessionState) -> str:
 
 
 async def _route_memory_confirmation(state: SessionState) -> str:
-    if state.get("new_file") is not None:
+    if state.get("new_files"):
         return "collect"
     reply = (state.get("new_text") or "").strip()
     if _MEMORY_CONFIRM_RE.fullmatch(reply):
@@ -434,13 +448,11 @@ def build_graph(
                 decision = await main_agent.decide(
                     DialogueContext(
                         user_text=state["pending_instruction"],
-                        input_filenames=tuple(
-                            ref.get("display_filename") or ref["filename"] for ref in files
-                        ),
+                        input_filenames=tuple(display_name(ref) for ref in files),
                         known_facts=known_facts,
                         recent_messages=tuple(state.get("recent_messages") or ()),
                         active_artifact_filenames=tuple(
-                            ref.get("display_filename") or ref["filename"] for ref in active_artifacts
+                            display_name(ref) for ref in active_artifacts
                         ),
                         current_user_text=state.get("current_user_text"),
                     )
@@ -602,9 +614,7 @@ def build_graph(
         report = None
         artifacts: list[dict] = []
         user_message: str | None = None
-        input_filenames_for_log = ", ".join(
-            ref.get("display_filename") or ref["filename"] for ref in files
-        ) or None
+        input_filenames_for_log = ", ".join(display_name(ref) for ref in files) or None
         try:
             if execution.get("error"):
                 raise RuntimeError("无法创建执行工作目录")
@@ -615,9 +625,7 @@ def build_graph(
             if task.use_previous_artifact and not files:
                 raise RuntimeError("任务要求使用上一份文件，但会话中没有可用产物")
             input_paths = tuple(resolve_artifact_reference(ref) for ref in files)
-            input_filenames = tuple(
-                ref.get("display_filename") or ref["filename"] for ref in files
-            )
+            input_filenames = tuple(display_name(ref) for ref in files)
 
             report = _load_execution_marker(workdir)
             if report is None:
