@@ -34,7 +34,12 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-from walkie_dokie.agents.base import ExecutionAgent, ExecutionReport, resolve_output_file
+from walkie_dokie.agents.base import (
+    ExecutionAgent,
+    ExecutionArtifact,
+    ExecutionReport,
+    resolve_output_file,
+)
 from walkie_dokie.agents.security import validate_office_artifact, validate_report_text
 from walkie_dokie.artifacts import (
     output_artifact_reference,
@@ -188,7 +193,7 @@ def _write_execution_marker(workdir: Path, report: ExecutionReport) -> None:
     marker = _execution_metadata_dir(workdir) / _EXECUTION_MARKER
     payload = {
         "summary": report.summary,
-        "result_filename": report.result_filename,
+        "filenames": [item.filename for item in report.artifacts],
         "warnings": list(report.warnings),
     }
     _atomic_write_json(marker, payload)
@@ -199,12 +204,13 @@ def _load_execution_marker(workdir: Path) -> ExecutionReport | None:
     if not marker.is_file():
         return None
     payload = json.loads(marker.read_text(encoding="utf-8"))
-    filename = payload.get("result_filename")
-    artifact_path = resolve_output_file(workdir, filename) if filename else None
+    artifacts = tuple(
+        ExecutionArtifact(resolve_output_file(workdir, filename), filename)
+        for filename in payload.get("filenames", ())
+    )
     return ExecutionReport(
         summary=payload["summary"],
-        artifact_path=artifact_path,
-        result_filename=filename,
+        artifacts=artifacts,
         warnings=tuple(payload.get("warnings", ())),
     )
 
@@ -217,37 +223,60 @@ def _validate_execution_report(
     warnings = tuple(
         validate_report_text(item, field="warnings") for item in report.warnings
     )
-    if report.artifact_path is None:
-        return ExecutionReport(summary, None, None, warnings)
-    assert report.result_filename is not None  # enforced by ExecutionReport
-    expected = resolve_output_file(workdir, report.result_filename)
-    if report.artifact_path.resolve() != expected:
-        raise RuntimeError(
-            "执行 Agent 返回了其他工作目录的 artifact："
-            f"{report.artifact_path}（本轮期望 {expected}）"
-        )
-    validate_office_artifact(expected, role="执行产物")
-    # Keep only the path reconstructed from trusted workdir + validated basename.
-    return ExecutionReport(
-        summary=summary,
-        artifact_path=expected,
-        result_filename=report.result_filename,
-        warnings=warnings,
-    )
+    validated_artifacts = []
+    for item in report.artifacts:
+        expected = resolve_output_file(workdir, item.filename)
+        if item.path.resolve() != expected:
+            raise RuntimeError(
+                "执行 Agent 返回了其他工作目录的 artifact："
+                f"{item.path}（本轮期望 {expected}）"
+            )
+        validate_office_artifact(expected, role="执行产物")
+        validated_artifacts.append(ExecutionArtifact(expected, item.filename))
+    return ExecutionReport(summary=summary, artifacts=tuple(validated_artifacts), warnings=warnings)
+
+
+def _dedupe_display_filename(existing_names: set[str], filename: str) -> str | None:
+    """existing_names 已经包含所有已用过的有效文件名（filename 或 display_filename）。
+    不碰撞返回 None（沿用原 filename）；碰撞则返回按到达顺序递增的去重名。
+    """
+    if filename not in existing_names:
+        return None
+    stem, dot, ext = filename.rpartition(".")
+    base, suffix = (stem, f".{ext}") if dot else (filename, "")
+    n = 2
+    candidate = f"{base}-{n}{suffix}"
+    while candidate in existing_names:
+        n += 1
+        candidate = f"{base}-{n}{suffix}"
+    return candidate
+
+
+def _merge_pending_files(existing: tuple[dict, ...], incoming: tuple[dict, ...]) -> tuple[dict, ...]:
+    used = {ref.get("display_filename") or ref["filename"] for ref in existing}
+    merged = list(existing)
+    for ref in incoming:
+        resolve_artifact_reference(ref)
+        display = _dedupe_display_filename(used, ref["filename"])
+        used.add(display or ref["filename"])
+        merged.append({**ref, "display_filename": display})
+    return tuple(merged)
 
 
 async def _collect(state: SessionState) -> dict:
     existing = state.get("pending_instruction")
     new = state.get("new_text")
     combined = f"{existing}\n{new}" if existing and new else (new or existing)
-    file = state.get("new_file") or state.get("pending_file")
-    if file is not None:
-        resolve_artifact_reference(file)
+    resume_file = state.get("new_file")
+    resume_files = (resume_file,) if resume_file is not None else ()
+    incoming_files = state.get("new_files") or resume_files
+    merged_files = _merge_pending_files(state.get("pending_files") or (), incoming_files)
     return {
         "pending_instruction": combined,
-        "pending_file": file,
+        "pending_files": merged_files,
         "new_text": None,
         "new_file": None,
+        "new_files": (),
         "current_user_text": new,
         # result/memory_changes 是单回合输出，不得泄漏到下一轮。旧代码未清理，
         # 下一轮只发文件时会再次发送上一轮结果。
@@ -295,12 +324,12 @@ async def _reply(state: SessionState) -> dict:
     decision = state["decision"]
     return {
         "pending_instruction": None,
-        "pending_file": None,
+        "pending_files": (),
         "current_user_text": None,
         "decision": None,
         "result": {
             "reply_text": decision["user_message"],
-            "artifact": None,
+            "artifacts": [],
             "success": True,
         },
         "recent_messages": _completed_turn_history(
@@ -383,13 +412,13 @@ def build_graph(
     async def _main_agent(state: SessionState) -> dict:
         platform = state["platform"]
         user_id = state["user_id"]
-        file = state.get("pending_file")
-        active_artifact = state.get("active_artifact")
+        files = state.get("pending_files") or ()
+        active_artifacts = state.get("active_artifacts") or ()
         try:
             known_facts = memory_repository.load(platform, user_id)
             if (
                 state["pending_instruction"].strip() == LONG_TERM_MEMORY_COMMAND
-                and file is None
+                and not files
             ):
                 return {
                     "decision": {
@@ -405,11 +434,13 @@ def build_graph(
                 decision = await main_agent.decide(
                     DialogueContext(
                         user_text=state["pending_instruction"],
-                        input_filename=file["filename"] if file else None,
+                        input_filenames=tuple(
+                            ref.get("display_filename") or ref["filename"] for ref in files
+                        ),
                         known_facts=known_facts,
                         recent_messages=tuple(state.get("recent_messages") or ()),
-                        active_artifact_filename=(
-                            active_artifact["filename"] if active_artifact else None
+                        active_artifact_filenames=tuple(
+                            ref["filename"] for ref in active_artifacts
                         ),
                         current_user_text=state.get("current_user_text"),
                     )
@@ -496,13 +527,13 @@ def build_graph(
         assistant_history = f'{state["decision"]["user_message"]}\n{reply}'
         return {
             "pending_instruction": None,
-            "pending_file": None,
+            "pending_files": (),
             "current_user_text": None,
             "new_text": None,
             "decision": None,
             "memory_changes": changes or None,
             "memory_feedback": reply,
-            "result": {"reply_text": reply, "artifact": None, "success": True},
+            "result": {"reply_text": reply, "artifacts": [], "success": True},
             "recent_messages": _completed_turn_history(
                 state, state["pending_instruction"], assistant_history
             ),
@@ -513,13 +544,13 @@ def build_graph(
         assistant_history = f'{state["decision"]["user_message"]}\n{reply}'
         return {
             "pending_instruction": None,
-            "pending_file": None,
+            "pending_files": (),
             "current_user_text": None,
             "new_text": None,
             "decision": None,
             "memory_changes": None,
             "memory_feedback": reply,
-            "result": {"reply_text": reply, "artifact": None, "success": True},
+            "result": {"reply_text": reply, "artifacts": [], "success": True},
             "recent_messages": _completed_turn_history(
                 state, state["pending_instruction"], assistant_history
             ),
@@ -543,19 +574,19 @@ def build_graph(
         user_id = state["user_id"]
         task = task_from_dict(state["decision"]["task"])
         execution_instruction = task.instruction
-        current_file = state.get("pending_file")
-        previous_file = state.get("active_artifact")
+        current_files = state.get("pending_files") or ()
+        previous_files = state.get("active_artifacts") or ()
         selection_error = None
         if task.use_previous_artifact:
-            if current_file is not None:
+            if current_files:
                 selection_error = (
                     "任务同时包含新附件并要求上一份 artifact，来源不明确，拒绝执行"
                 )
-                file = None
+                files = ()
             else:
-                file = previous_file
+                files = previous_files
         else:
-            file = current_file
+            files = current_files
 
         execution = state.get("execution") or {}
         workdir_value = execution.get("workdir")
@@ -569,8 +600,11 @@ def build_graph(
         started = time.monotonic()
         error: str | None = None
         report = None
-        artifact = None
+        artifacts: list[dict] = []
         user_message: str | None = None
+        input_filenames_for_log = ", ".join(
+            ref.get("display_filename") or ref["filename"] for ref in files
+        ) or None
         try:
             if execution.get("error"):
                 raise RuntimeError("无法创建执行工作目录")
@@ -578,9 +612,12 @@ def build_graph(
                 raise RuntimeError(selection_error)
             if not workdir.is_relative_to(WORKSPACES_ROOT.resolve()):
                 raise RuntimeError("执行工作目录越过 workspace 根目录")
-            if task.use_previous_artifact and file is None:
+            if task.use_previous_artifact and not files:
                 raise RuntimeError("任务要求使用上一份文件，但会话中没有可用产物")
-            input_path = resolve_artifact_reference(file) if file else None
+            input_paths = tuple(resolve_artifact_reference(ref) for ref in files)
+            input_filenames = tuple(
+                ref.get("display_filename") or ref["filename"] for ref in files
+            )
 
             report = _load_execution_marker(workdir)
             if report is None:
@@ -595,22 +632,22 @@ def build_graph(
                 async with asyncio.timeout(900):
                     report = await execution_agent.run(
                         instruction=execution_instruction,
-                        input_path=input_path,
+                        input_paths=input_paths,
+                        input_filenames=input_filenames,
                         workdir=workdir,
-                        input_filename=file["filename"] if file else None,
                     )
                 report = _validate_execution_report(workdir, report)
-                if report.artifact_path and report.result_filename:
-                    artifact = output_artifact_reference(
-                        report.artifact_path, report.result_filename
-                    )
+                artifacts = [
+                    output_artifact_reference(item.path, item.filename)
+                    for item in report.artifacts
+                ]
                 _write_execution_marker(workdir, report)
             else:
                 report = _validate_execution_report(workdir, report)
-                if report.artifact_path and report.result_filename:
-                    artifact = output_artifact_reference(
-                        report.artifact_path, report.result_filename
-                    )
+                artifacts = [
+                    output_artifact_reference(item.path, item.filename)
+                    for item in report.artifacts
+                ]
                 logger.warning(
                     "检测到 execution report marker，跳过重复执行 execution_id=%s",
                     execution.get("execution_id"),
@@ -618,20 +655,17 @@ def build_graph(
             try:
                 async with asyncio.timeout(60):
                     user_message = await main_agent.finalize(
-                        FinalizeContext(
-                            task=task,
-                            report=report,
-                        )
+                        FinalizeContext(task=task, report=report)
                     )
             except Exception:
                 # 执行已经产生副作用/文件，不能因为最后一次措辞调用失败就让整个
                 # 节点失败并在重试时重复执行。这里用确定性降级文案完成投递。
                 logger.exception("主 Agent 整理执行结果失败，使用降级回复")
-                user_message = (
-                    f"已经处理完成，文件「{report.result_filename}」已生成。"
-                    if report.result_filename
-                    else "已经处理完成。"
-                )
+                if report.artifacts:
+                    names = "、".join(item.filename for item in report.artifacts)
+                    user_message = f"已经处理完成，文件「{names}」已生成。"
+                else:
+                    user_message = "已经处理完成。"
                 if report.warnings:
                     user_message += "\n\n注意：" + "；".join(report.warnings)
             memory_feedback = state.get("memory_feedback")
@@ -651,10 +685,12 @@ def build_graph(
                         user_id=user_id,
                         run_id=execution.get("execution_id") or "prepare-failed",
                         input_text=execution_instruction,
-                        input_filename=file["filename"] if file else None,
+                        input_filename=input_filenames_for_log,
                         backend=type(execution_agent).__name__,
                         output_text=user_message,
-                        output_filename=report.result_filename if report else None,
+                        output_filename=(
+                            ", ".join(item["filename"] for item in artifacts) or None
+                        ),
                         duration_ms=int((time.monotonic() - started) * 1000),
                         success=error is None,
                         record_type="execution",
@@ -668,30 +704,30 @@ def build_graph(
         # 失败结果绝不能同时发布/激活不确定的产物。后端已写文件但 marker 失败
         # 时属于 outcome unknown，保留 workdir 供人工复盘，不交给用户继续使用。
         if error is not None:
-            artifact = None
+            artifacts = []
 
         update = {
             "pending_instruction": None,
-            "pending_file": None,
+            "pending_files": (),
             "current_user_text": None,
             "decision": None,
             "execution": None,
             "memory_feedback": None,
             "result": {
                 "reply_text": user_message,
-                "artifact": artifact,
+                "artifacts": artifacts,
                 "success": error is None,
             },
             "recent_messages": _completed_turn_history(
                 state, state["pending_instruction"], user_message
             ),
         }
-        if artifact is not None:
-            update["active_artifact"] = artifact
-        elif error is None and file is not None:
+        if artifacts:
+            update["active_artifacts"] = tuple(artifacts)
+        elif error is None and files:
             # 读取/总结任务可能只返回文字而不生成新文件；此时“刚才的文件”应当
             # 继续指向本轮实际使用的输入，而不是更早的一份产物。
-            update["active_artifact"] = file
+            update["active_artifacts"] = files
         return update
 
     graph = StateGraph(SessionState)
