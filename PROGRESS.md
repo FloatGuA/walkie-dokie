@@ -41,7 +41,8 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 标准 `pytest` 不再收集时启动真实 backend smoke script；两个脚本已有 `__main__` guard，pytest 配置限定 `tests/`。
 - ExecutionAgent prompt-injection 权限边界已收紧：Claude 使用 fail-closed Bash sandbox，Codex 使用最小 permission profile；两者都无执行网络、无 MCP/skills/子 Agent、无应用 secret 环境变量，只能写本轮 workspace。Codex profile 已在宿主 Linux 实测不能读取项目 README 或独立 CODEX_HOME，同时能写指定 workspace 并加载 python-docx/openpyxl。
 - `.docx/.xlsx` 在执行前后经过确定性 OOXML 校验；宏、嵌入对象、外部关系、危险字段/公式、异常 ZIP 会被拒绝。graph 会再次验证执行报告和产物，不信任 backend 自报路径。
-- 当前全量离线测试为 110 passed（2026-08-15 `contract_intelligence` 拆分到独立仓库后，只统计 walkie-dokie 自身套件；拆分前含合同智能共 161 passed）。
+- 当前全量离线测试为 129 passed（2026-08-15 `contract_intelligence` 拆分到独立仓库后，只统计 walkie-dokie 自身套件；拆分前含合同智能共 161 passed）。新增测试涵盖多文件执行会话工作的五个关键场景：防抖窗口内多文件累积、文件名碰撞去重、部分文件校验失败排除、全部文件校验失败拒绝、多产物执行报告与交付。
+- 防抖窗口内的多文件处理缺口已解决：debounce 此前实现中 `_files` 为单槽 dict，同一窗口内连发多个文件会静默覆盖丢失（见 DECISION.md "orchestrator 加回一道确认环节"条目的 2026-08-17 实现状态注记）；多文件执行会话完整设计（DECISION.md 2026-08-18）已定稿并全量实现，`pending_files` 改为队列结构、`ExecutionReport.artifacts` 支持多输出、文件名碰撞通过 `display_filename` 去重、部分校验失败排除而非整批拒绝，对应测试已全量覆盖。
 
 ## 尚未验证
 
