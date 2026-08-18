@@ -8,7 +8,7 @@ from docx import Document
 
 import walkie_dokie.artifacts as artifact_store
 import walkie_dokie.orchestrator.graph as graph_module
-from walkie_dokie.agents.base import ExecutionAgent, ExecutionReport
+from walkie_dokie.agents.base import ExecutionAgent, ExecutionArtifact, ExecutionReport
 from walkie_dokie.main_agent.base import (
     DialogueContext,
     FinalizeContext,
@@ -83,37 +83,40 @@ class FakeMainAgent(MainAgent):
 
 
 class FakeExecutionAgent(ExecutionAgent):
-    def __init__(self, *, produce_artifact=False, error: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        produce_artifact=False,
+        artifact_names: tuple[str, ...] | None = None,
+        error: Exception | None = None,
+    ):
         self.calls = []
         self.produce_artifact = produce_artifact
+        # artifact_names 允许测试要求生成多份产物；不传时沿用 produce_artifact
+        # 单文件语义，向后兼容既有测试。
+        self.artifact_names = artifact_names
         self.error = error
 
-    async def run(self, instruction, input_path, workdir, input_filename=None):
+    async def run(self, instruction, input_paths, input_filenames, workdir):
         self.calls.append(
             {
                 "instruction": instruction,
-                "input_path": input_path,
+                "input_paths": input_paths,
+                "input_filenames": input_filenames,
                 "workdir": workdir,
-                "input_filename": input_filename,
             }
         )
         if self.error:
             raise self.error
-        if self.produce_artifact:
-            artifact = workdir / "result.docx"
+        names = self.artifact_names or (("result.docx",) if self.produce_artifact else ())
+        artifacts = []
+        for name in names:
+            path = workdir / name
             document = Document()
             document.add_paragraph("generated")
-            document.save(artifact)
-            return ExecutionReport(
-                summary="测试文档已生成",
-                artifact_path=artifact,
-                result_filename=artifact.name,
-            )
-        return ExecutionReport(
-            summary="测试文档已生成",
-            artifact_path=None,
-            result_filename=None,
-        )
+            document.save(path)
+            artifacts.append(ExecutionArtifact(path, name))
+        return ExecutionReport(summary="测试文档已生成", artifacts=tuple(artifacts))
 
 
 @pytest.fixture(autouse=True)
@@ -488,8 +491,8 @@ async def test_file_only_new_turn_clears_previous_result(tmp_path, execution_age
         config=config(),
     )
     assert state.get("result") is None
-    assert state["pending_file"] == reference
-    assert "content" not in state["pending_file"]
+    assert state["pending_files"] == (reference,)
+    assert "content" not in state["pending_files"][0]
 
 
 async def test_memory_changes_do_not_leak_into_next_turn(tmp_path, execution_agent):
@@ -601,7 +604,7 @@ async def test_attachment_during_confirmation_is_not_dropped(tmp_path, execution
         Command(resume={"text": "", "file": reference}), config=config()
     )
     assert "__interrupt__" in state
-    assert main_agent.decide_calls[1].input_filename == "new.docx"
+    assert main_agent.decide_calls[1].input_filenames == ("new.docx",)
     assert execution_agent.calls == []
 
 
@@ -625,7 +628,7 @@ async def test_previous_output_can_be_selected_by_next_task(tmp_path):
         config=config(),
     )
     first = await graph.ainvoke(Command(resume="是"), config=config())
-    previous_path = Path(first["active_artifact"]["path"])
+    previous_path = Path(first["active_artifacts"][0]["path"])
 
     await graph.ainvoke(
         {
@@ -636,9 +639,9 @@ async def test_previous_output_can_be_selected_by_next_task(tmp_path):
         },
         config=config(),
     )
-    assert main_agent.decide_calls[1].active_artifact_filename == "result.docx"
+    assert main_agent.decide_calls[1].active_artifact_filenames == ("result.docx",)
     await graph.ainvoke(Command(resume="是"), config=config())
-    assert execution_agent.calls[1]["input_path"] == previous_path.resolve()
+    assert execution_agent.calls[1]["input_paths"] == (previous_path.resolve(),)
 
 
 async def test_successful_read_only_task_makes_its_input_the_active_artifact(
@@ -657,7 +660,7 @@ async def test_successful_read_only_task_makes_its_input_the_active_artifact(
         config=config(),
     )
     state = await graph.ainvoke(Command(resume="是"), config=config())
-    assert state["active_artifact"] == reference
+    assert state["active_artifacts"] == [reference]
 
 
 async def test_failed_execution_never_publishes_or_activates_partial_artifact(
@@ -682,18 +685,18 @@ async def test_failed_execution_never_publishes_or_activates_partial_artifact(
     )
     state = await graph.ainvoke(Command(resume="是"), config=config())
     assert state["result"]["success"] is False
-    assert state["result"]["artifact"] is None
+    assert state["result"]["artifacts"] == []
     assert state.get("active_artifact") is None
 
 
 async def test_execution_agent_cannot_publish_artifact_from_sibling_workdir(tmp_path):
     class CrossWorkspaceAgent(ExecutionAgent):
-        async def run(self, instruction, input_path, workdir, input_filename=None):
+        async def run(self, instruction, input_paths, input_filenames, workdir):
             victim_dir = workdir.parent / "victim-run"
             victim_dir.mkdir()
             victim = victim_dir / "result.docx"
             victim.write_bytes(b"another user's file")
-            return ExecutionReport("done", victim, victim.name)
+            return ExecutionReport("done", (ExecutionArtifact(victim, victim.name),))
 
     main_agent = FakeMainAgent()
     graph, _ = make_graph(tmp_path, main_agent, CrossWorkspaceAgent())
@@ -708,7 +711,7 @@ async def test_execution_agent_cannot_publish_artifact_from_sibling_workdir(tmp_
     )
     state = await graph.ainvoke(Command(resume="是"), config=config())
     assert state["result"]["success"] is False
-    assert state["result"]["artifact"] is None
+    assert state["result"]["artifacts"] == []
     assert state.get("active_artifact") is None
 
 
@@ -797,6 +800,70 @@ async def test_old_accumulated_text_cannot_be_reused_as_new_memory_evidence(
     )
     await graph.ainvoke(Command(resume="先不做"), config=config())
     assert memory.load("test", "u1") == {}
+
+
+async def test_multiple_files_in_one_window_are_merged_into_pending_files(
+    tmp_path, execution_agent
+):
+    main_agent = FakeMainAgent()
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    file_a = input_reference("a.docx", b"a")
+    file_b = input_reference("b.docx", b"b")
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "合并这两份",
+            "new_files": (file_a, file_b),
+        },
+        config=config(),
+    )
+    # main_agent 收到了两个文件名
+    assert main_agent.decide_calls[0].input_filenames == ("a.docx", "b.docx")
+
+
+async def test_filename_collision_in_same_window_gets_display_filename_suffix(
+    tmp_path, execution_agent
+):
+    main_agent = FakeMainAgent()
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    file_1 = input_reference("报价单.xlsx", b"1")
+    file_2 = input_reference("报价单.xlsx", b"2")
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "都看一下",
+            "new_files": (file_1, file_2),
+        },
+        config=config(),
+    )
+    assert main_agent.decide_calls[0].input_filenames == ("报价单.xlsx", "报价单-2.xlsx")
+
+
+async def test_execute_produces_multiple_artifacts_in_result(tmp_path):
+    main_agent = FakeMainAgent()
+    execution_agent = FakeExecutionAgent(artifact_names=("out1.docx", "out2.docx"))
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "生成两份文档",
+            "new_files": (),
+        },
+        config=config(),
+    )
+    state = await graph.ainvoke(
+        Command(resume={"text": "是", "file": None}), config=config()
+    )
+    assert [item["filename"] for item in state["result"]["artifacts"]] == [
+        "out1.docx",
+        "out2.docx",
+    ]
 
 
 @pytest.mark.parametrize(
