@@ -65,7 +65,8 @@ async def _invoke_from_event(
     platform_name: str,
     user_id: str,
     text: str,
-    file: IncomingFile | None,
+    file: IncomingFile | None = None,
+    files: tuple[IncomingFile, ...] = (),
 ):
     """Re-check durable state at dispatch time, then resume or start atomically."""
     snapshot = await graph.aget_state(config=config)
@@ -82,15 +83,15 @@ async def _invoke_from_event(
         raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
     if snapshot.next:
         raise RuntimeError(f"会话存在非 interrupt 的未完成任务 next={snapshot.next!r}")
-    file_reference = (
-        store_incoming_file(platform_name, user_id, file) if file else None
+    file_references = tuple(
+        store_incoming_file(platform_name, user_id, item) for item in files
     )
     return await graph.ainvoke(
         {
             "platform": platform_name,
             "user_id": user_id,
             "new_text": text or None,
-            "new_file": file_reference,
+            "new_files": file_references,
         },
         config=config,
         durability="sync",
@@ -109,33 +110,26 @@ async def deliver_graph_output(
 
     result = state.get("result")
     if result is None:
-        pending_file = state.get("pending_file")
-        if pending_file is not None:
+        pending_files = state.get("pending_files") or ()
+        if pending_files:
             # 飞书发文件时不能带文字，只能分开发——收到文件但还没指令是正常情况，
             # 得主动回一句，不能沉默，不然用户不知道文件收到没有。
-            await platform.send(
-                user_id,
-                OutboundMessage(
-                    text=f"收到文件「{pending_file['filename']}」了，请告诉我需要我做什么。"
-                ),
-            )
-            return (
-                f"收到文件「{pending_file['filename']}」了，请告诉我需要我做什么。",
-                None,
-                True,
-            )
+            names = "、".join(ref["filename"] for ref in pending_files)
+            text = f"收到文件「{names}」了，请告诉我需要我做什么。"
+            await platform.send(user_id, OutboundMessage(text=text))
+            return text, None, True
         else:
             logger.info("图输出为空 user_id=%s", user_id)
         return None, None, True
 
+    artifacts = result.get("artifacts") or []
     logger.info(
-        "图输出完成 user_id=%s success=%s artifact=%r",
+        "图输出完成 user_id=%s success=%s artifact_count=%d",
         user_id,
         result.get("success"),
-        result.get("artifact") and result["artifact"].get("filename"),
+        len(artifacts),
     )
-    if result["artifact"] is not None:
-        reference = result["artifact"]
+    for reference in artifacts:
         artifact = resolve_artifact_reference(reference)
         await platform.send(
             user_id,
@@ -150,7 +144,7 @@ async def deliver_graph_output(
     await platform.send(user_id, OutboundMessage(text=result["reply_text"]))
     return (
         result["reply_text"],
-        result.get("artifact") and result["artifact"].get("filename"),
+        ", ".join(item["filename"] for item in artifacts) or None,
         bool(result.get("success")),
     )
 
@@ -196,16 +190,16 @@ async def dispatch_fresh(
     platform_name: str,
     user_id: str,
     combined_text: str,
-    file: IncomingFile | None,
+    files: tuple[IncomingFile, ...],
     locks: UserLocks,
 ) -> None:
     session_key = _session_key(platform_name, user_id)
     started = time.monotonic()
     logger.info(
-        "开始处理防抖回合 session=%s text_chars=%d file=%r",
+        "开始处理防抖回合 session=%s text_chars=%d files=%r",
         session_key,
         len(combined_text),
-        file and file.filename,
+        [item.filename for item in files],
     )
     async with locks.get(session_key):
         fallback_text = "处理失败，稍后再试一下"
@@ -216,7 +210,7 @@ async def dispatch_fresh(
                 platform_name=platform_name,
                 user_id=user_id,
                 text=combined_text,
-                file=file,
+                files=files,
             )
         except Exception as exc:
             logger.exception("orchestrator 处理失败 user_id=%s", user_id)
@@ -225,7 +219,7 @@ async def dispatch_fresh(
                 platform_name=platform_name,
                 user_id=user_id,
                 input_text=combined_text or None,
-                input_filename=file.filename if file else None,
+                input_filename=", ".join(item.filename for item in files) or None,
                 output_text=fallback_text,
                 output_filename=None,
                 duration_ms=int((time.monotonic() - started) * 1000),
@@ -255,7 +249,7 @@ async def dispatch_fresh(
                 platform_name=platform_name,
                 user_id=user_id,
                 input_text=combined_text or None,
-                input_filename=file.filename if file else None,
+                input_filename=", ".join(item.filename for item in files) or None,
                 output_text=output_text,
                 output_filename=output_filename,
                 duration_ms=int((time.monotonic() - started) * 1000),
@@ -418,8 +412,8 @@ async def main():
         locks = UserLocks()
         debouncer = Debouncer(
             DEBOUNCE_WINDOW_SECONDS,
-            on_ready=lambda platform_name, user_id, text, file: dispatch_fresh(
-                graph, platform, platform_name, user_id, text, file, locks
+            on_ready=lambda platform_name, user_id, text, files: dispatch_fresh(
+                graph, platform, platform_name, user_id, text, files, locks
             ),
         )
 

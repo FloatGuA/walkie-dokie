@@ -11,7 +11,7 @@ from scripts.run_mvp import (
 from walkie_dokie.main_agent.base import MemoryOperation
 from walkie_dokie.main_agent.memory import JsonMemoryRepository
 from walkie_dokie.orchestrator.locks import UserLocks
-from walkie_dokie.platforms.base import InboundEvent
+from walkie_dokie.platforms.base import IncomingFile, InboundEvent
 
 
 class FakePlatform:
@@ -76,7 +76,7 @@ async def test_artifact_is_delivered_before_main_agent_text(monkeypatch, tmp_pat
         "u1",
         {
             "result": {
-                "artifact": reference,
+                "artifacts": [reference],
                 "reply_text": "已经处理好了。",
                 "success": True,
             }
@@ -96,7 +96,7 @@ async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatc
         async def ainvoke(self, value, config, durability=None):
             return {
                 "result": {
-                    "artifact": None,
+                    "artifacts": [],
                     "reply_text": "我是小帮。",
                     "success": True,
                 }
@@ -115,7 +115,7 @@ async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatc
         "test",
         "u1",
         "你是谁？",
-        None,
+        (),
         UserLocks(),
     )
 
@@ -160,3 +160,49 @@ async def test_long_term_memory_command_bypasses_graph_and_debounce(
     assert platform.sent[0][1].text == "当前保存的长期记忆：\n姓名：浮瓜"
     assert records[0].record_type == "conversation"
     assert records[0].success is True
+
+
+async def test_multiple_artifacts_are_delivered_before_text(monkeypatch, tmp_path):
+    root = tmp_path / "workspaces"
+    root.mkdir()
+    a = root / "a.docx"
+    a.write_bytes(b"doc-a")
+    b = root / "b.docx"
+    b.write_bytes(b"doc-b")
+    monkeypatch.setattr(artifact_store, "WORKSPACES_ROOT", root)
+    ref_a = artifact_store.output_artifact_reference(a, a.name)
+    ref_b = artifact_store.output_artifact_reference(b, b.name)
+    platform = FakePlatform()
+
+    await deliver_graph_output(
+        platform,
+        "u1",
+        {
+            "result": {
+                "artifacts": [ref_a, ref_b],
+                "reply_text": "两份都处理好了。",
+                "success": True,
+            }
+        },
+    )
+    assert len(platform.sent) == 3
+    assert platform.sent[0][1].file.filename == "a.docx"
+    assert platform.sent[1][1].file.filename == "b.docx"
+    assert platform.sent[2][1].text == "两份都处理好了。"
+
+
+async def test_pending_files_notice_lists_all_filenames(monkeypatch, tmp_path):
+    root = tmp_path / "inputs"
+    monkeypatch.setattr(artifact_store, "INPUT_ARTIFACTS_ROOT", root)
+    ref_a = artifact_store.store_incoming_file(
+        "test", "u1", IncomingFile("a.docx", b"a", "application/octet-stream")
+    )
+    ref_b = artifact_store.store_incoming_file(
+        "test", "u1", IncomingFile("b.docx", b"b", "application/octet-stream")
+    )
+    platform = FakePlatform()
+    await deliver_graph_output(
+        platform, "u1", {"pending_files": (ref_a, ref_b)}
+    )
+    assert "a.docx" in platform.sent[0][1].text
+    assert "b.docx" in platform.sent[0][1].text
