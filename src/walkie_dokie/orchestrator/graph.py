@@ -440,7 +440,7 @@ def build_graph(
                         known_facts=known_facts,
                         recent_messages=tuple(state.get("recent_messages") or ()),
                         active_artifact_filenames=tuple(
-                            ref["filename"] for ref in active_artifacts
+                            ref.get("display_filename") or ref["filename"] for ref in active_artifacts
                         ),
                         current_user_text=state.get("current_user_text"),
                     )
@@ -727,7 +727,7 @@ def build_graph(
         elif error is None and files:
             # 读取/总结任务可能只返回文字而不生成新文件；此时“刚才的文件”应当
             # 继续指向本轮实际使用的输入，而不是更早的一份产物。
-            update["active_artifacts"] = files
+            update["active_artifacts"] = tuple(files)
         return update
 
     graph = StateGraph(SessionState)

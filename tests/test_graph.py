@@ -660,7 +660,7 @@ async def test_successful_read_only_task_makes_its_input_the_active_artifact(
         config=config(),
     )
     state = await graph.ainvoke(Command(resume="是"), config=config())
-    assert state["active_artifacts"] == [reference]
+    assert state["active_artifacts"] == (reference,)
 
 
 async def test_failed_execution_never_publishes_or_activates_partial_artifact(
@@ -686,7 +686,7 @@ async def test_failed_execution_never_publishes_or_activates_partial_artifact(
     state = await graph.ainvoke(Command(resume="是"), config=config())
     assert state["result"]["success"] is False
     assert state["result"]["artifacts"] == []
-    assert state.get("active_artifact") is None
+    assert state.get("active_artifacts") in (None, ())
 
 
 async def test_execution_agent_cannot_publish_artifact_from_sibling_workdir(tmp_path):
@@ -712,7 +712,7 @@ async def test_execution_agent_cannot_publish_artifact_from_sibling_workdir(tmp_
     state = await graph.ainvoke(Command(resume="是"), config=config())
     assert state["result"]["success"] is False
     assert state["result"]["artifacts"] == []
-    assert state.get("active_artifact") is None
+    assert state.get("active_artifacts") in (None, ())
 
 
 async def test_main_agent_failure_finishes_turn_instead_of_leaving_pending_task(
