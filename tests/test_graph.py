@@ -21,6 +21,7 @@ from walkie_dokie.main_agent.base import (
     TaskContract,
 )
 from walkie_dokie.main_agent.memory import JsonMemoryRepository
+from walkie_dokie.main_agent.summarizer import Summarizer
 from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.graph import (
     _CANCEL_REPLY,
@@ -109,6 +110,30 @@ class JudgingFakeMainAgent(FakeMainAgent):
         return item
 
 
+class QueueSummarizer(Summarizer):
+    """summarize/merge 各按预置队列出牌；队列元素是条目 tuple 或要抛的异常。"""
+
+    def __init__(self, summarize_results, merge_results=()):
+        self._summarize_results = list(summarize_results)
+        self._merge_results = list(merge_results)
+        self.summarize_calls: list[tuple] = []
+        self.merge_calls: list[tuple] = []
+
+    async def summarize(self, messages):
+        self.summarize_calls.append(messages)
+        item = self._summarize_results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def merge(self, entries):
+        self.merge_calls.append(entries)
+        item = self._merge_results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 class FakeExecutionAgent(ExecutionAgent):
     def __init__(
         self,
@@ -179,13 +204,14 @@ def execution_agent():
     return FakeExecutionAgent()
 
 
-def make_graph(tmp_path, main_agent, execution_agent):
+def make_graph(tmp_path, main_agent, execution_agent, summarizer=None):
     memory = JsonMemoryRepository(tmp_path / "memory")
     graph = build_graph(
         main_agent,
         execution_agent,
         memory,
         checkpointer=InMemorySaver(),
+        summarizer=summarizer,
     )
     return graph, memory
 
@@ -1410,3 +1436,219 @@ async def test_history_within_window_leaves_pending_empty(tmp_path, execution_ag
 
     assert len(state["recent_messages"]) == 4
     assert state["pending_compaction"] == []
+
+
+def _compaction_messages(count=6):
+    """构造一批被挤出窗口的原始消息；content 互不相同，便于逐字 evidence 断言。"""
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"压缩原文{i}"}
+        for i in range(count)
+    ]
+
+
+def _compaction_invoke(**overrides):
+    """compaction 触发的 invoke 输入：只带旗标，其余是被测的预置 checkpoint 状态。"""
+    payload = {
+        "platform": "test",
+        "user_id": "u1",
+        "trace_id": "trace-compact",
+        "new_compaction_request": True,
+        "pending_compaction": _compaction_messages(),
+        "conversation_summary": [],
+        "compaction_failures": 0,
+    }
+    payload.update(overrides)
+    return payload
+
+
+async def test_compact_appends_validated_entries_and_clears_pending(
+    tmp_path, execution_agent
+):
+    """成功压缩：条目进 summary、pending 清空、计数清零、旗标消费、无用户输出。
+
+    刻意预置 pending_instruction：compaction 旗标必须优先于 pending_instruction
+    路由到 compact，绝不能顺带把上一轮残留指令再送一次主 Agent。
+    """
+    summarizer = QueueSummarizer(
+        [
+            (
+                {"fact": "用户在准备年度报告", "evidence": ["压缩原文0"]},
+                {"fact": "用户希望用中文沟通", "evidence": ["压缩原文3"]},
+            ),
+        ]
+    )
+    main_agent = FakeMainAgent()
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent, summarizer)
+
+    state = await graph.ainvoke(
+        _compaction_invoke(pending_instruction="上一轮残留指令"),
+        config=config(),
+        durability="sync",
+    )
+
+    assert [entry["fact"] for entry in state["conversation_summary"]] == [
+        "用户在准备年度报告",
+        "用户希望用中文沟通",
+    ]
+    assert state["conversation_summary"][0]["evidence"] == ["压缩原文0"]
+    assert state["pending_compaction"] == []
+    assert state["compaction_failures"] == 0
+    assert state["new_compaction_request"] is False
+    assert state["result"] is None
+    assert main_agent.decide_calls == []
+    assert state["pending_instruction"] == "上一轮残留指令"
+    assert len(summarizer.summarize_calls) == 1
+    assert list(summarizer.summarize_calls[0]) == _compaction_messages()
+    assert summarizer.merge_calls == []
+
+
+async def test_compact_failure_keeps_pending_and_counts(
+    tmp_path, execution_agent, caplog
+):
+    """压缩失败：pending 原样保留待重试、失败计数 +1、摘要不变、旗标仍被消费。"""
+    summarizer = QueueSummarizer([RuntimeError("摘要后端不可用")])
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+    preset_summary = [{"fact": "旧事实", "evidence": ["旧证据"]}]
+
+    with caplog.at_level(logging.WARNING, logger=CONFIRM_LOGGER):
+        state = await graph.ainvoke(
+            _compaction_invoke(conversation_summary=list(preset_summary)),
+            config=config(),
+            durability="sync",
+        )
+
+    assert state["pending_compaction"] == _compaction_messages()
+    assert state["compaction_failures"] == 1
+    assert state["conversation_summary"] == preset_summary
+    assert state["new_compaction_request"] is False
+    warnings = confirm_log_lines(caplog, logging.WARNING)
+    assert any("trace-compact" in line for line in warnings)
+
+
+async def test_compact_drops_batch_after_three_failures(
+    tmp_path, execution_agent, caplog
+):
+    """连续第 3 次失败：丢弃该批（pending 清空、计数归零），摘要不受影响。"""
+    summarizer = QueueSummarizer([RuntimeError("摘要后端仍然不可用")])
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+    preset_summary = [{"fact": "旧事实", "evidence": ["旧证据"]}]
+
+    with caplog.at_level(logging.WARNING, logger=CONFIRM_LOGGER):
+        state = await graph.ainvoke(
+            _compaction_invoke(
+                compaction_failures=2, conversation_summary=list(preset_summary)
+            ),
+            config=config(),
+            durability="sync",
+        )
+
+    assert state["pending_compaction"] == []
+    assert state["compaction_failures"] == 0
+    assert state["conversation_summary"] == preset_summary
+    assert state["new_compaction_request"] is False
+    warnings = confirm_log_lines(caplog, logging.WARNING)
+    assert any("丢弃" in line and "6" in line for line in warnings)
+
+
+async def test_compact_rejected_entries_do_not_enter_summary(
+    tmp_path, execution_agent
+):
+    """evidence 不是本批原文逐字子串的候选被机械拒绝，只有合法条目进 summary。"""
+    summarizer = QueueSummarizer(
+        [
+            (
+                {"fact": "编造的结论", "evidence": ["这句话本批消息里根本没有"]},
+                {"fact": "用户提到过压缩原文2", "evidence": ["压缩原文2"]},
+            ),
+        ]
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    state = await graph.ainvoke(
+        _compaction_invoke(), config=config(), durability="sync"
+    )
+
+    assert [entry["fact"] for entry in state["conversation_summary"]] == [
+        "用户提到过压缩原文2"
+    ]
+    assert state["pending_compaction"] == []
+    assert state["compaction_failures"] == 0
+
+
+async def test_merge_triggers_over_threshold_and_replaces_summary(
+    tmp_path, execution_agent
+):
+    """追加后条目 >20 触发二级合并；merge 看到的是含新条目的全表，结果整表替换。"""
+    old_entries = [
+        {"fact": f"旧事实{i}", "evidence": [f"旧证据{i}"]} for i in range(20)
+    ]
+    merged_entries = tuple(
+        {"fact": f"合并事实{i}", "evidence": [f"旧证据{i}"]} for i in range(8)
+    )
+    summarizer = QueueSummarizer(
+        [({"fact": "新事实", "evidence": ["压缩原文1"]},)],
+        merge_results=[merged_entries],
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    state = await graph.ainvoke(
+        _compaction_invoke(conversation_summary=old_entries),
+        config=config(),
+        durability="sync",
+    )
+
+    assert len(summarizer.merge_calls) == 1
+    assert len(summarizer.merge_calls[0]) == 21
+    assert summarizer.merge_calls[0][-1] == {
+        "fact": "新事实",
+        "evidence": ["压缩原文1"],
+    }
+    assert state["conversation_summary"] == list(merged_entries)
+    assert state["pending_compaction"] == []
+    assert state["compaction_failures"] == 0
+    assert state["new_compaction_request"] is False
+
+
+async def test_merge_failure_keeps_unmerged_summary_without_counting_failure(
+    tmp_path, execution_agent, caplog
+):
+    """二级合并失败不算批次失败：保留未合并的 21 条，pending 仍清空、计数仍归零。"""
+    old_entries = [
+        {"fact": f"旧事实{i}", "evidence": [f"旧证据{i}"]} for i in range(20)
+    ]
+    summarizer = QueueSummarizer(
+        [({"fact": "新事实", "evidence": ["压缩原文1"]},)],
+        merge_results=[RuntimeError("合并后端不可用")],
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    with caplog.at_level(logging.WARNING, logger=CONFIRM_LOGGER):
+        state = await graph.ainvoke(
+            _compaction_invoke(conversation_summary=old_entries),
+            config=config(),
+            durability="sync",
+        )
+
+    assert len(state["conversation_summary"]) == 21
+    assert state["conversation_summary"][-1] == {
+        "fact": "新事实",
+        "evidence": ["压缩原文1"],
+    }
+    assert state["pending_compaction"] == []
+    assert state["compaction_failures"] == 0
+    assert state["new_compaction_request"] is False
+
+
+async def test_compact_without_summarizer_raises(tmp_path, execution_agent):
+    """没注入 summarizer 却触发 compaction 是配置错误：直接抛，不静默吞。"""
+    graph = build_graph(
+        FakeMainAgent(),
+        execution_agent,
+        JsonMemoryRepository(tmp_path / "memory"),
+        checkpointer=InMemorySaver(),
+    )
+
+    with pytest.raises(RuntimeError):
+        await graph.ainvoke(
+            _compaction_invoke(), config=config(), durability="sync"
+        )

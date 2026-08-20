@@ -4,13 +4,17 @@ LangGraph 在这里是控制平面，不是主 Agent：它只负责累积跨消�
 确认、路由和调用两个明确边界的 Agent。MainAgent 负责面向用户的语义与长期
 记忆候选；ExecutionAgent 只执行已经确认的文档任务契约。
 
-    collect -> main_agent --+-- reply ---------------------------> END
+    collect -+-- compact ------------------------------------------> END
+             +-- main_agent -+-- reply -----------------------------> END
                              +-- ask_confirm -+-- prepare -> execute -> END
                                               +-- cancel_task ---------> END
                                               +-- collect --------...
                                               +-- judge_confirm -+-- prepare -> ...
                                                                  +-- cancel_task -> END
                                                                  +-- collect ----...
+
+``compact`` 是投递之后由触发方单独发起的后台回合（``new_compaction_request``
+旗标），把被挤出窗口的历史压成带逐字 evidence 的摘要条目，没有用户输出。
 
 确认回复分四层判定：零歧义白名单直接执行、整句放弃直接收尾、否定词硬否决直接
 重新理解，剩下的灰区才进 ``judge_confirm`` 调主 Agent。模型调用只在节点里，
@@ -69,6 +73,7 @@ from walkie_dokie.main_agent.memory import (
     render_memory_notice,
     render_memory_snapshot,
 )
+from walkie_dokie.main_agent.summarizer import Summarizer, validate_entries
 from walkie_dokie.orchestrator.state import SessionState
 from walkie_dokie.turn_log import TurnRecord, log_turn
 from walkie_dokie.workspace import WORKSPACES_ROOT, create_workspace_dir
@@ -85,6 +90,17 @@ _EXECUTION_STARTED_MARKER = "execution-started.json"
 # 而用户已经表达了“别做了”，再多调一次模型只会增加延迟和跑偏的机会。
 _CANCEL_REPLY = "好的，这个任务不做了。有需要随时再发我。"
 _JUDGE_TIMEOUT_SECONDS = 30
+# 攒够多少条被挤出的消息才压一次（≈3 轮对话）。触发方在图外读 pending_compaction
+# 做判断，所以这个常量是公开的。
+COMPACTION_BATCH_SIZE = 6
+# 摘要条目超过这条线就在同一节点内做二级合并，目标压回 _SUMMARY_MERGE_TARGET；
+# 合并后仍超线不递归，留待下次触发。
+_SUMMARY_MERGE_THRESHOLD = 20
+_SUMMARY_MERGE_TARGET = 10
+# 同一批 pending 连续失败到这个次数就丢弃该批：这些内容在压缩上线前本来就被
+# 硬截断静默丢掉，丢批不劣于现状，但无限重试会一直烧调用。
+_MAX_COMPACTION_FAILURES = 3
+_COMPACT_TIMEOUT_SECONDS = 120
 
 _CONFIRM_RE = re.compile(
     # 收紧版白名单：只收零歧义确认词，语气词（嗯/好/行/可以/对/ok）一律进灰区
@@ -345,6 +361,10 @@ async def _collect(state: SessionState) -> dict:
 
 
 async def _has_instruction(state: SessionState) -> str:
+    # 压缩旗标优先于 pending_instruction：压缩 invoke 是投递之后的后台回合，不带
+    # 新用户输入，绝不能顺带把残留指令再送一次主 Agent。
+    if state.get("new_compaction_request"):
+        return "compact"
     return "main_agent" if state.get("pending_instruction") else END
 
 
@@ -545,6 +565,7 @@ def build_graph(
     execution_agent: ExecutionAgent,
     memory_repository: MemoryRepository,
     checkpointer=None,
+    summarizer: Summarizer | None = None,
 ) -> CompiledStateGraph:
     async def _main_agent(state: SessionState) -> dict:
         platform = state["platform"]
@@ -667,6 +688,108 @@ def build_graph(
             int((time.monotonic() - started) * 1000),
         )
         return {"confirmation_verdict": verdict_dict}
+
+    async def _compact(state: SessionState) -> dict:
+        """把攒够的一批被挤出消息压成带逐字 evidence 的摘要条目。
+
+        这是投递之后的后台回合，没有用户输出：失败只影响记忆沉淀，绝不能把已经
+        发出去的回复变成一次报错。压缩后端是外部 API（真正的系统边界），所以这里
+        有重试语义——同一批连续失败 ``_MAX_COMPACTION_FAILURES`` 次才丢弃。
+        """
+
+        if summarizer is None:
+            # 路由已经把回合送到这里却没有后端，是装配错误，不是运行期状况：
+            # 吞掉只会让压缩永远静默不工作。
+            raise RuntimeError("compact 节点被触发，但 build_graph 没有注入 summarizer")
+
+        trace_id = state.get("trace_id")
+        pending = list(state.get("pending_compaction") or [])
+        summary = list(state.get("conversation_summary") or [])
+        failures = state.get("compaction_failures") or 0
+        started = time.monotonic()
+        # 一级校验的源文本就是本批消息原文：模型只许从这里逐字摘。
+        source_texts = tuple(str(message.get("content", "")) for message in pending)
+
+        try:
+            async with asyncio.timeout(_COMPACT_TIMEOUT_SECONDS):
+                candidates = await summarizer.summarize(tuple(pending))
+            accepted, rejected = validate_entries(candidates, source_texts=source_texts)
+            if not accepted:
+                # 整批被拒和后端报错同一性质：这批消息这次没压出任何可信内容。
+                raise RuntimeError(f"本批候选全部未通过校验：{list(rejected)!r}")
+        except Exception:
+            failures += 1
+            logger.warning(
+                "历史压缩失败 trace_id=%s batch=%d failures=%d",
+                trace_id,
+                len(pending),
+                failures,
+                exc_info=True,
+            )
+            if failures >= _MAX_COMPACTION_FAILURES:
+                logger.warning(
+                    "历史压缩连续失败 %d 次，丢弃本批 %d 条消息 trace_id=%s",
+                    failures,
+                    len(pending),
+                    trace_id,
+                )
+                return {
+                    "pending_compaction": [],
+                    "compaction_failures": 0,
+                    "new_compaction_request": False,
+                }
+            return {
+                "compaction_failures": failures,
+                "new_compaction_request": False,
+            }
+
+        summary.extend(accepted)
+        merged = False
+        if len(summary) > _SUMMARY_MERGE_THRESHOLD:
+            # 二级只许合并与精简：evidence 必须还是旧条目 evidence 里的逐字片段，
+            # 合并这一步不得引入任何新证据。
+            merge_sources = tuple(
+                item for entry in summary for item in entry["evidence"]
+            )
+            try:
+                async with asyncio.timeout(_COMPACT_TIMEOUT_SECONDS):
+                    merge_candidates = await summarizer.merge(tuple(summary))
+                merged_entries, merge_rejected = validate_entries(
+                    merge_candidates,
+                    source_texts=merge_sources,
+                    max_entries=_SUMMARY_MERGE_TARGET,
+                )
+                if not merged_entries:
+                    raise RuntimeError(f"合并结果全部未通过校验：{list(merge_rejected)!r}")
+                summary = list(merged_entries)
+                merged = True
+            except Exception:
+                # 合并失败没有任何数据丢失，未合并的摘要本身完全可用；不计入批次
+                # 失败计数，下次再超阈值时自然重试。
+                logger.warning(
+                    "摘要二级合并失败，保留未合并摘要 trace_id=%s entries=%d",
+                    trace_id,
+                    len(summary),
+                    exc_info=True,
+                )
+
+        logger.info(
+            "历史压缩完成 trace_id=%s batch=%d accepted=%d rejected=%d "
+            "merged=%s entries=%d elapsed_ms=%d",
+            trace_id,
+            len(pending),
+            len(accepted),
+            len(rejected),
+            merged,
+            len(summary),
+            int((time.monotonic() - started) * 1000),
+        )
+        return {
+            "conversation_summary": summary,
+            "pending_compaction": [],
+            "compaction_failures": 0,
+            "new_compaction_request": False,
+        }
 
     def _apply_confirmed_memory(state: SessionState) -> list[dict]:
         return memory_repository.apply(
@@ -923,10 +1046,13 @@ def build_graph(
     graph.add_node("discard_memory_reply", _discard_memory_reply)
     graph.add_node("prepare_execution", _prepare_execution)
     graph.add_node("execute", _execute)
+    graph.add_node("compact", _compact)
 
     graph.set_entry_point("collect")
     graph.add_conditional_edges(
-        "collect", _has_instruction, {"main_agent": "main_agent", END: END}
+        "collect",
+        _has_instruction,
+        {"main_agent": "main_agent", "compact": "compact", END: END},
     )
     graph.add_conditional_edges(
         "main_agent",
@@ -972,5 +1098,6 @@ def build_graph(
     graph.add_edge("save_memory_task", "prepare_execution")
     graph.add_edge("prepare_execution", "execute")
     graph.add_edge("execute", END)
+    graph.add_edge("compact", END)
 
     return graph.compile(checkpointer=checkpointer)
