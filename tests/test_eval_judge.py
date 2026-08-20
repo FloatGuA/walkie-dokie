@@ -3,8 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from walkie_dokie.agents.security import sensitive_environment_overrides
 from walkie_dokie.evals.judge import (
     JudgeVerdict,
+    _judge_options,
     agreement_rate,
     build_judge_prompt,
     judge_replies,
@@ -55,6 +57,19 @@ async def test_judge_without_structured_output_raises():
         await judge_replies("p", query_fn=query_fn)
 
 
+def test_judge_options_are_isolated_like_execution_options():
+    """真实 SDK 路径离线测不到，至少把隔离字段锁住（对齐 claude_agent._execution_options）。"""
+
+    options = _judge_options()
+    assert options.model == "opus"
+    assert options.allowed_tools == []
+    assert options.setting_sources == []
+    assert options.mcp_servers == {}
+    assert options.strict_mcp_config is True
+    assert options.skills == []
+    assert options.env == sensitive_environment_overrides()
+
+
 def test_build_judge_prompt_contains_case_and_transcript():
     prompt = build_judge_prompt("方法咨询", "用户：怎么调行距")
     assert "方法咨询" in prompt
@@ -72,6 +87,9 @@ def test_calibration_verdict_matching():
 def test_load_calibration_and_agreement():
     entries = load_calibration(CALIBRATION)
     assert {e["expected"] for e in entries} == {"good", "bad"}
+    # 每条都要带场景：golden 判分喂「场景 + 转写」，校准喂孤立单句会让分布错配，
+    # 靠上下文才成立的坏话术（如未确认就谎报完成）在 judge 眼里必然是 good。
+    assert all(e["context"].strip() for e in entries)
     verdicts = [
         JudgeVerdict(5, False, "") if e["expected"] == "good" else JudgeVerdict(1, True, "")
         for e in entries
@@ -81,8 +99,22 @@ def test_load_calibration_and_agreement():
 
 def test_load_calibration_rejects_illegal_expected(tmp_path):
     path = tmp_path / "bad.yaml"
-    path.write_text("- id: x\n  reply: hi\n  expected: maybe\n", encoding="utf-8")
+    path.write_text(
+        "- id: x\n  reply: hi\n  context: 用户刚打招呼\n  expected: maybe\n",
+        encoding="utf-8",
+    )
     with pytest.raises(ValueError, match="expected 非法"):
+        load_calibration(path)
+
+
+@pytest.mark.parametrize("missing", ["reply", "context", "expected"])
+def test_load_calibration_requires_all_fields(tmp_path, missing):
+    entry = {"reply": "hi", "context": "用户刚打招呼", "expected": "good"}
+    del entry[missing]
+    lines = "\n".join(f"  {k}: {v}" for k, v in entry.items())
+    path = tmp_path / "bad.yaml"
+    path.write_text(f"- id: x\n{lines}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=missing):
         load_calibration(path)
 
 

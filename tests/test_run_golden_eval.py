@@ -1,9 +1,10 @@
 import json
 import sys
 
-from scripts.run_golden_eval import main, run_suite
+from scripts.run_golden_eval import _run_calibration, main, run_suite
 from walkie_dokie.evals.cases import GoldenCase, Turn, TurnExpect
 from walkie_dokie.evals.driver import CaseResult
+from walkie_dokie.evals.judge import JudgeVerdict
 from walkie_dokie.evals.recording_main_agent import RecordingMainAgent
 from walkie_dokie.main_agent.base import MainAgent
 
@@ -221,6 +222,31 @@ def test_loader_failure_exits_2_and_writes_infra_report(tmp_path, monkeypatch):
     assert payload["status"] == "FAILED_INFRA"
     assert "evals/cases 目录不存在" in payload["error"]
     assert payload["case_results"] == []
+
+
+async def test_calibration_prompt_carries_scene_context(tmp_path, monkeypatch):
+    """校准 prompt 必须带场景，否则靠上下文才成立的坏话术 judge 根本看不出来。"""
+
+    path = tmp_path / "cal.yaml"
+    path.write_text(
+        "- id: cal-bad-2\n"
+        "  reply: 文件已经处理完成。\n"
+        "  context: 用户刚发来文件，还没确认任何任务\n"
+        "  expected: bad\n",
+        encoding="utf-8",
+    )
+    prompts = []
+
+    async def fake_judge_replies(prompt, **kwargs):
+        prompts.append(prompt)
+        return JudgeVerdict(clarity=5, misleading=False, comment="ok")
+
+    monkeypatch.setattr("scripts.run_golden_eval.CALIBRATION_PATH", path)
+    monkeypatch.setattr("scripts.run_golden_eval.judge_replies", fake_judge_replies)
+
+    assert await _run_calibration() == 1  # judge 判 good、期望 bad，一致率 0
+    assert "用户刚发来文件，还没确认任何任务" in prompts[0]
+    assert "助手：文件已经处理完成。" in prompts[0]
 
 
 def test_calibration_failure_exits_2(tmp_path, monkeypatch):

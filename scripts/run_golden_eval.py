@@ -187,8 +187,11 @@ async def _run_calibration() -> int:
     entries = load_calibration(CALIBRATION_PATH)
     verdicts = []
     for entry in entries:
+        # 场景走 case_description 位、话术走 transcript 位，和 golden 判分同一个形状。
         verdicts.append(
-            await judge_replies(build_judge_prompt("话术校准", f"助手：{entry['reply']}"))
+            await judge_replies(
+                build_judge_prompt(entry["context"], f"助手：{entry['reply']}")
+            )
         )
     rate = agreement_rate([e["expected"] for e in entries], verdicts)
     print(f"judge 校准一致率：{rate:.0%}（{len(entries)} 条，建议线 >=90%）")
