@@ -19,6 +19,8 @@ dependencies = [
 # 执行后端二选一或都装；Codex 走 CLI/子进程调用，暂无需专门的 pip 依赖。
 claude = ["claude-agent-sdk"]
 dev = ["pytest", "pytest-asyncio"]
+# 只读本机观测台（src/walkie_dokie/admin）。不装也不影响 bot 本体运行。
+admin = ["fastapi", "uvicorn"]
 
 [build-system]
 requires = ["setuptools>=68"]
