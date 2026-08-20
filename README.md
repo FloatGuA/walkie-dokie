@@ -39,6 +39,8 @@ sudo apt-get install bubblewrap socat
 pip install -e ".[claude]"
 ```
 
+本机管理观测台（可选）：`pip install -e ".[admin]"`（这台机器需加 `--user --break-system-packages`，见 PITFALLS）。
+
 运行测试：
 
 ```bash
@@ -85,6 +87,17 @@ python3 -m scripts.report_costs --days 30 --html var/logs/costs.html  # 单文�
 ```
 
 金额为保守上界估算（官方定价页未确认 `deepseek-chat` 别名映射），对账以 DeepSeek 控制台账单为准。
+
+## Admin 观测台（只读）
+
+本机 web 控制台，收拢四块观测仪器：对话回合流、成本仪表、记忆与对话摘要、eval 报告趋势。只绑 127.0.0.1、无鉴权、纯只读（无任何写端点；注意记忆板块会展示用户档案与逐字 evidence，勿将端口暴露到本机之外）：
+
+```bash
+python3 -m scripts.run_admin --port 8788
+# 浏览器打开 http://127.0.0.1:8788
+```
+
+数据每 10 秒自动刷新。可写配置为二期（连同"改配置强制过 golden 回归"机制一起设计，见 DECISION.md）。
 
 ## 合同智能
 
