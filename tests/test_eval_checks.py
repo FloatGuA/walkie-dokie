@@ -43,6 +43,13 @@ def test_final_memory_and_blacklist():
     assert len(failures) == 3  # must_contain 不满足 + must_not 命中 + 黑名单命中
 
 
+def test_final_blacklist_failure_reports_actual_reply():
+    expect = FinalExpect(reply_must_not_contain=("dev@example.com",))
+    (failure,) = check_final(expect, {}, ("你好", "联系 dev@example.com 问问"))
+    assert "dev@example.com" in failure
+    assert "联系 dev@example.com 问问" in failure
+
+
 def test_memory_must_be_empty():
     expect = FinalExpect(memory_must_be_empty=True)
     assert check_final(expect, {}, ()) == ()

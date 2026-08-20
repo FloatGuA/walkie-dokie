@@ -56,5 +56,5 @@ def check_final(
     joined = "\n".join(all_replies)
     for keyword in expect.reply_must_not_contain:
         if keyword in joined:
-            failures.append(f"final 全案话术含违禁词 {keyword!r}")
+            failures.append(f"final 全案话术含违禁词 {keyword!r}：{joined!r}")
     return tuple(failures)
