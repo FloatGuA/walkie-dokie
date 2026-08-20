@@ -1,5 +1,7 @@
 # Eval Harness (Golden Set 回归) Implementation Plan
 
+> **状态：✅ 已于 2026-08-20 全部执行完毕**（subagent-driven，17+ commits，首跑 20/20 PASSED、judge 校准 100%）。留档备查，不要重复执行。注意：final review fix wave 后部分代码片段（graph_factory 四元组、load_calibration 签名、校准集 context 字段等）与 plan 文本不一致，以代码为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 建一个可反复运行的 golden set 回归 harness：真实 DeepSeek 驱动端到端 graph，确定性断言阻断、Claude Opus judge 只报告，报告存 `var/evals/`。
