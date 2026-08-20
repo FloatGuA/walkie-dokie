@@ -1,5 +1,7 @@
 # Debounce + Graph Concurrency Regression Tests Implementation Plan
 
+> **状态：✅ 已于 2026-08-20 全部执行完毕**（commits `cf5b981`、`a758e28`、`94378b0`，`pytest` 142 passed）。留档备查，不要重复执行。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prove, with real `asyncio.gather`-driven concurrency (not sequential simulation), that `UserLocks` actually serializes graph access across the two call sites that use it (`scripts/run_mvp.py`'s `handle_event` and `dispatch_fresh`) — closing the gap flagged in `docs/agent-system-self-check.md`'s debounce row: "现有 7 个测试没覆盖并发场景."
