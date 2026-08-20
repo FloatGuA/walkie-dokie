@@ -476,6 +476,9 @@ async def test_leaked_internal_setup_in_finalize_is_replaced_before_delivery(
     assert any(
         "内部设定" in line for line in confirm_log_lines(caplog, logging.WARNING)
     )
+    # 钉住现状：话术被替换但产物照常投递（文件是合法执行产出，替换的只是话术）。
+    # 若未来改成连 artifacts 一起吞，这条断言会红，逼出显式决策。
+    assert state["result"]["artifacts"]
 
 
 async def test_normal_finalize_message_is_delivered_untouched(tmp_path):
@@ -1473,6 +1476,8 @@ def test_internal_leak_markers_are_redacted(text):
         "我这次没能理解你的请求，请稍后再发一次。",
         "已经处理完成，文件「结果.docx」已生成。",
         "I understand your intention, let me help with the document.",
+        # json object 是清单里误伤面相对最大的 marker：技术问答反例点名锁定
+        "JSON 是一种文件格式，您平时用 Word 不需要关心它。",
     ],
 )
 def test_normal_replies_are_never_redacted(text):
