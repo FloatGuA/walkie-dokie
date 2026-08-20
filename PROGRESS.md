@@ -1,6 +1,6 @@
 # walkie-dokie — Progress
 
-更新时间：2026-08-18（Asia/Shanghai）
+更新时间：2026-08-20（Asia/Shanghai）
 
 ## 合同智能已拆分
 
@@ -43,6 +43,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - `.docx/.xlsx` 在执行前后经过确定性 OOXML 校验；宏、嵌入对象、外部关系、危险字段/公式、异常 ZIP 会被拒绝。graph 会再次验证执行报告和产物，不信任 backend 自报路径。
 - 当前全量离线测试为 129 passed（2026-08-15 `contract_intelligence` 拆分到独立仓库后，只统计 walkie-dokie 自身套件；拆分前含合同智能共 161 passed）。新增测试涵盖多文件执行会话工作的五个关键场景：防抖窗口内多文件累积、文件名碰撞去重、部分文件校验失败排除、全部文件校验失败拒绝、多产物执行报告与交付。
 - 防抖窗口内的多文件处理缺口已解决：debounce 此前实现中 `_files` 为单槽 dict，同一窗口内连发多个文件会静默覆盖丢失（见 DECISION.md "orchestrator 加回一道确认环节"条目的 2026-08-17 实现状态注记）；多文件执行会话完整设计（DECISION.md 2026-08-18）已定稿并全量实现，`pending_files` 改为队列结构、`ExecutionReport.artifacts` 支持多输出、文件名碰撞通过 `display_filename` 去重、部分校验失败排除而非整批拒绝，对应测试已全量覆盖。
+- 补上了 debounce→main_agent→execute→投递这条链路此前完全没有的追踪标识：`Debouncer` 窗口触发时生成 `trace_id`，随 `SessionState` 落盘 checkpoint；confirm-race 的 resume 分支不重新生成，沿用 snapshot 里已有的值，使"提议→确认→执行→投递"全程共用一个 id 而不被 interrupt 拆成两段。顺带把 `run_mvp.py` 里一直硬编码 `run_id=None` 的 conversation TurnRecord 换成了真实 trace_id。有意不与 `execution_id`（`workspace.py` 生成、绑定 started-marker 幂等逻辑的那个）合并，两者现在并存。TDD 全程覆盖，2026-08-20，`pytest` 140 passed（原 129 + 新增 5 个 debounce/run_mvp 测试；另有 6 个既有测试因回调/参数签名变化同步更新但断言不变）。
 
 ## 尚未验证
 
@@ -90,6 +91,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 2. 增加持久 inbox/outbox：`InboundEvent.event_id` 去重；文件与文字分别记录 delivery ack/retry。现在图成功后平台发送失败会丢结果，文件成功而文字失败会半投递。
 3. 将 execution idempotency 扩展到 backend 边界。started marker 会在结果未知时拒绝自动重跑，但无法判断 coding agent 是否已经完成，只能转人工恢复；这仍不是 exactly-once。
 4. 公开给开发者本人以外的人之前，将当前订阅登录改为合规服务鉴权，并把已启用的进程级 OS sandbox 再放进专用服务账号 + container/cgroup，补齐 CPU、内存、进程数和磁盘配额。
+5. `orchestrator/debounce.py` 补并发场景测试：现有 7 个测试都是正常路径，上一轮 confirm-race 静默丢文件的 critical bug 就是从这里漏出来的，说明测试盲区不止一处。做完 trace_id（上条）之后紧接着做，方便复查时能看清完整链路。详见 `docs/agent-system-self-check.md` 的自查清单。
 
 ### P1：状态和部署边界
 

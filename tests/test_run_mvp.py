@@ -35,6 +35,63 @@ def test_only_real_ask_confirm_interrupt_is_resumable():
     assert _waiting_for_confirmation(memory_waiting) is True
 
 
+async def test_fresh_invoke_carries_caller_trace_id_into_initial_state():
+    class Graph:
+        def __init__(self):
+            self.input = None
+
+        async def aget_state(self, config):
+            return SimpleNamespace(next=(), interrupts=(), values={})
+
+        async def ainvoke(self, value, config, durability=None):
+            self.input = value
+            return {"result": None}
+
+    graph = Graph()
+    _state, effective_trace_id = await _invoke_from_event(
+        graph,
+        config={"configurable": {"thread_id": "test:u1"}},
+        platform_name="test",
+        user_id="u1",
+        text="帮我写份文档",
+        trace_id="new-batch-id",
+    )
+    assert graph.input["trace_id"] == "new-batch-id"
+    assert effective_trace_id == "new-batch-id"
+
+
+async def test_confirm_race_resume_reuses_snapshots_trace_id_not_callers():
+    """回合正在等确认时，一个新 debounce 批次带着自己新生成的 trace_id 赶到——
+    这时候应该沿用原任务在 snapshot 里已经落盘的 trace_id，而不是让新批次的
+    id 覆盖这一整轮任务的追踪标识。"""
+
+    class Graph:
+        def __init__(self):
+            self.input = None
+
+        async def aget_state(self, config):
+            return SimpleNamespace(
+                next=("ask_confirm",),
+                interrupts=(object(),),
+                values={"trace_id": "original-propose-id"},
+            )
+
+        async def ainvoke(self, value, config, durability=None):
+            self.input = value
+            return {"result": None}
+
+    graph = Graph()
+    _state, effective_trace_id = await _invoke_from_event(
+        graph,
+        config={"configurable": {"thread_id": "test:u1"}},
+        platform_name="test",
+        user_id="u1",
+        text="是",
+        trace_id="new-batch-id",
+    )
+    assert effective_trace_id == "original-propose-id"
+
+
 async def test_debounced_dispatch_rechecks_and_resumes_new_interrupt():
     class Graph:
         def __init__(self):
@@ -42,7 +99,9 @@ async def test_debounced_dispatch_rechecks_and_resumes_new_interrupt():
             self.durability = None
 
         async def aget_state(self, config):
-            return SimpleNamespace(next=("ask_confirm",), interrupts=(object(),))
+            return SimpleNamespace(
+                next=("ask_confirm",), interrupts=(object(),), values={"trace_id": "t1"}
+            )
 
         async def ainvoke(self, value, config, durability=None):
             self.input = value
@@ -56,6 +115,7 @@ async def test_debounced_dispatch_rechecks_and_resumes_new_interrupt():
         platform_name="test",
         user_id="u1",
         text="是",
+        trace_id="new-batch-id",
     )
     assert graph.input.resume == {"text": "是", "files": ()}
     assert graph.durability == "sync"
@@ -76,7 +136,9 @@ async def test_debounced_batch_survives_confirm_race_with_multiple_files(
             self.durability = None
 
         async def aget_state(self, config):
-            return SimpleNamespace(next=("ask_confirm",), interrupts=(object(),))
+            return SimpleNamespace(
+                next=("ask_confirm",), interrupts=(object(),), values={"trace_id": "t1"}
+            )
 
         async def ainvoke(self, value, config, durability=None):
             self.input = value
@@ -93,6 +155,7 @@ async def test_debounced_batch_survives_confirm_race_with_multiple_files(
         user_id="u1",
         text="是",
         files=(file_a, file_b),
+        trace_id="new-batch-id",
     )
     assert graph.input.resume["text"] == "是"
     resumed_files = graph.input.resume["files"]
@@ -155,6 +218,7 @@ async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatc
         "你是谁？",
         (),
         UserLocks(),
+        trace_id="t1",
     )
 
     assert len(records) == 1
@@ -162,6 +226,78 @@ async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatc
     assert records[0].input_text == "你是谁？"
     assert records[0].output_text == "我是小帮。"
     assert records[0].success is True
+
+
+async def test_dispatch_fresh_trace_id_is_recorded_as_conversation_run_id(monkeypatch):
+    class Graph:
+        async def aget_state(self, config):
+            return SimpleNamespace(next=(), interrupts=(), values={})
+
+        async def ainvoke(self, value, config, durability=None):
+            return {
+                "result": {
+                    "artifacts": [],
+                    "reply_text": "我是小帮。",
+                    "success": True,
+                }
+            }
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    platform = FakePlatform()
+    await dispatch_fresh(
+        Graph(),
+        platform,
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="batch-42",
+    )
+
+    assert records[0].run_id == "batch-42"
+
+
+async def test_handle_event_confirm_resume_reuses_snapshots_trace_id(monkeypatch):
+    class Graph:
+        async def aget_state(self, config):
+            return SimpleNamespace(
+                next=("ask_confirm",),
+                interrupts=(object(),),
+                values={"trace_id": "original-propose-id"},
+            )
+
+        async def ainvoke(self, value, config, durability=None):
+            return {
+                "result": {
+                    "artifacts": [],
+                    "reply_text": "好的，已经处理。",
+                    "success": True,
+                }
+            }
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    platform = FakePlatform()
+    await handle_event(
+        Graph(),
+        platform,
+        object(),  # debouncer.add is unreachable once resumed_state is set
+        UserLocks(),
+        object(),  # memory_repository is unreachable outside the /long-term-memory branch
+        InboundEvent("test", "u1", "是", None),
+    )
+
+    assert records[0].run_id == "original-propose-id"
 
 
 async def test_long_term_memory_command_bypasses_graph_and_debounce(

@@ -12,7 +12,8 @@ def collected():
 
 
 def _recorder(collected):
-    async def on_ready(platform, user_id, text, files):
+    async def on_ready(platform, user_id, text, files, trace_id):
+        assert trace_id
         collected.append((platform, user_id, text, files))
 
     return on_ready
@@ -74,6 +75,18 @@ async def test_close_cancels_pending_windows(collected):
     await d.close()
     await asyncio.sleep(0)
     assert collected == []
+
+
+async def test_fired_batch_includes_a_nonempty_trace_id():
+    collected = []
+
+    async def on_ready(platform, user_id, text, files, trace_id):
+        collected.append(trace_id)
+
+    d = Debouncer(0.05, on_ready)
+    d.add("test", "u1", "帮我写份文档")
+    await asyncio.sleep(0.15)
+    assert collected and collected[0]
 
 
 async def test_multiple_files_in_same_window_are_accumulated_not_overwritten(collected):

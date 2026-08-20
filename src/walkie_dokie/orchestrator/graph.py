@@ -295,9 +295,10 @@ async def _has_instruction(state: SessionState) -> str:
 
 async def _route_after_decision(state: SessionState) -> str:
     logger.info(
-        "意图分流 platform=%s user_id=%s intent=%s action=%s route=%s",
+        "意图分流 platform=%s user_id=%s trace_id=%s intent=%s action=%s route=%s",
         state["platform"],
         state["user_id"],
+        state.get("trace_id"),
         state["decision"].get("intent"),
         state["decision"]["action"],
         "execution_confirmation"
@@ -607,7 +608,12 @@ def build_graph(
         else:
             # 仅为失败日志提供一个稳定路径；不会调用执行后端。
             workdir = WORKSPACES_ROOT.resolve()
-        logger.info("orchestrator 派发执行 user_id=%s workdir=%s", user_id, workdir)
+        logger.info(
+            "orchestrator 派发执行 user_id=%s trace_id=%s workdir=%s",
+            user_id,
+            state.get("trace_id"),
+            workdir,
+        )
 
         started = time.monotonic()
         error: str | None = None
@@ -657,7 +663,8 @@ def build_graph(
                     for item in report.artifacts
                 ]
                 logger.warning(
-                    "检测到 execution report marker，跳过重复执行 execution_id=%s",
+                    "检测到 execution report marker，跳过重复执行 trace_id=%s execution_id=%s",
+                    state.get("trace_id"),
                     execution.get("execution_id"),
                 )
             try:
@@ -681,7 +688,11 @@ def build_graph(
                 user_message = f"{user_message}\n\n{memory_feedback}"
         except Exception as exc:
             error = str(exc)
-            logger.exception("执行 Agent 处理失败 execution_id=%s", execution.get("execution_id"))
+            logger.exception(
+                "执行 Agent 处理失败 trace_id=%s execution_id=%s",
+                state.get("trace_id"),
+                execution.get("execution_id"),
+            )
             # 不把 failed execute 留在 checkpoint 中等待下一条用户消息重跑。真正的
             # 显式重试以后应由 execution_id/idempotency policy 驱动。
             user_message = "这次文档处理没有完成，请稍后重新发起任务。"

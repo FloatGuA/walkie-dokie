@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -70,6 +71,7 @@ async def _invoke_from_event(
     user_id: str,
     text: str,
     files: tuple[IncomingFile, ...] = (),
+    trace_id: str,
 ):
     """Re-check durable state at dispatch time, then resume or start atomically.
 
@@ -78,40 +80,51 @@ async def _invoke_from_event(
     every file in the batch must still reach the graph via the resume payload's
     plural ``files`` key — dropping any of them here is exactly the silent-loss
     failure class this multi-file design exists to eliminate.
+
+    ``trace_id`` is the id this *new* debounce batch was minted with. On the
+    confirm-race resume path that id is discarded in favour of the trace_id
+    already persisted on the in-flight task's snapshot, so the whole
+    propose->confirm->execute->deliver lifecycle keeps sharing one id instead
+    of the race splitting it into two. Returns ``(state, effective_trace_id)``
+    so the caller logs/turn-records the id that actually applies.
     """
     snapshot = await graph.aget_state(config=config)
     file_references = tuple(
         store_incoming_file(platform_name, user_id, item) for item in files
     )
     if _waiting_for_confirmation(snapshot):
-        return await graph.ainvoke(
+        effective_trace_id = snapshot.values.get("trace_id", trace_id)
+        state = await graph.ainvoke(
             Command(resume={"text": text, "files": file_references}),
             config=config,
             durability="sync",
         )
+        return state, effective_trace_id
     if snapshot.interrupts:
         raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
     if snapshot.next:
         raise RuntimeError(f"会话存在非 interrupt 的未完成任务 next={snapshot.next!r}")
-    return await graph.ainvoke(
+    state = await graph.ainvoke(
         {
             "platform": platform_name,
             "user_id": user_id,
             "new_text": text or None,
             "new_files": file_references,
+            "trace_id": trace_id,
         },
         config=config,
         durability="sync",
     )
+    return state, trace_id
 
 
 async def deliver_graph_output(
-    platform: FeishuAdapter, user_id: str, state: dict
+    platform: FeishuAdapter, user_id: str, state: dict, *, trace_id: str | None = None
 ) -> tuple[str | None, str | None, bool]:
     if "__interrupt__" in state:
         # 给用户的话来自 MainAgent；task contract 只给 ExecutionAgent，不能混用。
         payload = state["__interrupt__"][0].value
-        logger.info("图输出等待用户确认 user_id=%s", user_id)
+        logger.info("图输出等待用户确认 user_id=%s trace_id=%s", user_id, trace_id)
         await platform.send(user_id, OutboundMessage(text=payload["user_message"]))
         return payload["user_message"], None, True
 
@@ -126,13 +139,14 @@ async def deliver_graph_output(
             await platform.send(user_id, OutboundMessage(text=text))
             return text, None, True
         else:
-            logger.info("图输出为空 user_id=%s", user_id)
+            logger.info("图输出为空 user_id=%s trace_id=%s", user_id, trace_id)
         return None, None, True
 
     artifacts = result.get("artifacts") or []
     logger.info(
-        "图输出完成 user_id=%s success=%s artifact_count=%d",
+        "图输出完成 user_id=%s trace_id=%s success=%s artifact_count=%d",
         user_id,
+        trace_id,
         result.get("success"),
         len(artifacts),
     )
@@ -160,6 +174,7 @@ async def _log_conversation_turn(
     *,
     platform_name: str,
     user_id: str,
+    trace_id: str | None,
     input_text: str | None,
     input_filename: str | None,
     output_text: str | None,
@@ -175,7 +190,7 @@ async def _log_conversation_turn(
             TurnRecord(
                 platform=platform_name,
                 user_id=user_id,
-                run_id=None,
+                run_id=trace_id,
                 input_text=input_text,
                 input_filename=input_filename,
                 backend=None,
@@ -199,32 +214,38 @@ async def dispatch_fresh(
     combined_text: str,
     files: tuple[IncomingFile, ...],
     locks: UserLocks,
+    trace_id: str,
 ) -> None:
     session_key = _session_key(platform_name, user_id)
     started = time.monotonic()
     logger.info(
-        "开始处理防抖回合 session=%s text_chars=%d files=%r",
+        "开始处理防抖回合 session=%s trace_id=%s text_chars=%d files=%r",
         session_key,
+        trace_id,
         len(combined_text),
         [item.filename for item in files],
     )
     async with locks.get(session_key):
         fallback_text = "处理失败，稍后再试一下"
         try:
-            state = await _invoke_from_event(
+            state, trace_id = await _invoke_from_event(
                 graph,
                 config={"configurable": {"thread_id": session_key}},
                 platform_name=platform_name,
                 user_id=user_id,
                 text=combined_text,
                 files=files,
+                trace_id=trace_id,
             )
         except Exception as exc:
-            logger.exception("orchestrator 处理失败 user_id=%s", user_id)
+            logger.exception(
+                "orchestrator 处理失败 user_id=%s trace_id=%s", user_id, trace_id
+            )
             await platform.send(user_id, OutboundMessage(text=fallback_text))
             await _log_conversation_turn(
                 platform_name=platform_name,
                 user_id=user_id,
+                trace_id=trace_id,
                 input_text=combined_text or None,
                 input_filename=", ".join(item.filename for item in files) or None,
                 output_text=fallback_text,
@@ -242,19 +263,23 @@ async def dispatch_fresh(
             # MVP 先把同 session 的状态推进与对应网络投递放在同一顺序域；正式版
             # 应改为 durable outbox，而不是长期持锁等待平台网络。
             output_text, output_filename, output_success = await deliver_graph_output(
-                platform, user_id, state
+                platform, user_id, state, trace_id=trace_id
             )
         except Exception as exc:
             delivery_error = str(exc)
             # 文件可能已经成功而文字失败；不能再追加一条“处理失败”制造更多
             # 不确定投递。持久 outbox 实现前只记录并保留 workspace 供人工恢复。
             logger.exception(
-                "投递图输出失败 platform=%s user_id=%s", platform_name, user_id
+                "投递图输出失败 platform=%s user_id=%s trace_id=%s",
+                platform_name,
+                user_id,
+                trace_id,
             )
         finally:
             await _log_conversation_turn(
                 platform_name=platform_name,
                 user_id=user_id,
+                trace_id=trace_id,
                 input_text=combined_text or None,
                 input_filename=", ".join(item.filename for item in files) or None,
                 output_text=output_text,
@@ -264,8 +289,9 @@ async def dispatch_fresh(
                 error=delivery_error,
             )
             logger.info(
-                "防抖回合处理结束 session=%s duration_ms=%d",
+                "防抖回合处理结束 session=%s trace_id=%s duration_ms=%d",
                 session_key,
+                trace_id,
                 int((time.monotonic() - started) * 1000),
             )
 
@@ -299,6 +325,7 @@ async def handle_event(
             await _log_conversation_turn(
                 platform_name=event.platform,
                 user_id=event.user_id,
+                trace_id=uuid.uuid4().hex[:8],
                 input_text=event.text,
                 input_filename=None,
                 output_text=output_text,
@@ -325,7 +352,10 @@ async def handle_event(
             )
             if _waiting_for_confirmation(snapshot):
                 started = time.monotonic()
-                logger.info("恢复确认中的回合 session=%s", session_key)
+                trace_id = snapshot.values.get("trace_id")
+                logger.info(
+                    "恢复确认中的回合 session=%s trace_id=%s", session_key, trace_id
+                )
                 config = {"configurable": {"thread_id": session_key}}
                 file_reference = (
                     store_incoming_file(event.platform, event.user_id, event.file)
@@ -345,15 +375,18 @@ async def handle_event(
                 delivery_error = None
                 try:
                     output_text, output_filename, output_success = await deliver_graph_output(
-                        platform, event.user_id, resumed_state
+                        platform, event.user_id, resumed_state, trace_id=trace_id
                     )
                 except Exception as exc:
                     delivery_error = str(exc)
-                    logger.exception("恢复后投递失败 user_id=%s", event.user_id)
+                    logger.exception(
+                        "恢复后投递失败 user_id=%s trace_id=%s", event.user_id, trace_id
+                    )
                 finally:
                     await _log_conversation_turn(
                         platform_name=event.platform,
                         user_id=event.user_id,
+                        trace_id=trace_id,
                         input_text=event.text,
                         input_filename=event.file.filename if event.file else None,
                         output_text=output_text,
@@ -363,8 +396,9 @@ async def handle_event(
                         error=delivery_error,
                     )
                     logger.info(
-                        "确认回合处理结束 session=%s duration_ms=%d",
+                        "确认回合处理结束 session=%s trace_id=%s duration_ms=%d",
                         session_key,
+                        trace_id,
                         int((time.monotonic() - started) * 1000),
                     )
             elif snapshot.interrupts:
@@ -419,8 +453,8 @@ async def main():
         locks = UserLocks()
         debouncer = Debouncer(
             DEBOUNCE_WINDOW_SECONDS,
-            on_ready=lambda platform_name, user_id, text, files: dispatch_fresh(
-                graph, platform, platform_name, user_id, text, files, locks
+            on_ready=lambda platform_name, user_id, text, files, trace_id: dispatch_fresh(
+                graph, platform, platform_name, user_id, text, files, locks, trace_id
             ),
         )
 

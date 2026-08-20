@@ -11,6 +11,11 @@ class SessionState(TypedDict):
 
     platform: str
     user_id: str
+    # 一整轮任务（防抖批次触发 -> 提议 -> 确认 -> 执行 -> 投递）共用的追踪 id，
+    # 由 Debouncer 在窗口触发时生成；resume 时不重新生成，沿用这里落盘的值，
+    # 使 confirm-race 也不会把同一任务的日志拆成两个 id。不同于 execution_id/
+    # workdir 名字——那个只标识"这一次真正执行"的幂等身份。
+    trace_id: str
     # 输入文件在入图前落盘；这里只保存 plain dict artifact reference，不保存 bytes
     # 或自定义 dataclass，避免 SQLite checkpoint 膨胀和序列化兼容风险。
     pending_files: tuple[dict, ...]

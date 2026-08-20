@@ -12,6 +12,7 @@ scripts/run_mvp.py 里对 snapshot.interrupts 的判断。
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 
 from walkie_dokie.platforms.base import IncomingFile
@@ -23,7 +24,7 @@ class Debouncer:
     def __init__(
         self,
         window_seconds: float,
-        on_ready: Callable[[str, str, str, tuple[IncomingFile, ...]], Awaitable[None]],
+        on_ready: Callable[[str, str, str, tuple[IncomingFile, ...], str], Awaitable[None]],
     ):
         self._window = window_seconds
         self._on_ready = on_ready
@@ -66,13 +67,15 @@ class Debouncer:
         if not messages and not files:
             return
         combined = "\n".join(messages)
+        trace_id = uuid.uuid4().hex[:8]
         logger.info(
-            "防抖窗口到期 user_id=%s，%d 条文字 + %d 个文件合并派发",
+            "防抖窗口到期 user_id=%s trace_id=%s，%d 条文字 + %d 个文件合并派发",
             user_id,
+            trace_id,
             len(messages),
             len(files),
         )
-        await self._on_ready(platform, user_id, combined, files)
+        await self._on_ready(platform, user_id, combined, files, trace_id)
 
     async def close(self) -> None:
         """Cancel pending windows so application shutdown can drain cleanly."""
