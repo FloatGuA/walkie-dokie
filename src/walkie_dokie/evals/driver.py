@@ -6,6 +6,11 @@
 
 driver 不捕获基础设施异常（fixture 缺失、图内部错误等），让它冒泡给入口脚本，
 避免把 harness 故障静默记成样本失败。
+
+已知不覆盖的支线：投递后的 compaction 触发只写在 ``run_mvp`` 的两个调用点
+（``dispatch_fresh`` / ``handle_event``）里，driver 不走那两个函数，因此 eval
+样本永远不会触发压缩回合。压缩行为由 ``tests/test_graph.py`` 和
+``tests/test_run_mvp.py`` 覆盖。
 """
 
 from __future__ import annotations

@@ -543,9 +543,11 @@ class CompactionGraph:
     resume 判定，第二次给投递后的 compaction 判定），并记录每次 ainvoke 的输入
     和 durability。"""
 
-    def __init__(self, snapshots, *, compaction_error=None):
+    def __init__(self, snapshots, *, compaction_error=None, on_compaction=None):
         self._snapshots = list(snapshots)
         self._compaction_error = compaction_error
+        # 压缩回合开始时的回调：给时长类测试一个推进假时钟的挂点。
+        self._on_compaction = on_compaction
         self.state_calls = 0
         self.invocations = []
 
@@ -557,6 +559,8 @@ class CompactionGraph:
     async def ainvoke(self, value, config, durability=None):
         self.invocations.append((value, durability))
         if isinstance(value, dict) and value.get("new_compaction_request"):
+            if self._on_compaction is not None:
+                self._on_compaction()
             if self._compaction_error is not None:
                 raise self._compaction_error
             return {}
@@ -723,6 +727,92 @@ async def test_compaction_invoke_failure_does_not_fail_turn(monkeypatch, caplog)
     assert records[0].success is True
     assert [message.text for _user, message in platform.sent] == ["好的。"]
     assert any(record.exc_info for record in caplog.records)
+
+
+class _FakeClock:
+    """可控假时钟：压缩回合里显式推进，不用 sleep，断言不会因机器快慢而抖。"""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _install_fake_clock(monkeypatch):
+    clock = _FakeClock()
+    # run_mvp 只用 time.monotonic，整体换掉模块引用即可。
+    monkeypatch.setattr(
+        "scripts.run_mvp.time", SimpleNamespace(monotonic=clock.monotonic)
+    )
+    return clock
+
+
+async def test_turn_duration_excludes_compaction_time(monkeypatch):
+    """turn log 的 duration_ms 是用户回合时长（“零感知延迟”的验收指标）：
+    投递之后才发起的后台压缩绝不能计进去。"""
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    clock = _install_fake_clock(monkeypatch)
+    graph = CompactionGraph(
+        [_idle_snapshot(0), _idle_snapshot(6)],
+        on_compaction=lambda: clock.advance(5.0),
+    )
+
+    await dispatch_fresh(
+        graph,
+        FakePlatform(),
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        summarizer=object(),
+    )
+
+    assert _compaction_invocations(graph) != []  # 压缩确实跑了
+    assert clock.now == 5.0  # 且确实吃掉了 5 秒
+    assert records[0].duration_ms == 0
+
+
+async def test_confirm_turn_duration_excludes_compaction_time(monkeypatch):
+    """第二个触发点（确认恢复分支）同样不得把压缩耗时算进本轮时长。"""
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    clock = _install_fake_clock(monkeypatch)
+    waiting = SimpleNamespace(
+        next=("ask_confirm",), interrupts=(object(),), values={"trace_id": "t0"}
+    )
+    graph = CompactionGraph(
+        [waiting, _idle_snapshot(6)], on_compaction=lambda: clock.advance(5.0)
+    )
+
+    await handle_event(
+        graph,
+        FakePlatform(),
+        object(),
+        UserLocks(),
+        object(),
+        InboundEvent("test", "u1", "是", None),
+        summarizer=object(),
+    )
+
+    assert clock.now == 5.0
+    assert records[0].duration_ms == 0
 
 
 async def test_compaction_triggers_after_confirm_resume_delivery(monkeypatch):

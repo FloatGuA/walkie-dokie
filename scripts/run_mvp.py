@@ -280,12 +280,16 @@ async def dispatch_fresh(
         output_filename = None
         output_success = False
         delivery_error = None
+        duration_ms = 0
         try:
             # MVP 先把同 session 的状态推进与对应网络投递放在同一顺序域；正式版
             # 应改为 durable outbox，而不是长期持锁等待平台网络。
             output_text, output_filename, output_success = await deliver_graph_output(
                 platform, user_id, state, trace_id=trace_id
             )
+            # 本轮时长在投递完成的这一刻定格：后面的 compaction 是投递之后的后台
+            # 回合，用户已经收到回复，它的耗时不属于“用户等待”。
+            duration_ms = int((time.monotonic() - started) * 1000)
             try:
                 # 压缩失败不改变本轮业务结果：compact 节点内部已有重试语义，这层
                 # 兜的是 invoke 本身的意外（如 checkpoint IO 错）。
@@ -298,6 +302,7 @@ async def dispatch_fresh(
                 )
         except Exception as exc:
             delivery_error = str(exc)
+            duration_ms = int((time.monotonic() - started) * 1000)
             # 文件可能已经成功而文字失败；不能再追加一条“处理失败”制造更多
             # 不确定投递。持久 outbox 实现前只记录并保留 workspace 供人工恢复。
             logger.exception(
@@ -315,7 +320,7 @@ async def dispatch_fresh(
                 input_filename=", ".join(item.filename for item in files) or None,
                 output_text=output_text,
                 output_filename=output_filename,
-                duration_ms=int((time.monotonic() - started) * 1000),
+                duration_ms=duration_ms,
                 success=output_success and delivery_error is None,
                 error=delivery_error,
             )
@@ -323,7 +328,7 @@ async def dispatch_fresh(
                 "防抖回合处理结束 session=%s trace_id=%s duration_ms=%d",
                 session_key,
                 trace_id,
-                int((time.monotonic() - started) * 1000),
+                duration_ms,
             )
 
 
@@ -405,10 +410,13 @@ async def handle_event(
                 output_filename = None
                 output_success = False
                 delivery_error = None
+                duration_ms = 0
                 try:
                     output_text, output_filename, output_success = await deliver_graph_output(
                         platform, event.user_id, resumed_state, trace_id=trace_id
                     )
+                    # 同 dispatch_fresh：时长在投递完成时定格，不含后台压缩。
+                    duration_ms = int((time.monotonic() - started) * 1000)
                     try:
                         # 同 dispatch_fresh：压缩失败只记录，不改变本轮业务结果。
                         await maybe_run_compaction(graph, config, summarizer)
@@ -418,6 +426,7 @@ async def handle_event(
                         )
                 except Exception as exc:
                     delivery_error = str(exc)
+                    duration_ms = int((time.monotonic() - started) * 1000)
                     logger.exception(
                         "恢复后投递失败 user_id=%s trace_id=%s", event.user_id, trace_id
                     )
@@ -430,7 +439,7 @@ async def handle_event(
                         input_filename=event.file.filename if event.file else None,
                         output_text=output_text,
                         output_filename=output_filename,
-                        duration_ms=int((time.monotonic() - started) * 1000),
+                        duration_ms=duration_ms,
                         success=output_success and delivery_error is None,
                         error=delivery_error,
                     )
@@ -438,7 +447,7 @@ async def handle_event(
                         "确认回合处理结束 session=%s trace_id=%s duration_ms=%d",
                         session_key,
                         trace_id,
-                        int((time.monotonic() - started) * 1000),
+                        duration_ms,
                     )
             elif snapshot.interrupts:
                 raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")

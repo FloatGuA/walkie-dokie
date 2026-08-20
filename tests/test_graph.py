@@ -1407,8 +1407,8 @@ async def test_conversation_summary_facts_reach_main_agent_context(
             "new_text": "在吗",
             "new_file": None,
             "conversation_summary": [
-                {"fact": "fact1", "evidence": "证据1"},
-                {"fact": "fact2", "evidence": "证据2"},
+                {"fact": "fact1", "evidence": ["证据1"]},
+                {"fact": "fact2", "evidence": ["证据2"]},
             ],
         },
         config=config(),

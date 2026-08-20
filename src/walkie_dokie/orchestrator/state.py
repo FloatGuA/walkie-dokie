@@ -42,8 +42,9 @@ class SessionState(TypedDict):
     # 被挤出 recent_messages 窗口的整条消息缓冲，跨回合累积，由 compact 节点消费；
     # 只收整条移出窗口的原文（role/content 不截断），不收窗口内消息的字符截断。
     pending_compaction: list[dict]
-    # 当前这批 pending_compaction 的连续压缩失败次数；压缩成功或放弃该批后归零，
-    # 用来避免同一批消息被无限重试。
+    # pending_compaction 的连续压缩失败次数；压缩成功或放弃后归零，用来避免无限
+    # 重试。注意这不是“同一批消息”的计数：失败时 pending 原样保留，重试之间新挤
+    # 出的消息会继续追加进来，所以后续几次重试面对的批次一次比一次大。
     compaction_failures: int
     # 压缩触发旗标：调用方只发 ``{"new_compaction_request": True}``，compact 节点
     # 消费后置 False。它随 checkpoint 持久（不同于 new_text 那种由 collect 无条件

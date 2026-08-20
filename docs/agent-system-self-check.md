@@ -13,7 +13,7 @@
 | 模块 | 代码位置 | 测试数 | 状态 | 风险/备注 |
 |------|---------|--------|------|-----------|
 | 长期记忆 | `main_agent/memory.py` | 20 | 已实现，白名单字段+evidence 校验+确认落盘 | 相对成熟；真实 DeepSeek 对抗性 eval 仍未跑（见下方 Evaluation harness） |
-| 短期历史 | `orchestrator/state.py` / `graph.py` | 含在 graph 41 个测试里 | 已实现（原文/历史直接带入 prompt） | 未压缩，长对话会持续膨胀 token |
+| 短期历史 | `orchestrator/state.py` / `graph.py` | 含在 graph 41 个测试里 | 已实现（原文/历史直接带入 prompt） | 窗口外历史已由下一行的 compaction 压缩承接；仍在的既有行为是单条超长消息尾部被硬截断 |
 | 记忆压缩（compaction） | `main_agent/summarizer.py` + `orchestrator/graph.py` compact 节点 | 35+ | ✅ 已实现（2026-08-21）：攒批 6 条→haiku 抽取→机械校验→注入 decide，二级合并 >20→≤10，失败重试 3 次丢弃 | 真实标定一次通过（3 事实零编造）；长会话质量分布待 badcase 观察 |
 | 任务分配/控制平面 | `orchestrator/graph.py` | 86 | 已实现，测得最重的模块 | 全项目相对最扎实的部分；2026-08-20 确认判定升级为四层结构（白名单/放弃层/否定否决/模型判灰区+cancel 出口），审计日志全程可归因 |
 | 时间窗口/debounce | `orchestrator/debounce.py` | 9 | 已实现 | 2026-08-20 补了两个用 `asyncio.gather` 真并发验证的回归测试（`handle_event` 双发、`dispatch_fresh` vs `handle_event` 竞态），确认现有 `UserLocks` 确实序列化了这两个场景，无需生产代码改动 |

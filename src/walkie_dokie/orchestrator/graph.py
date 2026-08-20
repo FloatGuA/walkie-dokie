@@ -100,7 +100,10 @@ _SUMMARY_MERGE_TARGET = 10
 # 同一批 pending 连续失败到这个次数就丢弃该批：这些内容在压缩上线前本来就被
 # 硬截断静默丢掉，丢批不劣于现状，但无限重试会一直烧调用。
 _MAX_COMPACTION_FAILURES = 3
-_COMPACT_TIMEOUT_SECONDS = 120
+# 比 judge 的 30s 宽（haiku 要批量抽取一批消息，不是判一句话），但远小于原来的
+# 120s：压缩是后台回合，卡住不影响用户，可同一批最多只重试 3 次——超时定得越长，
+# 一次卡死就吃掉越多重试预算。早失败早重试。
+_COMPACT_TIMEOUT_SECONDS = 60
 
 _CONFIRM_RE = re.compile(
     # 收紧版白名单：只收零歧义确认词，语气词（嗯/好/行/可以/对/ok）一律进灰区
@@ -191,8 +194,10 @@ def _history_and_pending(
     """收束 recent_messages 窗口，并把被挤出的整条消息交给 pending_compaction。
 
     只有整条被移出窗口的消息才算“挤出”——窗口内消息为省 checkpoint 做的字符
-    截断不算，那部分原文仍在 recent_messages 里可见。挤出的消息保留 role/content
-    原样不截断：压缩节点需要完整原文才能抽出可验证的事实。
+    截断不算。注意这不代表被截掉的原文还在：单条超长消息首次进窗口时尾部就被
+    ``[:_MAX_RECENT_MESSAGE_CHARS]`` 永久切掉，压缩也救不回来，属压缩上线前就
+    存在的既有行为。挤出的整条消息则保留 role/content 原样不截断：压缩节点需要
+    完整原文才能抽出可验证的事实。
     """
 
     history = list(state.get("recent_messages") or [])

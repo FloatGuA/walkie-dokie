@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -100,6 +101,41 @@ async def test_merge_sends_entries_payload_and_parses_entries():
     assert "旧事实" in captured["prompt"]
 
 
+SUMMARIZER_LOGGER = "walkie_dokie.main_agent.summarizer"
+
+
+async def test_summarize_logs_token_usage(caplog):
+    """token 用量是压缩这条后台链路唯一的成本可观测点：必须落 INFO 日志。"""
+
+    async def query_fn(*, prompt, options):
+        yield SimpleNamespace(usage={"input_tokens": 1234, "output_tokens": 56})
+        yield SimpleNamespace(
+            structured_output={"entries": []}, is_error=False, subtype="success"
+        )
+
+    with caplog.at_level(logging.INFO, logger=SUMMARIZER_LOGGER):
+        await ClaudeAgentSummarizer().summarize((), query_fn=query_fn)
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert any("mode=summarize" in line and "1234" in line for line in lines)
+
+
+async def test_merge_logs_token_usage_with_merge_mode(caplog):
+    async def query_fn(*, prompt, options):
+        yield SimpleNamespace(
+            structured_output={"entries": []},
+            is_error=False,
+            subtype="success",
+            usage={"input_tokens": 77},
+        )
+
+    with caplog.at_level(logging.INFO, logger=SUMMARIZER_LOGGER):
+        await ClaudeAgentSummarizer().merge((), query_fn=query_fn)
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert any("mode=merge" in line and "77" in line for line in lines)
+
+
 async def test_error_message_raises_runtime_error():
     async def query_fn(*, prompt, options):
         yield SimpleNamespace(structured_output=None, is_error=True, subtype="error_max_turns")
@@ -123,7 +159,7 @@ def test_summarizer_options_are_isolated():
 
     from walkie_dokie.main_agent.summarizer import _summarizer_options
 
-    options = _summarizer_options("sys")
+    options = _summarizer_options("sys", "haiku")
     assert options.model == "haiku"
     assert options.system_prompt == "sys"
     assert options.allowed_tools == []

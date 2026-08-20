@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 
+logger = logging.getLogger(__name__)
 _MAX_FACT_CHARS = 200
 
 _SUMMARIZE_SYSTEM_PROMPT = (
@@ -91,7 +93,7 @@ def validate_entries(
     return tuple(accepted), tuple(rejected)
 
 
-def _summarizer_options(system_prompt: str, model: str = "haiku"):
+def _summarizer_options(system_prompt: str, model: str):
     """Lazy import 真实 SDK 并构造 summarizer 的 options。
 
     隔离字段照搬 ``evals/judge.py`` 的 ``_judge_options``：摘要只读一段历史给结论，
@@ -135,16 +137,29 @@ class ClaudeAgentSummarizer(Summarizer):
         self._model = model
 
     async def summarize(self, messages, *, query_fn=None) -> tuple[dict, ...]:
-        return await self._query(
+        entries, usage = await self._query(
             _SUMMARIZE_SYSTEM_PROMPT, {"messages": list(messages)}, query_fn=query_fn
         )
+        logger.info(
+            "summarizer 调用完成 mode=summarize entries=%d usage=%r",
+            len(entries),
+            usage,
+        )
+        return entries
 
     async def merge(self, entries, *, query_fn=None) -> tuple[dict, ...]:
-        return await self._query(
+        merged, usage = await self._query(
             _MERGE_SYSTEM_PROMPT, {"entries": list(entries)}, query_fn=query_fn
         )
+        logger.info(
+            "summarizer 调用完成 mode=merge entries=%d usage=%r", len(merged), usage
+        )
+        return merged
 
-    async def _query(self, system_prompt: str, payload: dict, *, query_fn) -> tuple[dict, ...]:
+    async def _query(
+        self, system_prompt: str, payload: dict, *, query_fn
+    ) -> tuple[tuple[dict, ...], object | None]:
+        """返回 (entries, usage)。usage 只用于调用方记日志，不进 Summarizer 接口。"""
         if query_fn is None:
             from claude_agent_sdk import query as sdk_query
 
@@ -157,13 +172,19 @@ class ClaudeAgentSummarizer(Summarizer):
         # 不能 isinstance(ResultMessage)（顶层不许 import SDK），用鸭子类型区分
         # 中间消息与最终结果消息。
         structured = None
+        usage = None
         async for message in query_fn(prompt=prompt, options=options):
             if getattr(message, "is_error", False):
                 raise RuntimeError(
                     f"summarizer 调用失败 subtype={getattr(message, 'subtype', None)!r}"
                 )
+            # 同样用鸭子类型：带 usage 的消息才计数，后出现的覆盖先出现的
+            # （SDK 把最终用量放在结果消息上）。
+            message_usage = getattr(message, "usage", None)
+            if message_usage is not None:
+                usage = message_usage
             if getattr(message, "structured_output", None) is not None:
                 structured = message.structured_output
         if structured is None:
             raise RuntimeError("summarizer 没有返回结构化结果")
-        return tuple(structured["entries"])
+        return tuple(structured["entries"]), usage
