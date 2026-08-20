@@ -32,6 +32,7 @@ from walkie_dokie.evals.judge import (
     judge_replies,
     load_calibration,
 )
+from walkie_dokie.evals.recording_main_agent import RecordingMainAgent
 from walkie_dokie.evals.report import build_report, write_report
 from walkie_dokie.logging_config import setup_logging
 
@@ -91,7 +92,7 @@ async def run_suite(
     try:
         # graph/recorder/memory 必须成套构造：recorder 没接进 graph 时 executed 恒 False。
         # 每次运行都是全新 checkpointer + 全新 tmp memory 目录，见 _graph_factory。
-        graph, recorder, memory_repository = graph_factory()
+        graph, recorder, memory_repository, main_agent_recorder = graph_factory()
         for case in cases:
             result = await run_case(
                 case,
@@ -100,8 +101,17 @@ async def run_suite(
                 memory_repository=memory_repository,
                 fixtures_dir=FIXTURES_DIR,
             )
-            result.judge = await judge_fn(result, case)
+            # 先入列再判分：judge 抛异常时，刚跑完的确定性断言结果照样进报告
+            # （CaseResult 可变，append 之后再填 judge 字段）。
             results.append(result)
+            if main_agent_recorder.errors:
+                # graph 把主 Agent 异常降级成了确定性 reply，样本表面正常但语义全假。
+                raise RuntimeError(
+                    f"主 Agent 调用失败 {len(main_agent_recorder.errors)} 次"
+                    f"（graph 已降级成确定性回复，样本结果不可信）："
+                    f"{main_agent_recorder.errors[0]!r}"
+                )
+            result.judge = await judge_fn(result, case)
     except Exception as exc:  # 基础设施异常：fail-fast，保留已完成结果
         report = build_report(
             mode,
@@ -143,13 +153,15 @@ def _graph_factory(real_execution: bool):
         memory_repository = JsonMemoryRepository(
             Path(tempfile.mkdtemp(prefix="eval-memory-"))
         )
+        # 主 Agent 也要包一层：graph 会吞掉它的异常，不记录就看不见 DeepSeek 挂了。
+        main_agent_recorder = RecordingMainAgent(DeepSeekMainAgent())
         graph = build_graph(
-            DeepSeekMainAgent(),
+            main_agent_recorder,
             recorder,
             memory_repository,
             checkpointer=InMemorySaver(),
         )
-        return graph, recorder, memory_repository
+        return graph, recorder, memory_repository, main_agent_recorder
 
     return factory
 
