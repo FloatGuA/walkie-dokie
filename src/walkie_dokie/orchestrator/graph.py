@@ -341,7 +341,7 @@ async def _collect(state: SessionState) -> dict:
     resume_files = (resume_file,) if resume_file is not None else ()
     incoming_files = state.get("new_files") or resume_files
     merged_files = _merge_pending_files(state.get("pending_files") or (), incoming_files)
-    return {
+    update = {
         "pending_instruction": combined,
         "pending_files": merged_files,
         "new_text": None,
@@ -358,6 +358,14 @@ async def _collect(state: SessionState) -> dict:
         # 上一轮灰区判定的结论不得残留到新回合的路由里。
         "confirmation_verdict": None,
     }
+    if new or incoming_files:
+        # 有新用户输入的回合必须清掉可能粘滞的压缩旗标。旗标随 checkpoint 落盘，
+        # 而只有 _compact 正常返回才会清它：compact 抛异常、或压缩 invoke 撞上
+        # ask_confirm 的 interrupt 等待期，都会让旗标一直为 True，此后用户的真实
+        # 消息会被路由劫持进 compact -> END，result 为 None——用户收到一轮空回复。
+        # 压缩 invoke 本身不带新输入，走不到这里，路由优先级不受影响。
+        update["new_compaction_request"] = False
+    return update
 
 
 async def _has_instruction(state: SessionState) -> str:

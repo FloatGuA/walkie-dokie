@@ -1652,3 +1652,57 @@ async def test_compact_without_summarizer_raises(tmp_path, execution_agent):
         await graph.ainvoke(
             _compaction_invoke(), config=config(), durability="sync"
         )
+
+
+async def test_whole_batch_rejected_counts_as_compaction_failure(
+    tmp_path, execution_agent
+):
+    """整批候选被机械校验拒绝 = 本次压缩失败：批次保留重试，不是"成功压出零条"。"""
+    summarizer = QueueSummarizer(
+        [({"fact": "整批唯一候选也是编造的", "evidence": ["原文里没有这句"]},)]
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+    preset_summary = [{"fact": "旧事实", "evidence": ["旧证据"]}]
+
+    state = await graph.ainvoke(
+        _compaction_invoke(conversation_summary=list(preset_summary)),
+        config=config(),
+        durability="sync",
+    )
+
+    assert state["compaction_failures"] == 1
+    assert state["pending_compaction"] == _compaction_messages()
+    assert state["conversation_summary"] == preset_summary
+    assert state["new_compaction_request"] is False
+
+
+async def test_new_user_input_clears_sticky_compaction_flag(tmp_path, execution_agent):
+    """粘滞的压缩旗标不得劫持用户回合：新输入到达时清旗标，正常走主 Agent。
+
+    compact 抛异常或 compaction invoke 撞上 interrupt 等待期时，带旗标的输入已经
+    随 durability=sync 落盘；不清的话用户下一条真实消息会被路由进 compact -> END，
+    result 为 None——用户收到一轮空回复。
+    """
+    # 队列空：万一还是走进了 compact，QueueSummarizer 会 IndexError 而不是静默通过。
+    summarizer = QueueSummarizer([])
+    main_agent = FakeMainAgent([reply_decision("正常回复")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent, summarizer)
+
+    state = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "这是一条真实的用户消息",
+            "new_file": None,
+            "new_compaction_request": True,
+            "pending_compaction": _compaction_messages(),
+        },
+        config=config(),
+    )
+
+    assert len(main_agent.decide_calls) == 1
+    assert state["result"]["reply_text"] == "正常回复"
+    assert state["new_compaction_request"] is False
+    # 压缩没有发生：这一批仍在等下一次真正的 compaction invoke。
+    assert state["pending_compaction"] == _compaction_messages()
+    assert summarizer.summarize_calls == []

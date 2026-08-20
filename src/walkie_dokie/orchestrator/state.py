@@ -45,8 +45,10 @@ class SessionState(TypedDict):
     # 当前这批 pending_compaction 的连续压缩失败次数；压缩成功或放弃该批后归零，
     # 用来避免同一批消息被无限重试。
     compaction_failures: int
-    # 单次 invoke 的压缩触发旗标：调用方只发 ``{"new_compaction_request": True}``，
-    # compact 节点消费后置 False，不跨调用持久化（形状同其他 new_* 字段）。
+    # 压缩触发旗标：调用方只发 ``{"new_compaction_request": True}``，compact 节点
+    # 消费后置 False。它随 checkpoint 持久（不同于 new_text 那种由 collect 无条件
+    # 清空的字段），所以 compact 异常退出时会粘住；collect 在有新用户输入的回合
+    # 一并置 False，避免粘滞旗标把用户的下一条消息劫持进 compact。
     new_compaction_request: bool
     # 已验证的长期对话结论，条目形如 ``{fact, evidence}``；随 checkpoint 持久，
     # 同一 thread 跨天存在，是窗口滚出去之后仍然可用的那部分记忆。
