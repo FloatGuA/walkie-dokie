@@ -6,7 +6,7 @@
     python3 -m scripts.report_costs --html var/logs/costs.html        # 附带单文件 HTML
 
 数据源是 ``var/logs/model_calls.jsonl``（walkie_dokie.model_call_log 写入）。
-金额只是估算：按下面的价目常量乘 token 数算出来的，不是账单。
+金额只是保守上界估算（按高峰无缓存单价），不是账单；对账以控制台为准。
 """
 
 from __future__ import annotations
@@ -35,12 +35,13 @@ PURPOSES = tuple(PURPOSE_COLORS)
 # 日志是历史数据，可能含今天还不存在的 purpose；给它们一个中性灰，不进固定色序。
 _FALLBACK_COLOR = "#8a8880"
 
-# 价目日期 2026-08，变价改这里。单位：人民币元 / 百万 token。
-# 注意：这两个数字来自本次需求给定的现价；作者训练知识里 2025-09 调价后
-# deepseek-chat 的 output 价是 ¥8/百万，跟这里不一致——真要拿这个金额对账，
-# 先去 DeepSeek 定价页核一次。金额只是估算，报表其余部分不依赖它。
-DEEPSEEK_INPUT_CNY_PER_MTOK = 2.0
-DEEPSEEK_OUTPUT_CNY_PER_MTOK = 3.0
+# 价目核实于 2026-08-21（https://api-docs.deepseek.com/quick_start/pricing）：
+# 官方当前只列 deepseek-v4-flash / v4-pro（美元、分峰谷与缓存命中），未确认
+# deepseek-chat 别名映射到哪个。此处按 v4-flash 高峰·无缓存价做**保守上界**估算
+# （input $0.44/M、output $1.32/M）；缓存命中与离峰会显著更便宜，对账一律以
+# 控制台账单为准。变价/确认别名后改这里。单位：美元 / 百万 token。
+DEEPSEEK_INPUT_USD_PER_MTOK = 0.44
+DEEPSEEK_OUTPUT_USD_PER_MTOK = 1.32
 
 # 文本一律用文本色，不用系列色写字（dataviz 规则）。
 _INK = "#1f1f1e"
@@ -57,8 +58,8 @@ def estimate_cost_cny(provider: str, prompt_tokens: int, completion_tokens: int)
     if provider != "deepseek":
         return 0.0
     return (
-        prompt_tokens * DEEPSEEK_INPUT_CNY_PER_MTOK
-        + completion_tokens * DEEPSEEK_OUTPUT_CNY_PER_MTOK
+        prompt_tokens * DEEPSEEK_INPUT_USD_PER_MTOK
+        + completion_tokens * DEEPSEEK_OUTPUT_USD_PER_MTOK
     ) / 1_000_000
 
 
@@ -164,7 +165,7 @@ def _fmt_int(value: int) -> str:
 
 
 def _fmt_cny(value: float) -> str:
-    return f"¥{value:.4f}" if 0 < value < 0.01 else f"¥{value:.2f}"
+    return f"${value:.4f}" if 0 < value < 0.01 else f"${value:.2f}"
 
 
 # ---------------------------------------------------------------- 终端输出
