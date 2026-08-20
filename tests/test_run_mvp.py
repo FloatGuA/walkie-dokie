@@ -364,6 +364,70 @@ async def test_concurrent_handle_event_calls_do_not_interleave_graph_access(
         )
 
 
+async def test_concurrent_dispatch_fresh_and_handle_event_resume_do_not_interleave(
+    monkeypatch,
+):
+    """一次由 debounce 触发的 dispatch_fresh，和一条几乎同时到达、直接命中确认
+    分支的 handle_event，必须被同一把 UserLocks 完全序列化——这是上次真实
+    confirm-race bug（commit 1201650）的场景，但这次用 asyncio.gather 真并发
+    压出来，而不是手工摆好 resume payload 形状去验证结果。"""
+
+    order = []
+
+    class Graph:
+        async def aget_state(self, config):
+            order.append("aget_state-start")
+            await asyncio.sleep(0.02)
+            order.append("aget_state-end")
+            return SimpleNamespace(
+                next=("ask_confirm",), interrupts=(object(),), values={"trace_id": "t0"}
+            )
+
+        async def ainvoke(self, value, config, durability=None):
+            order.append("ainvoke-start")
+            await asyncio.sleep(0.02)
+            order.append("ainvoke-end")
+            return {
+                "result": {"artifacts": [], "reply_text": "ok", "success": True}
+            }
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    graph = Graph()
+    platform = FakePlatform()
+    locks = UserLocks()
+
+    await asyncio.gather(
+        dispatch_fresh(
+            graph,
+            platform,
+            "test",
+            "u1",
+            "新一批消息",
+            (),
+            locks,
+            trace_id="new-batch",
+        ),
+        handle_event(
+            graph,
+            platform,
+            object(),
+            locks,
+            object(),
+            InboundEvent("test", "u1", "是", None),
+        ),
+    )
+
+    for i in range(0, len(order), 2):
+        assert order[i].endswith("-start")
+        assert order[i + 1].endswith("-end")
+        assert order[i].split("-")[0] == order[i + 1].split("-")[0], (
+            f"interleaved graph access detected: {order}"
+        )
+
+
 async def test_long_term_memory_command_bypasses_graph_and_debounce(
     monkeypatch, tmp_path
 ):
