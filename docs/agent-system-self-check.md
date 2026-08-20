@@ -26,7 +26,7 @@
 | 幂等与失败语义 | started marker 已挡住部分场景，未区分可重试 vs 永久失败，无 backoff/熔断 | 高（已在 PROGRESS.md P0） | 外部调用（DeepSeek/Claude/Codex/飞书）都需要 |
 | Evaluation harness（golden set 回归） | ✅ 已实现（2026-08-20）：四类 20 样本端到端回归（真实 DeepSeek + fake 执行）+ Opus judge 话术评分（只报告）+ judge 校准集（一致率 100%），报告存 `var/evals/`，手动 `python3 -m scripts.run_golden_eval` | 已闭环（样本随 badcase 增长） | 22 样本；`--real-execution` 冒烟 2026-08-21 完成（真实 Claude 执行 2 样本 PASSED；DeepSeek 瞬时超时触发 FAILED_INFRA 属防线正常工作） |
 | Guardrails | ✅ 泄漏防护三层已实现（2026-08-21）：prompt 不复述条款 + 出口确定性 guard（零触发安全网）+ eval 双样本盯防；验收 23/23，inject-002 clarity 1→4。**刻意不建输入检测器**（DECISION.md 2026-08-21：出口拦截是完备闭环，输入检测成本每消息级收益被攻击时级） | 输出侧闭环；输入观测层（只打标不阻断）为对外开放前置项 | 攻击尝试目前不可观测，对外开放时补 |
-| 成本与延迟预算 | 无 token 用量/单用户成本埋点 | 中（开放前必须） | 按量计费 API，异常重试或超长文件可能打飞成本 |
+| 成本与延迟预算 | ✅ 记账已实现（2026-08-21）：model_calls.jsonl 全模型调用结构化记账（含用户归属）+ report_costs.py 汇总/HTML 报表；金额按官方价保守上界估算 | 记账闭环；enforcement（限流/配额/告警）挂对外开放前置项 | deepseek-chat 别名映射未获官方确认；summarizer is_error 分支不记账 |
 | 人工兜底路径 | 有 ask_confirm 交互，但无"多次失败后转人工/明确说不会"的出口 | 中 | PROGRESS.md P2 已提到中老年用户体验，这是其中一角 |
 
 ---
@@ -38,6 +38,7 @@
 - 2026-08-20：debounce+graph 并发场景补了两个真并发回归测试（Task 1/2），确认现有锁机制已正确工作，无需修复。
 - 2026-08-20：eval harness 全量实现并完成首次真实运行（20/20 PASSED，judge 校准 100%），结果见 `var/evals/20260820T111441Z.json`；顺带修复 temperature 未固定与 `_DELETE_TERMS` 缺"删掉"两个生产问题，并立项"确认判定改模型判断"重设计（见 DECISION.md）。
 - 2026-08-20：确认判定四层结构落地并验收（golden 21/21，`var/evals/20260820T150924Z.json`）；final review 发现并经用户拍板修复 cancel 出口错位（补确定性放弃词层）。
+- 2026-08-21：成本埋点与报表上线（记账不限流，用户拍板三维度：按用户归属/不 enforcement/脚本+HTML 报表）。
 - 2026-08-21：Guardrails 泄漏防护三层上线并验收（23/23，prompt 加固单独生效、出口 guard 零触发待命）；拍板不建输入检测器，输入观测层挂为对外开放前置项。
 - 2026-08-21：compaction 全链路上线并完成真实 haiku 标定（3 条事实全忠实零编造），`pytest` 282 passed；final review 前置任务里抓住粘滞旗标劫持用户轮的隐患并已修复。
 - 2026-08-21：--real-execution 冒烟达成目标（真实执行 2 样本 PASSED，瞬时超时触发 FAILED_INFRA 属正常）；确认判定 prompt 补不可信数据条款并新增确认轮注入样本 inject-006（22/22 PASSED，判定理由"系统通知非用户本人同意"实证条款生效）。
