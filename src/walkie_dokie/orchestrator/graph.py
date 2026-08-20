@@ -163,6 +163,31 @@ def _is_cancellation(reply: str) -> bool:
     return bool(_CANCEL_RE.fullmatch(reply.strip()))
 
 
+_INTERNAL_LEAK_MARKERS = (
+    # 只收“正常面向中老年用户的中文话术绝不可能出现”的强特异性串——
+    # 误报会把正常回复整条吞掉，方向与确认判定相反：宁窄勿宽。
+    "系统提示词",
+    "system prompt",
+    "memory_operations",
+    "propose_task",
+    "TaskContract",
+    "task contract",
+    "DialogueContext",
+    "user_message",
+    "json object",
+)
+_LEAK_REDACTION_REPLY = "这些是我内部的工作设置，不方便展示。您需要处理 Word 或 Excel 文档，随时告诉我。"
+
+
+def _redact_internal_leak(text: str) -> tuple[str, bool]:
+    """出口防线：话术含内部设定特征串时整条替换为确定性话术。返回 (话术, 是否命中)。"""
+    lowered = text.lower()
+    for marker in _INTERNAL_LEAK_MARKERS:
+        if marker.lower() in lowered:
+            return _LEAK_REDACTION_REPLY, True
+    return text, False
+
+
 def _remove_unverified_memory_claim(
     decision, *, had_memory_candidates: bool
 ):
@@ -642,6 +667,18 @@ def build_graph(
         decision = _remove_unverified_memory_claim(
             decision, had_memory_candidates=had_memory_candidates
         )
+        # 泄漏 guard 必须排在记忆话术改写之后：改写会把模型生成的
+        # task.instruction 拼进 user_message，先过 guard 就会漏掉这条重新引入的
+        # 路径。反过来不会互相干扰——_LEAK_REDACTION_REPLY 里没有记忆成功声明。
+        # 也排在 memory_notice 追加之前：那条通知是控制平面的确定性话术，
+        # 记忆确实落盘了就该让用户看到，不该被整条替换掉。
+        redacted, leaked = _redact_internal_leak(decision.user_message)
+        if leaked:
+            logger.warning(
+                "主 Agent 回复命中内部设定特征串，已整条替换 trace_id=%s",
+                state.get("trace_id"),
+            )
+            decision = replace(decision, user_message=redacted)
         changes: list[dict] = []
         if validated_operations:
             try:
@@ -998,6 +1035,15 @@ def build_graph(
                     user_message = "已经处理完成。"
                 if report.warnings:
                     user_message += "\n\n注意：" + "；".join(report.warnings)
+            # 第二个出口：finalize 的措辞同样是模型产物。放在 memory_feedback
+            # 追加之前，理由同 _main_agent 处——确定性通知不该被整条替换。
+            redacted, leaked = _redact_internal_leak(user_message)
+            if leaked:
+                logger.warning(
+                    "finalize 回复命中内部设定特征串，已整条替换 trace_id=%s",
+                    state.get("trace_id"),
+                )
+                user_message = redacted
             memory_feedback = state.get("memory_feedback")
             if memory_feedback:
                 user_message = f"{user_message}\n\n{memory_feedback}"
