@@ -44,6 +44,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 当前全量离线测试为 129 passed（2026-08-15 `contract_intelligence` 拆分到独立仓库后，只统计 walkie-dokie 自身套件；拆分前含合同智能共 161 passed）。新增测试涵盖多文件执行会话工作的五个关键场景：防抖窗口内多文件累积、文件名碰撞去重、部分文件校验失败排除、全部文件校验失败拒绝、多产物执行报告与交付。
 - 防抖窗口内的多文件处理缺口已解决：debounce 此前实现中 `_files` 为单槽 dict，同一窗口内连发多个文件会静默覆盖丢失（见 DECISION.md "orchestrator 加回一道确认环节"条目的 2026-08-17 实现状态注记）；多文件执行会话完整设计（DECISION.md 2026-08-18）已定稿并全量实现，`pending_files` 改为队列结构、`ExecutionReport.artifacts` 支持多输出、文件名碰撞通过 `display_filename` 去重、部分校验失败排除而非整批拒绝，对应测试已全量覆盖。
 - 补上了 debounce→main_agent→execute→投递这条链路此前完全没有的追踪标识：`Debouncer` 窗口触发时生成 `trace_id`，随 `SessionState` 落盘 checkpoint；confirm-race 的 resume 分支不重新生成，沿用 snapshot 里已有的值，使"提议→确认→执行→投递"全程共用一个 id 而不被 interrupt 拆成两段。顺带把 `run_mvp.py` 里一直硬编码 `run_id=None` 的 conversation TurnRecord 换成了真实 trace_id。有意不与 `execution_id`（`workspace.py` 生成、绑定 started-marker 幂等逻辑的那个）合并，两者现在并存。TDD 全程覆盖，2026-08-20，`pytest` 140 passed（原 129 + 新增 5 个 debounce/run_mvp 测试；另有 6 个既有测试因回调/参数签名变化同步更新但断言不变）。
+- debounce+graph 并发场景补了两个 `asyncio.gather` 真并发回归测试（此前 7 个 debounce 测试全是顺序模拟）：同一 session 两条 `handle_event` 同时到达、以及 `dispatch_fresh` 与 `handle_event` confirm-resume 竞态（即 commit `1201650` 修过的那类 bug 的场景），均确认共享 `UserLocks` 实例下 `graph.aget_state`/`ainvoke` 严格序列化不交错；每个测试都先用"两把独立锁"版本验证过自身能检测到交错（RED）再切回生产接线（GREEN）。无生产代码改动。2026-08-20，`pytest` 142 passed。
 
 ## 尚未验证
 
