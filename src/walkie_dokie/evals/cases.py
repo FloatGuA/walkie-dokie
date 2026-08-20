@@ -58,6 +58,8 @@ class GoldenCase:
 
 
 def _parse_expect(raw: dict, case_id: str) -> TurnExpect:
+    if not isinstance(raw, dict):
+        raise ValueError(f"样本 {case_id} 的 expect 必须是映射（写空值等于没断言）：{raw!r}")
     known = {"action", "intent", "executed", "reply_contains", "reply_must_not_contain"}
     unknown = set(raw) - known
     if unknown:
@@ -71,6 +73,10 @@ def _parse_expect(raw: dict, case_id: str) -> TurnExpect:
     )
     if expect.action is not None and expect.action not in ("reply", "propose_task"):
         raise ValueError(f"样本 {case_id} 的 action 非法：{expect.action!r}")
+    if expect.intent is not None and expect.intent not in ("chat", "document_task"):
+        raise ValueError(f"样本 {case_id} 的 intent 非法：{expect.intent!r}")
+    if expect.executed is not None and not isinstance(expect.executed, bool):
+        raise ValueError(f"样本 {case_id} 的 executed 必须是布尔值：{expect.executed!r}")
     if expect.intent is not None and expect.action != "propose_task":
         raise ValueError(
             f"样本 {case_id}：intent 只在 interrupt 状态可观测，"
@@ -85,18 +91,23 @@ def _parse_case(raw: dict, category: str, fixtures_dir: Path) -> GoldenCase:
         raise ValueError(f"样本缺少 id/description/turns：{raw!r}")
     turns = []
     for item in raw["turns"]:
+        user = item.get("user")
+        if not isinstance(user, str) or not user:
+            raise ValueError(f"样本 {case_id} 的某轮缺少 user（或 user 不是非空字符串）：{item!r}")
         files = tuple(item.get("files", ()))
         for name in files:
             if not (fixtures_dir / name).is_file():
                 raise ValueError(f"样本 {case_id} 引用的 fixture 不存在：{name}")
         turns.append(
             Turn(
-                user=item["user"],
+                user=user,
                 files=files,
                 expect=_parse_expect(item.get("expect", {}), case_id),
             )
         )
     raw_final = raw.get("final", {})
+    if not isinstance(raw_final, dict):
+        raise ValueError(f"样本 {case_id} 的 final 必须是映射（写空值等于没断言）：{raw_final!r}")
     known = {
         "memory_must_contain",
         "memory_must_not_contain",

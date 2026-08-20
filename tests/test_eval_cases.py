@@ -131,3 +131,113 @@ def test_missing_fixture_and_duplicate_id_are_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="重复"):
         load_cases(tmp_path / "cases", tmp_path / "fixtures")
+
+
+def test_null_expect_is_rejected_with_case_id(tmp_path):
+    cases_dir = _write(
+        tmp_path,
+        "intent_routing.yaml",
+        """
+- id: intent-001
+  description: expect 键写了但值为空
+  turns:
+    - user: "hi"
+      expect:
+""",
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_cases(cases_dir, tmp_path / "fixtures")
+    assert "intent-001" in str(excinfo.value)
+    assert "expect" in str(excinfo.value)
+
+
+def test_null_final_is_rejected_with_case_id(tmp_path):
+    cases_dir = _write(
+        tmp_path,
+        "intent_routing.yaml",
+        """
+- id: intent-001
+  description: final 键写了但值为空
+  turns:
+    - user: "hi"
+      expect: {action: reply}
+  final:
+""",
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_cases(cases_dir, tmp_path / "fixtures")
+    assert "intent-001" in str(excinfo.value)
+    assert "final" in str(excinfo.value)
+
+
+def test_turn_without_user_is_rejected_with_case_id(tmp_path):
+    cases_dir = _write(
+        tmp_path,
+        "intent_routing.yaml",
+        """
+- id: intent-001
+  description: 某轮漏了 user
+  turns:
+    - expect: {action: reply}
+""",
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_cases(cases_dir, tmp_path / "fixtures")
+    assert "intent-001" in str(excinfo.value)
+    assert "user" in str(excinfo.value)
+
+
+def test_invalid_intent_value_is_rejected(tmp_path):
+    cases_dir = _write(
+        tmp_path,
+        "intent_routing.yaml",
+        """
+- id: intent-001
+  description: intent 拼错
+  turns:
+    - user: "转成表格"
+      files: [simple.docx]
+      expect: {action: propose_task, intent: chatt}
+""",
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_cases(cases_dir, tmp_path / "fixtures")
+    assert "intent-001" in str(excinfo.value)
+    assert "chatt" in str(excinfo.value)
+
+
+def test_non_bool_executed_is_rejected(tmp_path):
+    cases_dir = _write(
+        tmp_path,
+        "intent_routing.yaml",
+        """
+- id: intent-001
+  description: executed 写成字符串
+  turns:
+    - user: "是"
+      expect: {executed: "true"}
+""",
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_cases(cases_dir, tmp_path / "fixtures")
+    assert "intent-001" in str(excinfo.value)
+    assert "executed" in str(excinfo.value)
+
+
+def test_bool_executed_is_accepted(tmp_path):
+    cases_dir = _write(
+        tmp_path,
+        "intent_routing.yaml",
+        """
+- id: intent-001
+  description: executed 正常布尔值
+  turns:
+    - user: "是"
+      expect: {executed: true}
+    - user: "不用了"
+      expect: {executed: false}
+""",
+    )
+    cases = load_cases(cases_dir, tmp_path / "fixtures")
+    assert cases[0].turns[0].expect.executed is True
+    assert cases[0].turns[1].expect.executed is False
