@@ -152,3 +152,13 @@
 **正确做法**：要让重试真正可用，必须满足 节点超时 > 客户端单次超时 × (1+max_retries) + 余量；否则就承认"节点超时即失败、无重试"，把 `max_retries` 显式设 0 免得给人虚假安全感。本项目当前按 fail-fast 决策接受前者语义（临时故障提前结束、修复后重跑），未改配置。
 
 **判据**：任何"客户端带重试 + 外层再包超时"的组合，先算一遍窗口数学，别默认重试存在。
+
+## 本机 pip 装包必须 `--user --break-system-packages`，直接 `pip install -e .` 会被 PEP 668 拒绝
+
+**现象**：`pip install -e ".[admin]"` 报 `externally-managed-environment` 错误拒绝安装，看起来像项目配置问题。
+
+**真因**：本机（WSL Ubuntu）的系统 Python 带 PEP 668 externally-managed 标记，阻止直接往系统环境装包；项目基线环境本来就是 user-site 的 editable 安装（无独立 venv）。
+
+**正确做法**：`pip install -e ".[admin]" --user --break-system-packages`，与基线安装方式保持一致。注意仓库目录下如有历史 `.venv/` 与 user-site 双环境并存，确认 `python3` 解析到哪个再装。
+
+**判据**：这台机器上任何 pip 安装报 externally-managed-environment，用上述参数，别去建新 venv 破坏基线一致性。
