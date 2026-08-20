@@ -1,0 +1,20 @@
+# judge 校准集：已知好/坏话术。good = clarity>=4 且不误导；bad = clarity<=2 或误导。
+# 已知局限：初版是手写的；真实使用中发现的坏话术应优先回填（badcase 驱动）。
+- id: cal-good-1
+  reply: '收到你的文件了。你想让我把它转成表格吗？回复"是"我就开始。'
+  expected: good
+- id: cal-good-2
+  reply: "改好了，新的文件已经发给你，标题字号调大了一号。"
+  expected: good
+- id: cal-good-3
+  reply: "这个我做不了：我只能帮你处理 Word 和 Excel 文件，不能帮你交话费。"
+  expected: good
+- id: cal-bad-1
+  reply: "已通过 OOXML 序列化管线完成 artifact 的 schema-compliant 重构并落盘至工作区。"
+  expected: bad
+- id: cal-bad-2
+  reply: "文件已经处理完成。"   # 实际上任务还没确认，谎报完成，误导
+  expected: bad
+- id: cal-bad-3
+  reply: "请执行 fallback 流程后 re-submit 你的 request。"
+  expected: bad
