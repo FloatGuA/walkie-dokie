@@ -185,6 +185,39 @@ async def _run_calibration() -> int:
     return 0 if rate >= 0.9 else 1
 
 
+def _run_regression(real_execution: bool, report_dir: Path):
+    """常规分支：样本加载失败与 run_case/judge 失败同属基础设施异常。
+
+    loader 抛异常时如果让它冒泡，用户拿到的是裸 traceback 和 Python 默认退出码 1
+    ——和「样本断言失败」撞码，且一份报告都不写。这里把它收敛成和 ``run_suite``
+    内部一致的处理：FAILED_INFRA 报告 + 退出码 2。
+    """
+    mode = "real-execution" if real_execution else "regression"
+    try:
+        cases = load_cases(CASES_DIR, FIXTURES_DIR, _blacklist())
+    except Exception as exc:
+        report = build_report(
+            mode,
+            "FAILED_INFRA",
+            [],
+            deepseek_model=DEEPSEEK_MODEL,
+            judge_model=JUDGE_MODEL,
+            error=str(exc),
+        )
+        path = write_report(report, out_dir=report_dir)
+        logger.exception("样本加载失败，一个样本都没跑，报告写入 %s", path)
+        return report
+    return asyncio.run(
+        run_suite(
+            cases,
+            graph_factory=_graph_factory(real_execution),
+            judge_fn=_judge_case,
+            report_dir=report_dir,
+            mode=mode,
+        )
+    )
+
+
 def main() -> int:
     setup_logging()
     parser = argparse.ArgumentParser()
@@ -193,18 +226,17 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.calibrate:
-        return asyncio.run(_run_calibration())
+        try:
+            return asyncio.run(_run_calibration())
+        except Exception as exc:
+            # 校准集读不出来 / judge 调不通同样是基础设施异常，退出码同为 2。
+            # 这一支不写 RunReport：RunReport 的字段（case_results、summary、
+            # deepseek_model）全是 golden 运行的语义，塞一份空壳只会污染报告目录。
+            logger.exception("judge 校准失败")
+            print(f"judge 校准失败：{exc}")
+            return 2
 
-    cases = load_cases(CASES_DIR, FIXTURES_DIR, _blacklist())
-    report = asyncio.run(
-        run_suite(
-            cases,
-            graph_factory=_graph_factory(args.real_execution),
-            judge_fn=_judge_case,
-            report_dir=REPORT_DIR,
-            mode="real-execution" if args.real_execution else "regression",
-        )
-    )
+    report = _run_regression(args.real_execution, REPORT_DIR)
     _print_summary(report)
     if report.status == "FAILED_INFRA":
         return 2

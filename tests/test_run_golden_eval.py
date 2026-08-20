@@ -1,4 +1,7 @@
-from scripts.run_golden_eval import run_suite
+import json
+import sys
+
+from scripts.run_golden_eval import main, run_suite
 from walkie_dokie.evals.cases import GoldenCase, Turn, TurnExpect
 from walkie_dokie.evals.driver import CaseResult
 
@@ -115,3 +118,41 @@ async def test_mode_is_recorded_in_report(tmp_path, monkeypatch):
         mode="real-execution",
     )
     assert real_report.mode == "real-execution"
+
+
+def _silence_logging(monkeypatch):
+    # setup_logging 每次调用都往 root 挂新 handler，测试里调真身会污染整个 session。
+    monkeypatch.setattr("scripts.run_golden_eval.setup_logging", lambda: None)
+
+
+def test_loader_failure_exits_2_and_writes_infra_report(tmp_path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise FileNotFoundError("evals/cases 目录不存在")
+
+    _silence_logging(monkeypatch)
+    monkeypatch.setattr("scripts.run_golden_eval.load_cases", boom)
+    monkeypatch.setattr("scripts.run_golden_eval.REPORT_DIR", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["run_golden_eval"])
+
+    assert main() == 2
+
+    reports = list(tmp_path.glob("*.json"))
+    assert len(reports) == 1
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "FAILED_INFRA"
+    assert "evals/cases 目录不存在" in payload["error"]
+    assert payload["case_results"] == []
+
+
+def test_calibration_failure_exits_2(tmp_path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise ValueError("校准样本 cal-bad-1 的 expected 非法")
+
+    _silence_logging(monkeypatch)
+    monkeypatch.setattr("scripts.run_golden_eval.load_calibration", boom)
+    monkeypatch.setattr("scripts.run_golden_eval.REPORT_DIR", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["run_golden_eval", "--calibrate"])
+
+    assert main() == 2
+    # 校准不是 golden 运行，不产出 RunReport。
+    assert list(tmp_path.glob("*.json")) == []
