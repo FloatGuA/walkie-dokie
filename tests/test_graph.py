@@ -81,6 +81,9 @@ class FakeMainAgent(MainAgent):
             raise self.finalize_error
         return self.final_message
 
+    async def judge_confirmation(self, context):
+        raise AssertionError("本测试不应触发确认判定")
+
 
 class FakeExecutionAgent(ExecutionAgent):
     def __init__(

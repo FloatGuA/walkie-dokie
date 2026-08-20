@@ -4,7 +4,13 @@ from types import SimpleNamespace
 import pytest
 
 from walkie_dokie.agents.base import ExecutionArtifact, ExecutionReport
-from walkie_dokie.main_agent.base import DialogueContext, FinalizeContext, TaskContract
+from walkie_dokie.main_agent.base import (
+    ConfirmationContext,
+    ConfirmationVerdict,
+    DialogueContext,
+    FinalizeContext,
+    TaskContract,
+)
 from walkie_dokie.main_agent.deepseek import DeepSeekMainAgent
 
 
@@ -295,3 +301,36 @@ async def test_deepseek_calls_use_temperature_zero():
         )
     )
     assert completions.calls[0]["temperature"] == 0
+
+
+async def test_judge_confirmation_parses_three_way_verdict():
+    client, completions = fake_client(
+        [{"decision": "cancel", "reason": "用户明确说不做了"}]
+    )
+    agent = DeepSeekMainAgent(client=client)
+    verdict = await agent.judge_confirmation(
+        ConfirmationContext(
+            task_instruction="把文档转成表格",
+            proposal_message="要把文档转成表格吗？",
+            user_reply="算了，不做了",
+        )
+    )
+    assert verdict == ConfirmationVerdict(decision="cancel", reason="用户明确说不做了")
+    payload = json.loads(completions.calls[0]["messages"][1]["content"])
+    assert payload == {
+        "task_instruction": "把文档转成表格",
+        "proposal_message": "要把文档转成表格吗？",
+        "user_reply": "算了，不做了",
+    }
+    assert completions.calls[0]["temperature"] == 0
+
+
+async def test_judge_confirmation_rejects_unknown_decision():
+    client, _ = fake_client([{"decision": "maybe", "reason": "x"}])
+    agent = DeepSeekMainAgent(client=client)
+    with pytest.raises(RuntimeError, match="maybe"):
+        await agent.judge_confirmation(
+            ConfirmationContext(
+                task_instruction="t", proposal_message="p", user_reply="嗯"
+            )
+        )

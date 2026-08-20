@@ -23,6 +23,9 @@ class _SilentMainAgent(MainAgent):
     async def finalize(self, context):
         raise AssertionError("测试不该真的调主 Agent")
 
+    async def judge_confirmation(self, context):
+        raise AssertionError("本测试不应触发确认判定")
+
 
 class _BoomMainAgent(MainAgent):
     async def decide(self, context):
@@ -30,6 +33,9 @@ class _BoomMainAgent(MainAgent):
 
     async def finalize(self, context):
         raise RuntimeError("DeepSeek API 报错")
+
+    async def judge_confirmation(self, context):
+        raise AssertionError("本测试不应触发确认判定")
 
 
 def _case(case_id):

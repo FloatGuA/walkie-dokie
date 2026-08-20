@@ -65,6 +65,25 @@ class FinalizeContext:
     report: ExecutionReport
 
 
+@dataclass(frozen=True)
+class ConfirmationContext:
+    """判定用户对已提案任务的回复属于哪一类所需的全部上下文。"""
+
+    task_instruction: str
+    proposal_message: str
+    user_reply: str
+
+
+ConfirmationDecision = Literal["confirm", "revise", "cancel"]
+
+
+@dataclass(frozen=True)
+class ConfirmationVerdict:
+    decision: ConfirmationDecision
+    # reason 只进日志，不面向用户，也不参与任何控制流分支。
+    reason: str
+
+
 class MainAgent(ABC):
     """唯一面向用户语义的 Agent。
 
@@ -78,6 +97,11 @@ class MainAgent(ABC):
 
     @abstractmethod
     async def finalize(self, context: FinalizeContext) -> str: ...
+
+    @abstractmethod
+    async def judge_confirmation(
+        self, context: ConfirmationContext
+    ) -> ConfirmationVerdict: ...
 
 
 def decision_to_dict(decision: MainAgentDecision) -> dict:

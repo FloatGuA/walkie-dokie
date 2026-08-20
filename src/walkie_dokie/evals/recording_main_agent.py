@@ -10,6 +10,8 @@ graph 的 ``main_agent`` 节点会捕获 ``decide``/``finalize`` 的任何异常
 from __future__ import annotations
 
 from walkie_dokie.main_agent.base import (
+    ConfirmationContext,
+    ConfirmationVerdict,
     DialogueContext,
     FinalizeContext,
     MainAgent,
@@ -34,6 +36,15 @@ class RecordingMainAgent(MainAgent):
     async def finalize(self, context: FinalizeContext) -> str:
         try:
             return await self._inner.finalize(context)
+        except BaseException as exc:
+            self.errors.append(exc)
+            raise
+
+    async def judge_confirmation(
+        self, context: ConfirmationContext
+    ) -> ConfirmationVerdict:
+        try:
+            return await self._inner.judge_confirmation(context)
         except BaseException as exc:
             self.errors.append(exc)
             raise

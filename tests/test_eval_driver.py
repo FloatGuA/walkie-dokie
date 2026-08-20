@@ -34,6 +34,9 @@ class ScriptedMainAgent(MainAgent):
     async def finalize(self, context: FinalizeContext) -> str:
         return "任务完成，文件已发给你。"
 
+    async def judge_confirmation(self, context):
+        raise AssertionError("本测试不应触发确认判定")
+
 
 def _graph(decisions, tmp_path):
     memory = JsonMemoryRepository(tmp_path / "memory")

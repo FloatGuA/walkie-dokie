@@ -4,6 +4,7 @@ import pytest
 
 from walkie_dokie.evals.recording_main_agent import RecordingMainAgent
 from walkie_dokie.main_agent.base import (
+    ConfirmationContext,
     DialogueContext,
     FinalizeContext,
     MainAgent,
@@ -34,6 +35,9 @@ class _StubMainAgent(MainAgent):
         if self._error is not None:
             raise self._error
         return self._final_text
+
+    async def judge_confirmation(self, context):
+        raise AssertionError("本测试不应触发确认判定")
 
 
 async def test_delegates_and_records_nothing_on_success():
@@ -89,8 +93,30 @@ async def test_cancellation_from_timeout_is_recorded():
         async def finalize(self, context):
             raise AssertionError("不该跑到这里")
 
+        async def judge_confirmation(self, context):
+            raise AssertionError("本测试不应触发确认判定")
+
     recorder = RecordingMainAgent(_HangingMainAgent())
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.01):
             await recorder.decide(_context())
+    assert len(recorder.errors) == 1
+
+
+async def test_judge_confirmation_error_is_recorded_and_reraised():
+    class Boom(MainAgent):
+        async def decide(self, context):  # pragma: no cover - 不触发
+            raise AssertionError
+
+        async def finalize(self, context):  # pragma: no cover - 不触发
+            raise AssertionError
+
+        async def judge_confirmation(self, context):
+            raise RuntimeError("judge 挂了")
+
+    recorder = RecordingMainAgent(Boom())
+    with pytest.raises(RuntimeError, match="judge 挂了"):
+        await recorder.judge_confirmation(
+            ConfirmationContext(task_instruction="t", proposal_message="p", user_reply="嗯")
+        )
     assert len(recorder.errors) == 1
