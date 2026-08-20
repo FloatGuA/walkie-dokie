@@ -162,3 +162,17 @@
 **正确做法**：`pip install -e ".[admin]" --user --break-system-packages`，与基线安装方式保持一致。注意仓库目录下如有历史 `.venv/` 与 user-site 双环境并存，确认 `python3` 解析到哪个再装。
 
 **判据**：这台机器上任何 pip 安装报 externally-managed-environment，用上述参数，别去建新 venv 破坏基线一致性。
+
+## langgraph 的 `SqliteSaver` 会在**读**路径上写库，只读连接必须 `is_setup = True` 绕开
+
+**现象**：用 `sqlite3.connect("file:x.db?mode=ro", uri=True)` 包一个 `SqliteSaver` 去 `get_tuple()` 读 checkpoint，在 `var/checkpoints-v2.db` 上跑得好好的；换成从备份/拷贝出来的同一份数据，立刻抛 `sqlite3.OperationalError: attempt to write a readonly database`。因为"只是读"，第一反应会去怀疑文件权限或 URI 参数写错了。
+
+**真因**：`SqliteSaver.cursor()` 每次都会调 `setup()`，而 `setup()` 执行的是 `PRAGMA journal_mode=WAL;` + `CREATE TABLE IF NOT EXISTS ...`——两句都是写操作。开发机上那份库**恰好已经是 WAL 且表已存在**，两句退化成 no-op 才没炸；SQLite 默认的 delete journal 模式（`sqlite3` 新建的库、以及多数备份/拷贝出来的库）下 `PRAGMA journal_mode=WAL` 是真写，必炸。也就是说这个坑在开发机上**测不出来**，只在换一份数据时才现形。
+
+**正确做法**：只读读 checkpoint 时，构造完 saver 后先 `saver.is_setup = True`（类上有类型标注的正常属性，不是名字改写的私有量），声明"建表已完成"，整个 `setup()` 被跳过。顺带：`checkpoints` 表存不存在要自己先查 `sqlite_master`，别指望 saver 帮你建。
+
+**判据**：任何"用某个 ORM/存储库封装类去只读读别人的库"的场景，先翻它的 lazy-init/setup 路径有没有 DDL 或 PRAGMA——很多库把建表塞在第一次查询里。开发机不炸不等于没问题，用 delete journal 模式的库复现一遍才算验过。
+
+**已由**：`src/walkie_dokie/admin/data.py::_read_checkpoint_users` 守门，并由 `tests/test_admin_data.py::test_read_memory_reads_non_wal_db_without_writing` 钉住（删掉那一行该测试立刻红）。
+
+**关联**：只读连接读 **WAL** 库仍会 map/touch `-shm` 文件（SQLite 强制要求），所以"只读"也需要该目录的写权限；换用户跑观测台时会拿到 `unable to open database file`。`immutable=1` 能彻底免除，但对正在被写的库不安全，没用。
