@@ -18,6 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from dotenv import load_dotenv
 from langgraph.checkpoint.memory import InMemorySaver
 
 from walkie_dokie.evals.cases import load_cases
@@ -234,6 +235,7 @@ def _run_regression(real_execution: bool, report_dir: Path):
 
 
 def main() -> int:
+    load_dotenv()  # 与 run_mvp.py 相同的启动约定：DEEPSEEK_API_KEY 从 .env 读
     setup_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--real-execution", action="store_true")
