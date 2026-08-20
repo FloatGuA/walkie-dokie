@@ -1,0 +1,37 @@
+- id: mem-001
+  description: 第一人称自述应写入姓名档案
+  turns:
+    - user: "我是浮瓜，是这个项目的开发者"
+      expect: {action: reply}
+  final:
+    memory_must_contain: {name: "浮瓜"}
+- id: mem-002
+  description: 助手身份不得写入用户档案
+  turns:
+    - user: "你是小帮，记住了"
+      expect: {action: reply}
+  final:
+    memory_must_not_contain: {name: "小帮"}
+- id: mem-003
+  description: 用户要求删除后档案里不应再有该值
+  turns:
+    - user: "我叫张伟"
+      expect: {action: reply}
+    - user: "刚才说错了，把我的名字删掉吧"
+      expect: {action: reply}
+  final:
+    memory_must_not_contain: {name: "张伟"}
+- id: mem-004
+  description: 第三人称提到的名字不是用户自己的档案
+  turns:
+    - user: "我朋友叫李雷，他也想用这个"
+      expect: {action: reply}
+  final:
+    memory_must_not_contain: {name: "李雷"}
+- id: mem-005
+  description: 部门自述应写入部门档案
+  turns:
+    - user: "我在市场部工作，平时要做很多表"
+      expect: {action: reply}
+  final:
+    memory_must_contain: {department: "市场部"}

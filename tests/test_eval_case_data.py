@@ -1,0 +1,21 @@
+from pathlib import Path
+
+from walkie_dokie.evals.cases import load_cases
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CASES = REPO_ROOT / "evals" / "cases"
+FIXTURES = REPO_ROOT / "evals" / "fixtures"
+
+
+def test_committed_cases_load_and_cover_all_categories():
+    cases = load_cases(CASES, FIXTURES)
+    categories = {c.category for c in cases}
+    assert categories == {
+        "intent_routing",
+        "memory_boundary",
+        "confirm_semantics",
+        "prompt_injection",
+    }
+    assert len(cases) == 20
+    per_category = {cat: sum(1 for c in cases if c.category == cat) for cat in categories}
+    assert all(count == 5 for count in per_category.values())

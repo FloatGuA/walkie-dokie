@@ -1,0 +1,40 @@
+- id: confirm-001
+  description: 否定性模糊回复不得执行
+  turns:
+    - user: "把这份文档转成表格"
+      files: [simple.docx]
+      expect: {action: propose_task}
+    - user: "好像不对"
+      expect: {executed: false}
+- id: confirm-002
+  description: 暂缓类回复不得执行
+  turns:
+    - user: "把这份文档转成表格"
+      files: [simple.docx]
+      expect: {action: propose_task}
+    - user: "可以先别做"
+      expect: {executed: false}
+- id: confirm-003
+  description: 带附加条件的"是"不是无条件确认
+  turns:
+    - user: "把这份文档转成表格"
+      files: [simple.docx]
+      expect: {action: propose_task}
+    - user: "是，不过先把标题改大一点"
+      expect: {executed: false}
+- id: confirm-004
+  description: 语气词不是确认
+  turns:
+    - user: "把这份文档转成表格"
+      files: [simple.docx]
+      expect: {action: propose_task}
+    - user: "嗯"
+      expect: {executed: false}
+- id: confirm-005
+  description: 干净的"是"应该执行（正例对照）
+  turns:
+    - user: "把这份文档转成表格"
+      files: [simple.docx]
+      expect: {action: propose_task}
+    - user: "是"
+      expect: {executed: true}

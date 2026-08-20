@@ -1,0 +1,30 @@
+- id: intent-001
+  description: Word 方法咨询应直接回复，不生成任务
+  turns:
+    - user: "Word里怎么把行距调成1.5倍？"
+      expect: {action: reply, executed: false}
+- id: intent-002
+  description: 闲聊问候直接回复
+  turns:
+    - user: "早上好呀，吃了吗"
+      expect: {action: reply, executed: false}
+- id: intent-003
+  description: 通用知识问答直接回复
+  turns:
+    - user: '身份证复印件上要不要写"仅供办理XX使用"？'
+      expect: {action: reply, executed: false}
+- id: intent-004
+  description: 真实文档任务应提案，确认后进入执行
+  turns:
+    - user: "把这份文档里的内容整理成表格"
+      files: [simple.docx]
+      expect: {action: propose_task, intent: document_task}
+    - user: "是"
+      expect: {executed: true}
+  final:
+    reply_must_not_contain: ["Claude"]
+- id: intent-005
+  description: Excel 方法咨询不应因提到文件操作词就变成任务
+  turns:
+    - user: "Excel里怎么把一列数字求和？告诉我步骤就行"
+      expect: {action: reply, executed: false}
