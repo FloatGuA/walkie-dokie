@@ -323,3 +323,12 @@
   - **同名文件直接丢弃晚到的**：会静默丢失用户真实上传的不同文件（只是碰巧同名），用户选择了新增字段去重而不是丢弃。
 - **代价 / 已知不足**：多文件投递部分失败（runner 发送 N 个文件中途失败）本次不处理，沿用 PROGRESS.md 已排期的持久 outbox/ack 缺口，只是量级从单文件放大到 N 文件；"闲聊/文件处理/重任务"三分 Agent 的架构问题被明确推迟，"重任务"具体含义仍未定义；这条决策截至记录时代码尚未实现，只是 spec 定稿。
 - **什么情况下应该重新考虑**：如果实现后发现"重任务"确实需要跟"文件处理"完全不同的能力边界（比如需要联网检索、多步骤规划），再单独为"闲聊/文件/重任务"三分 Agent 走一轮 brainstorming；如果多文件投递部分失败在真实使用中频繁出现且用户体验受损明显，应提前 PROGRESS.md 里 outbox/ack 任务的优先级，不要继续等它排到。
+
+## trace_id（追踪 id）与 execution_id（执行幂等身份）并存，不合并成一个字段
+
+- **日期**：2026-08-20
+- **背景**：给 debounce→main_agent→execute→投递这条链路补统一追踪 id 时发现，`workspace.py` 早就在 `prepare_execution` 阶段生成一个 `execution_id`（`uuid.uuid4().hex[:8]`，同时是 workdir 目录名），并写进 `TurnRecord.run_id`。两者字符串格式完全一样，看起来像是"重复造轮子"，更自然的做法是把新 trace_id 直接并进 `execution_id`，或者干脆复用同一个字段。
+- **选了什么**：新增独立的 `SessionState.trace_id` 字段，与 `execution["execution_id"]` 并存。`trace_id` 在 debounce 窗口触发时生成，覆盖"提议→确认→执行→投递"整轮任务的生命周期；`execution_id` 只在真正进入 `_prepare_execution` 时生成，仍然只标识"这一次执行尝试"。
+- **否掉了什么，为什么**：合并成一个字段——`execution_id` 目前直接绑定 started/report marker 幂等逻辑（`_execution_was_started`/`_mark_execution_started`/`_load_execution_marker` 都以 workdir 名即 execution_id 为准），且只在 `_prepare_execution` 之后才存在；而 trace_id 需要在此之前（debounce 阶段、甚至提议被拒绝走 `reply → END` 从不进入执行）就已经产生并可用于日志。把两者合一要么把 execution_id 的生成提前到 debounce（会打乱"确认前不能有外部副作用目录"这条既有边界，参见上方"多文件执行会话设计"决策里否掉的"工作区创建提前"选项），要么让 trace_id 退化成只在执行阶段才存在（就失去了覆盖提议/确认阶段的意义）。两者都不划算，不如接受两个字段并存。
+- **代价 / 已知不足**：同一次任务的日志里会同时出现两个格式相同的短 id（trace_id 和 execution_id），初读代码/日志的人容易误以为是同一个东西或多余重复；文档（`orchestrator/state.py` 的字段注释、本条决策）是目前唯一区分两者的地方。
+- **什么情况下应该重新考虑**：如果以后 execution_id 的幂等身份逻辑被重新设计成不再绑定 workdir 目录名（比如换成独立的幂等 key），可以重新评估要不要把 trace_id 并入；如果实测发现两个 id 在日志排查中确实经常被人搞混、造成实际排障成本，应该优先加清晰的日志字段前缀/文档提醒，而不是仓促合并。
