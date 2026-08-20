@@ -1309,3 +1309,79 @@ def test_negation_words_are_hard_vetoed(reply, expected):
 )
 def test_cancellation_is_whole_reply_only(reply, expected):
     assert _is_cancellation(reply) is expected
+
+
+def _preset_history(count):
+    """构造 count 条内容互不相同的历史消息，user/assistant 交替。"""
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"旧消息{i}"}
+        for i in range(count)
+    ]
+
+
+async def test_evicted_history_goes_to_pending_compaction(tmp_path, execution_agent):
+    """被挤出 12 条窗口的整条消息进 pending_compaction，且跨回合累积不清。"""
+    main_agent = FakeMainAgent(
+        [reply_decision("第一轮回复"), reply_decision("第二轮回复")]
+    )
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    first = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "第一轮提问",
+            "new_file": None,
+            "recent_messages": _preset_history(12),
+        },
+        config=config(),
+    )
+
+    assert len(first["recent_messages"]) == 12
+    contents = [message["content"] for message in first["recent_messages"]]
+    assert "旧消息0" not in contents
+    assert "旧消息1" not in contents
+    assert contents[0] == "旧消息2"
+    assert contents[-2:] == ["第一轮提问", "第一轮回复"]
+    assert first["pending_compaction"] == [
+        {"role": "user", "content": "旧消息0"},
+        {"role": "assistant", "content": "旧消息1"},
+    ]
+
+    second = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "第二轮提问",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    assert len(second["recent_messages"]) == 12
+    assert second["pending_compaction"] == [
+        {"role": "user", "content": "旧消息0"},
+        {"role": "assistant", "content": "旧消息1"},
+        {"role": "user", "content": "旧消息2"},
+        {"role": "assistant", "content": "旧消息3"},
+    ]
+
+
+async def test_history_within_window_leaves_pending_empty(tmp_path, execution_agent):
+    """历史没超窗口时没有整条被挤出，pending_compaction 保持空。"""
+    main_agent = FakeMainAgent([reply_decision("窗口内回复")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    state = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "窗口内提问",
+            "new_file": None,
+            "recent_messages": _preset_history(2),
+        },
+        config=config(),
+    )
+
+    assert len(state["recent_messages"]) == 4
+    assert state["pending_compaction"] == []

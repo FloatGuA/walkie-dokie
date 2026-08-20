@@ -169,9 +169,16 @@ def _remove_unverified_memory_claim(
     return decision
 
 
-def _completed_turn_history(
+def _history_and_pending(
     state: SessionState, user_text: str, assistant_text: str
-) -> list[dict[str, str]]:
+) -> dict:
+    """收束 recent_messages 窗口，并把被挤出的整条消息交给 pending_compaction。
+
+    只有整条被移出窗口的消息才算“挤出”——窗口内消息为省 checkpoint 做的字符
+    截断不算，那部分原文仍在 recent_messages 里可见。挤出的消息保留 role/content
+    原样不截断：压缩节点需要完整原文才能抽出可验证的事实。
+    """
+
     history = list(state.get("recent_messages") or [])
     history.extend(
         [
@@ -189,7 +196,12 @@ def _completed_turn_history(
         content = content[:remaining]
         bounded.append({"role": str(message.get("role", "user")), "content": content})
         total += len(content)
-    return list(reversed(bounded))
+    bounded.reverse()
+    evicted = history[: len(history) - len(bounded)]
+    return {
+        "recent_messages": bounded,
+        "pending_compaction": list(state.get("pending_compaction") or []) + evicted,
+    }
 
 
 def _execution_metadata_dir(workdir: Path) -> Path:
@@ -377,7 +389,7 @@ async def _reply(state: SessionState) -> dict:
             "artifacts": [],
             "success": True,
         },
-        "recent_messages": _completed_turn_history(
+        **_history_and_pending(
             state, state["pending_instruction"], decision["user_message"]
         ),
     }
@@ -513,7 +525,7 @@ async def _cancel_task(state: SessionState) -> dict:
         # active_artifacts 故意保留：放弃一次任务不该让“继续改刚才那份文件”
         # 的引用失效。
         "result": {"reply_text": _CANCEL_REPLY, "artifacts": [], "success": True},
-        "recent_messages": _completed_turn_history(state, user_history, _CANCEL_REPLY),
+        **_history_and_pending(state, user_history, _CANCEL_REPLY),
     }
 
 
@@ -692,7 +704,7 @@ def build_graph(
             "memory_changes": changes or None,
             "memory_feedback": reply,
             "result": {"reply_text": reply, "artifacts": [], "success": True},
-            "recent_messages": _completed_turn_history(
+            **_history_and_pending(
                 state, state["pending_instruction"], assistant_history
             ),
         }
@@ -709,7 +721,7 @@ def build_graph(
             "memory_changes": None,
             "memory_feedback": reply,
             "result": {"reply_text": reply, "artifacts": [], "success": True},
-            "recent_messages": _completed_turn_history(
+            **_history_and_pending(
                 state, state["pending_instruction"], assistant_history
             ),
         }
@@ -882,7 +894,7 @@ def build_graph(
                 "artifacts": artifacts,
                 "success": error is None,
             },
-            "recent_messages": _completed_turn_history(
+            **_history_and_pending(
                 state, state["pending_instruction"], user_message
             ),
         }

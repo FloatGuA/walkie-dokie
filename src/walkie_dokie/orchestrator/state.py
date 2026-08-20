@@ -39,6 +39,15 @@ class SessionState(TypedDict):
     # 固定上限避免 checkpoint 无限膨胀。确认中的当前任务由 pending_* 表达，
     # 不提前写入 history，避免补充说明时重复。
     recent_messages: list[dict[str, str]]
+    # 被挤出 recent_messages 窗口的整条消息缓冲，跨回合累积，由 compact 节点消费；
+    # 只收整条移出窗口的原文（role/content 不截断），不收窗口内消息的字符截断。
+    pending_compaction: list[dict]
+    # 当前这批 pending_compaction 的连续压缩失败次数；压缩成功或放弃该批后归零，
+    # 用来避免同一批消息被无限重试。
+    compaction_failures: int
+    # 已验证的长期对话结论，条目形如 ``{fact, evidence}``；随 checkpoint 持久，
+    # 同一 thread 跨天存在，是窗口滚出去之后仍然可用的那部分记忆。
+    conversation_summary: list[dict]
     # 主 Agent 的结构化决策：intent/action/user_message/task/memory_operations。确认通过后
     # 只把 task contract 交给执行 Agent，不把对话历史或整份长期档案倾倒过去。
     decision: dict | None
