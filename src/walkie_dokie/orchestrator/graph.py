@@ -641,6 +641,8 @@ def build_graph(
                             display_name(ref) for ref in active_artifacts
                         ),
                         current_user_text=state.get("current_user_text"),
+                        platform=platform,
+                        user_id=user_id,
                     )
                 )
         except Exception:
@@ -717,6 +719,8 @@ def build_graph(
             task_instruction=(decision.get("task") or {}).get("instruction", ""),
             proposal_message=decision["user_message"],
             user_reply=reply,
+            platform=state["platform"],
+            user_id=state["user_id"],
         )
         started = time.monotonic()
         try:
@@ -753,6 +757,8 @@ def build_graph(
             raise RuntimeError("compact 节点被触发，但 build_graph 没有注入 summarizer")
 
         trace_id = state.get("trace_id")
+        # 压缩是没有用户输出的后台回合，成本记账只能靠这里显式带上归属身份。
+        owner = f'{state["platform"]}:{state["user_id"]}'
         pending = list(state.get("pending_compaction") or [])
         summary = list(state.get("conversation_summary") or [])
         failures = state.get("compaction_failures") or 0
@@ -762,7 +768,7 @@ def build_graph(
 
         try:
             async with asyncio.timeout(_COMPACT_TIMEOUT_SECONDS):
-                candidates = await summarizer.summarize(tuple(pending))
+                candidates = await summarizer.summarize(tuple(pending), owner=owner)
             accepted, rejected = validate_entries(candidates, source_texts=source_texts)
             if not accepted:
                 # 整批被拒和后端报错同一性质：这批消息这次没压出任何可信内容。
@@ -803,7 +809,9 @@ def build_graph(
             )
             try:
                 async with asyncio.timeout(_COMPACT_TIMEOUT_SECONDS):
-                    merge_candidates = await summarizer.merge(tuple(summary))
+                    merge_candidates = await summarizer.merge(
+                        tuple(summary), owner=owner
+                    )
                 merged_entries, merge_rejected = validate_entries(
                     merge_candidates,
                     source_texts=merge_sources,
@@ -1022,7 +1030,12 @@ def build_graph(
             try:
                 async with asyncio.timeout(60):
                     user_message = await main_agent.finalize(
-                        FinalizeContext(task=task, report=report)
+                        FinalizeContext(
+                            task=task,
+                            report=report,
+                            platform=platform,
+                            user_id=user_id,
+                        )
                     )
             except Exception:
                 # 执行已经产生副作用/文件，不能因为最后一次措辞调用失败就让整个

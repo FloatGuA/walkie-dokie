@@ -120,16 +120,19 @@ class QueueSummarizer(Summarizer):
         self._merge_results = list(merge_results)
         self.summarize_calls: list[tuple] = []
         self.merge_calls: list[tuple] = []
+        self.owners: list[str | None] = []
 
-    async def summarize(self, messages):
+    async def summarize(self, messages, *, owner=None):
         self.summarize_calls.append(messages)
+        self.owners.append(owner)
         item = self._summarize_results.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
 
-    async def merge(self, entries):
+    async def merge(self, entries, *, owner=None):
         self.merge_calls.append(entries)
+        self.owners.append(owner)
         item = self._merge_results.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -1973,3 +1976,76 @@ async def test_new_user_input_clears_sticky_compaction_flag(tmp_path, execution_
     # 压缩没有发生：这一批仍在等下一次真正的 compaction invoke。
     assert state["pending_compaction"] == _compaction_messages()
     assert summarizer.summarize_calls == []
+
+
+async def test_dialogue_and_finalize_contexts_carry_identity_for_cost_accounting(
+    tmp_path, execution_agent
+):
+    """成本埋点要能按用户归账：图必须把 platform/user_id 填进两个 Context。"""
+    main_agent = FakeMainAgent()
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写份文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+    await graph.ainvoke(Command(resume="是"), config=config())
+
+    assert main_agent.decide_calls[0].platform == "test"
+    assert main_agent.decide_calls[0].user_id == "u1"
+    assert main_agent.finalize_calls[0].platform == "test"
+    assert main_agent.finalize_calls[0].user_id == "u1"
+
+
+async def test_confirmation_context_carries_identity_for_cost_accounting(
+    tmp_path, execution_agent
+):
+    main_agent = JudgingFakeMainAgent(
+        [ConfirmationVerdict(decision="confirm", reason="明确同意")]
+    )
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写份文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+    await graph.ainvoke(Command(resume="嗯"), config=config())
+
+    assert main_agent.judge_calls[0].platform == "test"
+    assert main_agent.judge_calls[0].user_id == "u1"
+
+
+async def test_compact_passes_owner_to_summarizer_for_cost_accounting(
+    tmp_path, execution_agent
+):
+    """压缩是后台调用，用户看不见；不带 owner 就没人知道这笔 token 该算谁的。"""
+    old_entries = [
+        {"fact": f"旧事实{i}", "evidence": [f"旧证据{i}"]} for i in range(20)
+    ]
+    merged_entries = tuple(
+        {"fact": f"合并事实{i}", "evidence": [f"旧证据{i}"]} for i in range(8)
+    )
+    summarizer = QueueSummarizer(
+        [({"fact": "新事实", "evidence": ["压缩原文1"]},)],
+        merge_results=[merged_entries],
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    await graph.ainvoke(
+        _compaction_invoke(conversation_summary=old_entries),
+        config=config(),
+        durability="sync",
+    )
+
+    # summarize 和 merge 两次调用都要带上同一个 owner。
+    assert summarizer.owners == ["test:u1", "test:u1"]

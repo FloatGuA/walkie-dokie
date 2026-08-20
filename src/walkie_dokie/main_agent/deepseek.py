@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from walkie_dokie.main_agent.base import (
@@ -17,8 +18,11 @@ from walkie_dokie.main_agent.base import (
     MemoryOperation,
     TaskContract,
 )
+from walkie_dokie.model_call_log import ModelCallRecord, log_model_call
 
 logger = logging.getLogger(__name__)
+
+_MODEL = "deepseek-chat"
 
 _DECIDE_SYSTEM_PROMPT = """你是“小帮”的主 Agent，是唯一负责理解用户和组织对话的语义层。
 你没有代码执行工具；真正的 Word/Excel 操作会由独立执行单元完成。
@@ -98,9 +102,18 @@ class DeepSeekMainAgent(MainAgent):
         )
         return self._client
 
-    async def _json_completion(self, system_prompt: str, payload: dict) -> dict:
+    async def _json_completion(
+        self,
+        system_prompt: str,
+        payload: dict,
+        *,
+        purpose: str,
+        platform: str | None,
+        user_id: str | None,
+    ) -> dict:
+        started = time.monotonic()
         response = await self._get_client().chat.completions.create(
-            model="deepseek-chat",
+            model=_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -108,6 +121,23 @@ class DeepSeekMainAgent(MainAgent):
             response_format={"type": "json_object"},
             max_tokens=1200,
             temperature=0,
+        )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        # 埋点必须在解析之前：解析失败的调用一样烧了 token，不记账会让报表偏低。
+        # usage 是 OpenAI SDK 的正式字段，但服务端可能不回（值为 None）——
+        # 那种情况记 None，绝不猜一个数。
+        usage = response.usage
+        await log_model_call(
+            ModelCallRecord(
+                provider="deepseek",
+                model=_MODEL,
+                purpose=purpose,
+                platform=platform,
+                user_id=user_id,
+                prompt_tokens=getattr(usage, "prompt_tokens", None),
+                completion_tokens=getattr(usage, "completion_tokens", None),
+                duration_ms=duration_ms,
+            )
         )
         content = response.choices[0].message.content
         parsed = json.loads(content)
@@ -127,6 +157,9 @@ class DeepSeekMainAgent(MainAgent):
                 "conversation_summary": list(context.conversation_summary),
                 "active_artifact_filenames": list(context.active_artifact_filenames),
             },
+            purpose="decide",
+            platform=context.platform,
+            user_id=context.user_id,
         )
         intent = parsed.get("intent")
         if intent not in {"chat", "document_task"}:
@@ -230,6 +263,9 @@ class DeepSeekMainAgent(MainAgent):
                     "warnings": list(context.report.warnings),
                 },
             },
+            purpose="finalize",
+            platform=context.platform,
+            user_id=context.user_id,
         )
         message = parsed.get("user_message")
         if not isinstance(message, str) or not message.strip():
@@ -246,6 +282,9 @@ class DeepSeekMainAgent(MainAgent):
                 "proposal_message": context.proposal_message,
                 "user_reply": context.user_reply,
             },
+            purpose="judge_confirmation",
+            platform=context.platform,
+            user_id=context.user_id,
         )
         decision = parsed.get("decision")
         if decision not in {"confirm", "revise", "cancel"}:

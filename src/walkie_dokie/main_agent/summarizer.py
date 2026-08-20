@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
+
+from walkie_dokie.model_call_log import ModelCallRecord, log_model_call
 
 logger = logging.getLogger(__name__)
 _MAX_FACT_CHARS = 200
@@ -120,15 +123,31 @@ def _summarizer_options(system_prompt: str, model: str):
     )
 
 
+def _split_owner(owner: str | None) -> tuple[str | None, str | None]:
+    """``"platform:user_id"`` 拆成埋点身份；user_id 本身可能含冒号，只切第一个。"""
+    if not owner:
+        return None, None
+    platform, _, user_id = owner.partition(":")
+    return platform, user_id or None
+
+
 class Summarizer(ABC):
-    """压缩后端接口：一级抽取事实，二级把事实清单合并精简。"""
+    """压缩后端接口：一级抽取事实，二级把事实清单合并精简。
+
+    ``owner`` 形如 ``"platform:user_id"``，纯粹用于成本记账（谁的压缩烧了多少
+    token），不进 prompt、不参与任何判断。默认 None，不关心成本的调用方可以不传。
+    """
 
     @abstractmethod
-    async def summarize(self, messages: tuple[dict, ...]) -> tuple[dict, ...]:
+    async def summarize(
+        self, messages: tuple[dict, ...], *, owner: str | None = None
+    ) -> tuple[dict, ...]:
         ...
 
     @abstractmethod
-    async def merge(self, entries: tuple[dict, ...]) -> tuple[dict, ...]:
+    async def merge(
+        self, entries: tuple[dict, ...], *, owner: str | None = None
+    ) -> tuple[dict, ...]:
         ...
 
 
@@ -136,9 +155,13 @@ class ClaudeAgentSummarizer(Summarizer):
     def __init__(self, model: str = "haiku"):
         self._model = model
 
-    async def summarize(self, messages, *, query_fn=None) -> tuple[dict, ...]:
+    async def summarize(self, messages, *, query_fn=None, owner=None) -> tuple[dict, ...]:
         entries, usage = await self._query(
-            _SUMMARIZE_SYSTEM_PROMPT, {"messages": list(messages)}, query_fn=query_fn
+            _SUMMARIZE_SYSTEM_PROMPT,
+            {"messages": list(messages)},
+            query_fn=query_fn,
+            purpose="summarize",
+            owner=owner,
         )
         logger.info(
             "summarizer 调用完成 mode=summarize entries=%d usage=%r",
@@ -147,9 +170,13 @@ class ClaudeAgentSummarizer(Summarizer):
         )
         return entries
 
-    async def merge(self, entries, *, query_fn=None) -> tuple[dict, ...]:
+    async def merge(self, entries, *, query_fn=None, owner=None) -> tuple[dict, ...]:
         merged, usage = await self._query(
-            _MERGE_SYSTEM_PROMPT, {"entries": list(entries)}, query_fn=query_fn
+            _MERGE_SYSTEM_PROMPT,
+            {"entries": list(entries)},
+            query_fn=query_fn,
+            purpose="merge",
+            owner=owner,
         )
         logger.info(
             "summarizer 调用完成 mode=merge entries=%d usage=%r", len(merged), usage
@@ -157,7 +184,7 @@ class ClaudeAgentSummarizer(Summarizer):
         return merged
 
     async def _query(
-        self, system_prompt: str, payload: dict, *, query_fn
+        self, system_prompt: str, payload: dict, *, query_fn, purpose, owner
     ) -> tuple[tuple[dict, ...], object | None]:
         """返回 (entries, usage)。usage 只用于调用方记日志，不进 Summarizer 接口。"""
         if query_fn is None:
@@ -169,6 +196,7 @@ class ClaudeAgentSummarizer(Summarizer):
             options = None
 
         prompt = json.dumps(payload, ensure_ascii=False)
+        started = time.monotonic()
         # 不能 isinstance(ResultMessage)（顶层不许 import SDK），用鸭子类型区分
         # 中间消息与最终结果消息。
         structured = None
@@ -185,6 +213,22 @@ class ClaudeAgentSummarizer(Summarizer):
                 usage = message_usage
             if getattr(message, "structured_output", None) is not None:
                 structured = message.structured_output
+        # 记账排在结构化结果校验之前：模型没给出可用结果的那次调用一样烧了 token。
+        # usage 的实际形状是 ResultMessage.usage: dict[str, Any] | None（已对照
+        # 已装 claude_agent_sdk 的类型定义），键沿用 Anthropic 的 input/output_tokens。
+        platform, user_id = _split_owner(owner)
+        await log_model_call(
+            ModelCallRecord(
+                provider="claude-cli",
+                model=self._model,
+                purpose=purpose,
+                platform=platform,
+                user_id=user_id,
+                prompt_tokens=(usage or {}).get("input_tokens"),
+                completion_tokens=(usage or {}).get("output_tokens"),
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        )
         if structured is None:
             raise RuntimeError("summarizer 没有返回结构化结果")
         return tuple(structured["entries"]), usage

@@ -170,3 +170,90 @@ def test_summarizer_options_are_isolated():
     assert options.strict_mcp_config is True
     assert options.skills == []
     assert options.env == sensitive_environment_overrides()
+
+
+def _collect_model_calls(monkeypatch):
+    from walkie_dokie.main_agent import summarizer as summarizer_module
+
+    records = []
+
+    async def _collect(record):
+        records.append(record)
+
+    monkeypatch.setattr(summarizer_module, "log_model_call", _collect)
+    return records
+
+
+async def test_summarize_logs_model_call_with_owner_split_into_identity(monkeypatch):
+    records = _collect_model_calls(monkeypatch)
+
+    async def query_fn(*, prompt, options):
+        yield SimpleNamespace(
+            structured_output={"entries": []},
+            is_error=False,
+            subtype="success",
+            usage={"input_tokens": 1234, "output_tokens": 56},
+        )
+
+    await ClaudeAgentSummarizer().summarize((), query_fn=query_fn, owner="feishu:u1")
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.provider == "claude-cli"
+    assert record.model == "haiku"
+    assert record.purpose == "summarize"
+    assert record.platform == "feishu"
+    assert record.user_id == "u1"
+    assert record.prompt_tokens == 1234
+    assert record.completion_tokens == 56
+    assert record.duration_ms >= 0
+
+
+async def test_merge_logs_model_call_with_merge_purpose(monkeypatch):
+    records = _collect_model_calls(monkeypatch)
+
+    async def query_fn(*, prompt, options):
+        yield SimpleNamespace(
+            structured_output={"entries": []},
+            is_error=False,
+            subtype="success",
+            usage={"input_tokens": 77, "output_tokens": 3},
+        )
+
+    await ClaudeAgentSummarizer().merge((), query_fn=query_fn, owner="feishu:u2")
+
+    assert [r.purpose for r in records] == ["merge"]
+    assert records[0].user_id == "u2"
+
+
+async def test_missing_owner_and_usage_are_logged_as_none(monkeypatch):
+    records = _collect_model_calls(monkeypatch)
+
+    async def query_fn(*, prompt, options):
+        yield SimpleNamespace(
+            structured_output={"entries": []}, is_error=False, subtype="success"
+        )
+
+    await ClaudeAgentSummarizer().summarize((), query_fn=query_fn)
+
+    assert records[0].platform is None
+    assert records[0].user_id is None
+    assert records[0].prompt_tokens is None
+    assert records[0].completion_tokens is None
+
+
+async def test_owner_with_colon_inside_user_id_splits_only_once(monkeypatch):
+    """user_id 里带冒号时不能被切碎——platform 只取第一段。"""
+    records = _collect_model_calls(monkeypatch)
+
+    async def query_fn(*, prompt, options):
+        yield SimpleNamespace(
+            structured_output={"entries": []}, is_error=False, subtype="success"
+        )
+
+    await ClaudeAgentSummarizer().summarize(
+        (), query_fn=query_fn, owner="feishu:ou:abc:def"
+    )
+
+    assert records[0].platform == "feishu"
+    assert records[0].user_id == "ou:abc:def"

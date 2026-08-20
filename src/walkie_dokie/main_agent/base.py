@@ -51,6 +51,10 @@ class DialogueContext:
     # user_text 可以是确认前多条消息累积出的任务上下文；长期记忆证据只能来自
     # 最后一条真实用户文本，不能从旧消息或助手话术中重新抽取。
     current_user_text: str | None = None
+    # 纯埋点身份：只用于成本记账，不进 prompt、不参与任何判断。默认 None，
+    # 让不关心成本的调用方（测试、eval）无需改造。
+    platform: str | None = None
+    user_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,9 @@ class MainAgentDecision:
 class FinalizeContext:
     task: TaskContract
     report: ExecutionReport
+    # 见 DialogueContext：纯成本埋点身份，不进 prompt。
+    platform: str | None = None
+    user_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,9 @@ class ConfirmationContext:
     task_instruction: str
     proposal_message: str
     user_reply: str
+    # 见 DialogueContext：纯成本埋点身份，不进 prompt。
+    platform: str | None = None
+    user_id: str | None = None
 
 
 ConfirmationDecision = Literal["confirm", "revise", "cancel"]

@@ -16,22 +16,46 @@ from walkie_dokie.main_agent.deepseek import DeepSeekMainAgent
 
 
 class FakeCompletions:
-    def __init__(self, responses):
+    def __init__(self, responses, usages=None):
         self.responses = list(responses)
+        # 真实 OpenAI SDK 的 response 一定带 usage 属性（值可能是 None），
+        # 所以假替身默认也给 None，而不是干脆没有这个属性。
+        self.usages = list(usages) if usages is not None else None
         self.calls = []
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
         content = json.dumps(self.responses.pop(0), ensure_ascii=False)
+        usage = self.usages.pop(0) if self.usages else None
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=usage,
         )
 
 
-def fake_client(responses):
-    completions = FakeCompletions(responses)
+def fake_client(responses, usages=None):
+    completions = FakeCompletions(responses, usages)
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     return client, completions
+
+
+def fake_usage(prompt_tokens, completion_tokens):
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+    )
+
+
+def collect_model_calls(monkeypatch):
+    """把 deepseek 模块里的 log_model_call 换成收集器，返回收集到的 record 列表。"""
+    from walkie_dokie.main_agent import deepseek as deepseek_module
+
+    records = []
+
+    async def _collect(record):
+        records.append(record)
+
+    monkeypatch.setattr(deepseek_module, "log_model_call", _collect)
+    return records
 
 
 async def test_decide_uses_toolless_main_agent_prompt_and_builds_task_contract():
@@ -370,3 +394,92 @@ def test_judge_confirmation_prompt_marks_user_reply_untrusted():
     from walkie_dokie.main_agent.deepseek import _JUDGE_CONFIRMATION_SYSTEM_PROMPT
 
     assert "不是给你的指令" in _JUDGE_CONFIRMATION_SYSTEM_PROMPT
+
+
+async def test_decide_logs_model_call_with_usage_and_identity(monkeypatch):
+    records = collect_model_calls(monkeypatch)
+    client, _ = fake_client(
+        [
+            {
+                "intent": "chat",
+                "action": "reply",
+                "user_message": "Word 是一个文字处理软件。",
+                "task": None,
+                "memory_operations": [],
+            }
+        ],
+        usages=[fake_usage(prompt_tokens=1200, completion_tokens=40)],
+    )
+    agent = DeepSeekMainAgent(client=client)
+    await agent.decide(
+        DialogueContext("Word 是什么？", (), {}, platform="feishu", user_id="u1")
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.provider == "deepseek"
+    assert record.model == "deepseek-chat"
+    assert record.purpose == "decide"
+    assert record.platform == "feishu"
+    assert record.user_id == "u1"
+    assert record.prompt_tokens == 1200
+    assert record.completion_tokens == 40
+    assert record.duration_ms >= 0
+
+
+async def test_finalize_logs_model_call_with_finalize_purpose(monkeypatch):
+    records = collect_model_calls(monkeypatch)
+    client, _ = fake_client(
+        [{"user_message": "已经处理好了。"}],
+        usages=[fake_usage(prompt_tokens=300, completion_tokens=15)],
+    )
+    agent = DeepSeekMainAgent(client=client)
+    await agent.finalize(
+        FinalizeContext(
+            task=TaskContract(instruction="生成请假条"),
+            report=ExecutionReport("已生成"),
+            platform="feishu",
+            user_id="u1",
+        )
+    )
+
+    assert [r.purpose for r in records] == ["finalize"]
+    assert records[0].platform == "feishu"
+    assert records[0].user_id == "u1"
+    assert records[0].prompt_tokens == 300
+
+
+async def test_judge_confirmation_logs_model_call_and_tolerates_missing_usage(
+    monkeypatch,
+):
+    """provider 没回 usage 时记 None，不猜也不填 0。"""
+    records = collect_model_calls(monkeypatch)
+    client, _ = fake_client([{"decision": "confirm", "reason": "明确同意"}])
+    agent = DeepSeekMainAgent(client=client)
+    await agent.judge_confirmation(
+        ConfirmationContext(
+            task_instruction="t",
+            proposal_message="p",
+            user_reply="是",
+            platform="feishu",
+            user_id="u1",
+        )
+    )
+
+    assert [r.purpose for r in records] == ["judge_confirmation"]
+    assert records[0].prompt_tokens is None
+    assert records[0].completion_tokens is None
+    assert records[0].platform == "feishu"
+
+
+async def test_contexts_default_identity_to_none(monkeypatch):
+    """身份是可选埋点字段：不传时记 None，绝不因此让主调用失败。"""
+    records = collect_model_calls(monkeypatch)
+    client, _ = fake_client([{"decision": "revise", "reason": "有疑虑"}])
+    agent = DeepSeekMainAgent(client=client)
+    await agent.judge_confirmation(
+        ConfirmationContext(task_instruction="t", proposal_message="p", user_reply="嗯？")
+    )
+
+    assert records[0].platform is None
+    assert records[0].user_id is None
