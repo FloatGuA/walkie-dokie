@@ -49,6 +49,11 @@ class SessionState(TypedDict):
     # 本回合实际落盘的 memory set/delete 操作。透明回显已经并进主 Agent 的
     # user_message；保留此字段用于诊断/测试，不跨回合复用。
     memory_changes: list[dict] | None
+    # 灰区确认回复的模型判定结论，plain dict ``{decision, reason}``（不存
+    # ConfirmationVerdict dataclass，理由同 result：checkpointer 序列化未注册的
+    # 自定义类会告警）。只在 ask_confirm -> judge_confirm -> 路由 这一小段生命
+    # 周期内有意义，collect 每轮清空，不跨回合复用。
+    confirmation_verdict: dict | None
     # 仅用于恢复旧版“确认后保存”checkpoint；新回合会隐式保存长期记忆，并把
     # 确定性结果直接追加到 decision.user_message。不跨回合复用。
     memory_feedback: str | None

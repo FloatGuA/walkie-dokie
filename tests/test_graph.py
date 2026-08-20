@@ -10,6 +10,8 @@ import walkie_dokie.artifacts as artifact_store
 import walkie_dokie.orchestrator.graph as graph_module
 from walkie_dokie.agents.base import ExecutionAgent, ExecutionArtifact, ExecutionReport
 from walkie_dokie.main_agent.base import (
+    ConfirmationContext,
+    ConfirmationVerdict,
     DialogueContext,
     FinalizeContext,
     MainAgent,
@@ -19,7 +21,11 @@ from walkie_dokie.main_agent.base import (
 )
 from walkie_dokie.main_agent.memory import JsonMemoryRepository
 from walkie_dokie.orchestrator import build_graph
-from walkie_dokie.orchestrator.graph import _is_confirmation, _is_negation
+from walkie_dokie.orchestrator.graph import (
+    _CANCEL_REPLY,
+    _is_confirmation,
+    _is_negation,
+)
 from walkie_dokie.platforms.base import IncomingFile
 
 
@@ -83,6 +89,22 @@ class FakeMainAgent(MainAgent):
 
     async def judge_confirmation(self, context):
         raise AssertionError("本测试不应触发确认判定")
+
+
+class JudgingFakeMainAgent(FakeMainAgent):
+    """decide 提案一次任务；judge_confirmation 按预置 verdict 队列出牌。"""
+
+    def __init__(self, verdicts, decisions=None, **kwargs):
+        super().__init__(decisions, **kwargs)
+        self._verdicts = list(verdicts)
+        self.judge_calls: list[ConfirmationContext] = []
+
+    async def judge_confirmation(self, context):
+        self.judge_calls.append(context)
+        item = self._verdicts.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 class FakeExecutionAgent(ExecutionAgent):
@@ -587,6 +609,186 @@ async def test_non_confirmation_is_reconsidered_by_main_agent(
     assert main_agent.decide_calls[1].user_text == "帮我写文档\n不对，先不做"
     assert main_agent.decide_calls[1].current_user_text == "不对，先不做"
     assert execution_agent.calls == []
+
+
+async def test_gray_zone_reply_goes_through_model_confirm_executes(
+    tmp_path, execution_agent
+):
+    """语气歧义词不在白名单里，必须交模型判定；判 confirm 才执行。"""
+    main_agent = JudgingFakeMainAgent(
+        [ConfirmationVerdict("confirm", "语气词在这个上下文里就是同意")]
+    )
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    state = await graph.ainvoke(
+        Command(resume={"text": "嗯", "files": ()}), config=config()
+    )
+    assert execution_agent.calls[0]["instruction"] == "写一份测试文档"
+    assert state["result"]["reply_text"] == "文档已经处理好了。"
+    assert state["result"]["success"] is True
+    assert len(main_agent.judge_calls) == 1
+    assert main_agent.judge_calls[0].user_reply == "嗯"
+    assert main_agent.judge_calls[0].task_instruction == "写一份测试文档"
+    assert (
+        main_agent.judge_calls[0].proposal_message
+        == "我理解为写一份测试文档，回复“是”确认。"
+    )
+
+
+async def test_gray_zone_revise_returns_to_main_agent(tmp_path, execution_agent):
+    """判 revise 不执行，回到 collect->main_agent 重新理解（现状路径）。"""
+    main_agent = JudgingFakeMainAgent(
+        [ConfirmationVerdict("revise", "回复带不确定语气，需要再澄清")],
+        decisions=[task_decision(), reply_decision("那我再跟你确认一下细节。")],
+    )
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    state = await graph.ainvoke(
+        Command(resume={"text": "应该可以吧", "files": ()}), config=config()
+    )
+    assert execution_agent.calls == []
+    assert len(main_agent.judge_calls) == 1
+    assert len(main_agent.decide_calls) == 2
+    assert main_agent.decide_calls[1].user_text == "帮我写文档\n应该可以吧"
+    assert main_agent.decide_calls[1].current_user_text == "应该可以吧"
+    assert state["result"]["reply_text"] == "那我再跟你确认一下细节。"
+
+
+async def test_gray_zone_cancel_clears_pending_and_replies_deterministically(
+    tmp_path, execution_agent
+):
+    """cancel 出口：确定性话术、清空待执行任务、但保留 active_artifacts。
+
+    触发词刻意选“撤回这个请求吧”——“算了/不做了”都含否定词表字符，会被硬否决
+    层先拦成 revise，根本到不了模型（见 test_negation_words_are_hard_vetoed）。
+    """
+    assert _is_negation("撤回这个请求吧") is False
+    previous = input_reference("上一份产物.docx", b"old")
+    main_agent = JudgingFakeMainAgent(
+        [ConfirmationVerdict("cancel", "用户明确放弃这次任务")]
+    )
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写文档",
+            "new_file": None,
+            "active_artifacts": (previous,),
+        },
+        config=config(),
+    )
+
+    state = await graph.ainvoke(
+        Command(resume={"text": "撤回这个请求吧", "files": ()}), config=config()
+    )
+    assert state["result"] == {
+        "reply_text": _CANCEL_REPLY,
+        "artifacts": [],
+        "success": True,
+    }
+    assert state["pending_instruction"] is None
+    assert state["pending_files"] == ()
+    assert state["decision"] is None
+    assert state["new_text"] is None
+    assert state["confirmation_verdict"] is None
+    # 放弃一次任务不该让“继续改刚才那份文件”的引用失效
+    # （跨 invoke 从 checkpoint 反序列化回来是 list，这里只关心内容）
+    assert tuple(state["active_artifacts"]) == (previous,)
+    assert state["recent_messages"][-1] == {
+        "role": "assistant",
+        "content": _CANCEL_REPLY,
+    }
+    assert execution_agent.calls == []
+
+
+async def test_judge_failure_degrades_to_revise_not_execute(tmp_path, execution_agent):
+    """判定调用挂掉时只许降级到重新理解，绝不执行，也不把异常抛给调用方。"""
+    main_agent = JudgingFakeMainAgent(
+        [RuntimeError("judge 挂了")],
+        decisions=[task_decision(), reply_decision("我这次没太确定，再说一次好吗？")],
+    )
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    state = await graph.ainvoke(
+        Command(resume={"text": "嗯", "files": ()}), config=config()
+    )
+    assert execution_agent.calls == []
+    assert len(main_agent.decide_calls) == 2
+    assert state["result"]["reply_text"] == "我这次没太确定，再说一次好吗？"
+    assert state["result"]["success"] is True
+
+
+async def test_whitelist_and_negation_never_reach_model(tmp_path, execution_agent):
+    """确定性两层各自短路：白名单直接执行、否定词直接重新理解，都不调模型。"""
+    main_agent = JudgingFakeMainAgent(
+        [],
+        decisions=[
+            task_decision(),
+            task_decision(),
+            reply_decision("好的，那这次先不做。"),
+        ],
+    )
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+    confirmed = await graph.ainvoke(
+        Command(resume={"text": "是", "files": ()}), config=config()
+    )
+    assert confirmed["result"]["reply_text"] == "文档已经处理好了。"
+    assert execution_agent.calls[0]["instruction"] == "写一份测试文档"
+    assert main_agent.judge_calls == []
+
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u2",
+            "new_text": "帮我写文档",
+            "new_file": None,
+        },
+        config=config("u2"),
+    )
+    refused = await graph.ainvoke(
+        Command(resume={"text": "先别", "files": ()}), config=config("u2")
+    )
+    assert refused["result"]["reply_text"] == "好的，那这次先不做。"
+    assert len(execution_agent.calls) == 1
+    assert main_agent.judge_calls == []
 
 
 async def test_attachment_during_confirmation_is_not_dropped(tmp_path, execution_agent):

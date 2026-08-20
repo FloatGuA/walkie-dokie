@@ -7,6 +7,12 @@ LangGraph 在这里是控制平面，不是主 Agent：它只负责累积跨消�
     collect -> main_agent --+-- reply ---------------------------> END
                              +-- ask_confirm -+-- prepare -> execute -> END
                                               +-- collect --------...
+                                              +-- judge_confirm -+-- prepare -> ...
+                                                                 +-- cancel_task -> END
+                                                                 +-- collect ----...
+
+确认回复分三层判定：零歧义白名单直接执行、否定词硬否决直接重新理解，剩下的
+灰区才进 ``judge_confirm`` 调主 Agent。模型调用只在节点里，路由函数保持纯函数。
 
 ``ask_memory`` 相关节点仅保留用于恢复升级前已经暂停的 checkpoint；新回合的
 长期记忆在确定性证据校验通过后隐式写入，不再要求用户二次确认。
@@ -47,6 +53,7 @@ from walkie_dokie.artifacts import (
     resolve_artifact_reference,
 )
 from walkie_dokie.main_agent.base import (
+    ConfirmationContext,
     DialogueContext,
     FinalizeContext,
     MainAgent,
@@ -72,6 +79,10 @@ _VAR_ROOT = Path(__file__).parent.parent.parent.parent / "var"
 EXECUTION_METADATA_ROOT = _VAR_ROOT / "execution-metadata"
 _EXECUTION_MARKER = "execution-report.json"
 _EXECUTION_STARTED_MARKER = "execution-started.json"
+# 放弃任务的回复是确定性系统话术，不走模型：这一步没有任何需要判断的东西，
+# 而用户已经表达了“别做了”，再多调一次模型只会增加延迟和跑偏的机会。
+_CANCEL_REPLY = "好的，这个任务不做了。有需要随时再发我。"
+_JUDGE_TIMEOUT_SECONDS = 30
 
 _CONFIRM_RE = re.compile(
     # 收紧版白名单：只收零歧义确认词，语气词（嗯/好/行/可以/对/ok）一律进灰区
@@ -298,6 +309,8 @@ async def _collect(state: SessionState) -> dict:
         "memory_changes": None,
         "memory_feedback": None,
         "execution": None,
+        # 上一轮灰区判定的结论不得残留到新回合的路由里。
+        "confirmation_verdict": None,
     }
 
 
@@ -407,16 +420,73 @@ async def _ask_memory(state: SessionState) -> dict:
 
 
 async def _route_confirm(state: SessionState) -> str:
+    """确认回复的三层分流：确定性放行 -> 确定性否决 -> 灰区交模型。
+
+    路由本身保持纯函数（不调模型），灰区只是把控制权交给 ``judge_confirm``
+    节点，模型调用集中在那里。
+    """
+
     # 确认阶段又收到附件时（可能是一整批），把它当任务补充重新交给主 Agent；
     # 不能像旧 runner 那样丢掉文件，也不能一边换附件一边按“是”执行旧任务。
     if state.get("new_files"):
         return "collect"
-    reply = state.get("new_text") or ""
+    reply = (state.get("new_text") or "").strip()
     if state["decision"].get("memory_operations") and _TASK_AND_MEMORY_CONFIRM_RE.fullmatch(
-        reply.strip()
+        reply
     ):
         return "save_memory_task"
-    return "execute" if _is_confirmation(reply) else "collect"
+    if _is_confirmation(reply):
+        return "execute"
+    if _is_negation(reply):
+        logger.info("确认回复命中否定词，硬否决进入重新理解 trace_id=%s", state.get("trace_id"))
+        return "collect"
+    if not reply:
+        return "collect"
+    return "judge_confirm"
+
+
+async def _route_after_judge(state: SessionState) -> str:
+    verdict = state.get("confirmation_verdict") or {}
+    decision = verdict.get("decision")
+    if decision == "confirm":
+        return "execute"
+    if decision == "cancel":
+        return "cancel_task"
+    # revise 与任何意外取值都走最保守的一条：回到主 Agent 重新理解。
+    return "collect"
+
+
+async def _cancel_task(state: SessionState) -> dict:
+    """用户放弃这次任务：清空待执行内容，用确定性话术收尾。
+
+    注意这条出口在实践中是少数路径：否定词硬否决优先于模型，意味着大部分放弃
+    说法（“算了”“不做了”“先不用了”）在 ``_route_confirm`` 就被拦下走 collect
+    重新理解，根本到不了模型。cancel 出口服务的是绕过否定词表的放弃说法——两
+    条路都不会误执行，差别只是收尾话术由谁给。
+    """
+
+    reply = (state.get("new_text") or "").strip()
+    instruction = state.get("pending_instruction") or ""
+    # 历史里同时留下原始请求和放弃原话，下一轮主 Agent 才看得懂“刚才那个没做”。
+    user_history = f"{instruction}\n{reply}" if instruction and reply else (instruction or reply)
+    logger.info(
+        "确认判定为放弃，清空待执行任务 trace_id=%s reason=%s",
+        state.get("trace_id"),
+        (state.get("confirmation_verdict") or {}).get("reason"),
+    )
+    return {
+        "pending_instruction": None,
+        "pending_files": (),
+        "current_user_text": None,
+        "decision": None,
+        "new_text": None,
+        "new_file": None,
+        "confirmation_verdict": None,
+        # active_artifacts 故意保留：放弃一次任务不该让“继续改刚才那份文件”
+        # 的引用失效。
+        "result": {"reply_text": _CANCEL_REPLY, "artifacts": [], "success": True},
+        "recent_messages": _completed_turn_history(state, user_history, _CANCEL_REPLY),
+    }
 
 
 async def _route_memory_confirmation(state: SessionState) -> str:
@@ -518,6 +588,38 @@ def build_graph(
             "decision": decision_to_dict(decision),
             "memory_changes": changes or None,
         }
+
+    async def _judge_confirm(state: SessionState) -> dict:
+        """灰区确认回复交主 Agent 判定。异常一律吞在节点内，用户无感知。"""
+
+        decision = state["decision"]
+        reply = (state.get("new_text") or "").strip()
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(_JUDGE_TIMEOUT_SECONDS):
+                verdict = await main_agent.judge_confirmation(
+                    ConfirmationContext(
+                        task_instruction=(decision.get("task") or {}).get("instruction", ""),
+                        proposal_message=decision["user_message"],
+                        user_reply=reply,
+                    )
+                )
+            verdict_dict = {"decision": verdict.decision, "reason": verdict.reason}
+        except Exception:
+            # 降级只许落 revise（多问一轮），绝不落 confirm——判不出来时执行是
+            # 不可逆的，重新理解只是多一次对话。
+            logger.warning(
+                "确认判定失败，降级为 revise trace_id=%s", state.get("trace_id"), exc_info=True
+            )
+            verdict_dict = {"decision": "revise", "reason": "判定调用失败，安全降级"}
+        logger.info(
+            "确认判定 trace_id=%s verdict=%s reason=%s elapsed_ms=%d",
+            state.get("trace_id"),
+            verdict_dict["decision"],
+            verdict_dict["reason"],
+            int((time.monotonic() - started) * 1000),
+        )
+        return {"confirmation_verdict": verdict_dict}
 
     def _apply_confirmed_memory(state: SessionState) -> list[dict]:
         return memory_repository.apply(
@@ -767,6 +869,8 @@ def build_graph(
     graph.add_node("reply", _reply)
     graph.add_node("ask_confirm", _ask_confirm)
     graph.add_node("ask_memory", _ask_memory)
+    graph.add_node("judge_confirm", _judge_confirm)
+    graph.add_node("cancel_task", _cancel_task)
     graph.add_node("save_memory_task", _save_memory_task)
     graph.add_node("save_memory_reply", _save_memory_reply)
     graph.add_node("discard_memory_reply", _discard_memory_reply)
@@ -792,9 +896,20 @@ def build_graph(
         {
             "execute": "prepare_execution",
             "save_memory_task": "save_memory_task",
+            "judge_confirm": "judge_confirm",
             "collect": "collect",
         },
     )
+    graph.add_conditional_edges(
+        "judge_confirm",
+        _route_after_judge,
+        {
+            "execute": "prepare_execution",
+            "cancel_task": "cancel_task",
+            "collect": "collect",
+        },
+    )
+    graph.add_edge("cancel_task", END)
     graph.add_conditional_edges(
         "ask_memory",
         _route_memory_confirmation,
