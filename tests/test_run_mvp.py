@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import walkie_dokie.artifacts as artifact_store
@@ -298,6 +299,69 @@ async def test_handle_event_confirm_resume_reuses_snapshots_trace_id(monkeypatch
     )
 
     assert records[0].run_id == "original-propose-id"
+
+
+async def test_concurrent_handle_event_calls_do_not_interleave_graph_access(
+    monkeypatch,
+):
+    """两个几乎同时到达的 handle_event 调用（同一 session，都命中确认分支）必须
+    被 UserLocks 完全序列化——graph.aget_state/ainvoke 不能交错执行。这是
+    handle_event 里"查询状态和 resume 决策必须和 ainvoke 使用同一把锁"那条注释
+    背后的真实承诺；此前只有顺序模拟测过结果形状，从没用真并发（asyncio.gather）
+    验证过锁真的挡住了交错。"""
+
+    order = []
+
+    class Graph:
+        async def aget_state(self, config):
+            order.append("aget_state-start")
+            await asyncio.sleep(0.02)
+            order.append("aget_state-end")
+            return SimpleNamespace(
+                next=("ask_confirm",), interrupts=(object(),), values={"trace_id": "t0"}
+            )
+
+        async def ainvoke(self, value, config, durability=None):
+            order.append("ainvoke-start")
+            await asyncio.sleep(0.02)
+            order.append("ainvoke-end")
+            return {
+                "result": {"artifacts": [], "reply_text": "ok", "success": True}
+            }
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    graph = Graph()
+    platform = FakePlatform()
+    locks = UserLocks()
+
+    await asyncio.gather(
+        handle_event(
+            graph,
+            platform,
+            object(),  # debouncer.add is unreachable once resumed_state is set
+            locks,
+            object(),  # memory_repository is unreachable outside /long-term-memory
+            InboundEvent("test", "u1", "是", None),
+        ),
+        handle_event(
+            graph,
+            platform,
+            object(),
+            locks,
+            object(),
+            InboundEvent("test", "u1", "是，确认", None),
+        ),
+    )
+
+    for i in range(0, len(order), 2):
+        assert order[i].endswith("-start")
+        assert order[i + 1].endswith("-end")
+        assert order[i].split("-")[0] == order[i + 1].split("-")[0], (
+            f"interleaved graph access detected: {order}"
+        )
 
 
 async def test_long_term_memory_command_bypasses_graph_and_debounce(
