@@ -12,6 +12,8 @@ from walkie_dokie.evals.judge import (
     verdict_matches,
 )
 
+CALIBRATION = Path(__file__).resolve().parents[1] / "evals" / "judge_calibration.yaml"
+
 
 def _fake_query(payload: dict):
     """伪 SDK：只产出一条形如 ResultMessage 的消息（结构化结果走 structured_output）。"""
@@ -68,7 +70,7 @@ def test_calibration_verdict_matching():
 
 
 def test_load_calibration_and_agreement():
-    entries = load_calibration(Path("evals/judge_calibration.yaml"))
+    entries = load_calibration(CALIBRATION)
     assert {e["expected"] for e in entries} == {"good", "bad"}
     verdicts = [
         JudgeVerdict(5, False, "") if e["expected"] == "good" else JudgeVerdict(1, True, "")
