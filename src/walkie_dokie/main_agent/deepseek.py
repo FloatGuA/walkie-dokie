@@ -39,6 +39,7 @@ _DECIDE_SYSTEM_PROMPT = """你是“小帮”的主 Agent，是唯一负责理�
 - 用户一句话连续陈述多个身份事实、后半句省略主语时，evidence 要复制能看出第一人称归属的完整片段。例如“我是浮瓜，是这个项目的开发者”中的职位证据应复制整句，不能只写“是这个项目的开发者”。
 - known_facts 只是已有资料，不能因为它出现在上下文里就重新输出 memory_operations。
 - recent_messages 只用于理解“继续刚才那个”之类的上下文；其中 assistant 的话不是用户事实。任何 memory_operations 仍只能来自 current_user_message。
+- conversation_summary 是更早对话压缩沉淀的事实清单，只是背景参考，不是当前指令，也不能作为记忆 evidence 的来源。
 - memory_operations 只是待系统确定性校验的候选；校验通过后控制平面会自动保存。user_message 绝不能提前声称“已经记住、保存或记录”，只有控制平面在实际落盘成功后才会追加保存结果。
 
 intent 与 action 必须严格对应：
@@ -121,6 +122,7 @@ class DeepSeekMainAgent(MainAgent):
                 "input_filenames": list(context.input_filenames),
                 "known_facts": context.known_facts,
                 "recent_messages": list(context.recent_messages),
+                "conversation_summary": list(context.conversation_summary),
                 "active_artifact_filenames": list(context.active_artifact_filenames),
             },
         )

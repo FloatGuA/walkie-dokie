@@ -574,6 +574,10 @@ def build_graph(
                         input_filenames=tuple(display_name(ref) for ref in files),
                         known_facts=known_facts,
                         recent_messages=tuple(state.get("recent_messages") or ()),
+                        conversation_summary=tuple(
+                            entry["fact"]
+                            for entry in state.get("conversation_summary") or ()
+                        ),
                         active_artifact_filenames=tuple(
                             display_name(ref) for ref in active_artifacts
                         ),

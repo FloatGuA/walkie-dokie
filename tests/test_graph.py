@@ -1367,6 +1367,31 @@ async def test_evicted_history_goes_to_pending_compaction(tmp_path, execution_ag
     ]
 
 
+async def test_conversation_summary_facts_reach_main_agent_context(
+    tmp_path, execution_agent
+):
+    """已沉淀的摘要事实只把 fact 注入 DialogueContext，evidence 不进主 Agent 上下文。"""
+    main_agent = FakeMainAgent([reply_decision("知道了")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "在吗",
+            "new_file": None,
+            "conversation_summary": [
+                {"fact": "fact1", "evidence": "证据1"},
+                {"fact": "fact2", "evidence": "证据2"},
+            ],
+        },
+        config=config(),
+    )
+
+    context = main_agent.decide_calls[0]
+    assert context.conversation_summary == ("fact1", "fact2")
+
+
 async def test_history_within_window_leaves_pending_empty(tmp_path, execution_agent):
     """历史没超窗口时没有整条被挤出，pending_compaction 保持空。"""
     main_agent = FakeMainAgent([reply_decision("窗口内回复")])

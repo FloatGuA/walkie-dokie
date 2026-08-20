@@ -45,6 +45,9 @@ class DialogueContext:
     known_facts: dict[str, str]
     recent_messages: tuple[dict[str, str], ...] = ()
     active_artifact_filenames: tuple[str, ...] = ()
+    # 更早对话压缩沉淀的事实清单（只有 fact，不含 evidence）；纯背景参考，
+    # 不能当作当前指令，也不能反过来当作长期记忆 evidence 的来源。
+    conversation_summary: tuple[str, ...] = ()
     # user_text 可以是确认前多条消息累积出的任务上下文；长期记忆证据只能来自
     # 最后一条真实用户文本，不能从旧消息或助手话术中重新抽取。
     current_user_text: str | None = None
