@@ -36,6 +36,9 @@ InboundEvent
   → ExecutionReport
   → main_agent.finalize
   → 文件、文字投递
+  → 投递后（同一 session 锁内）：被挤出窗口的历史消息攒满 6 条时，
+    专用 compact invoke → haiku 摘要 → 逐字 evidence 机械校验 →
+    conversation_summary（随 checkpoint 持久，facts 注入后续 decide）
 ```
 
 `prepare_execution` 先生成稳定 `execution_id/workdir`；生产入口显式传 `durability="sync"`，保证该 superstep 的 checkpoint 完成后才进入有外部副作用的 `execute`。编排元数据写在执行 Agent cwd 之外：调用 backend 前先写 started marker，完成后写原子 report marker。若恢复时只有 started、没有可信 report，系统拒绝自动重跑并把 outcome 视为未知；若已有 report，则复用它。这降低了重复风险，但不能判断未知执行究竟完成到哪一步，也不构成通用 exactly-once 保证。
