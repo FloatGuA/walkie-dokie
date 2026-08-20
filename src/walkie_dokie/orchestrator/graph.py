@@ -767,8 +767,15 @@ def build_graph(
                     source_texts=merge_sources,
                     max_entries=_SUMMARY_MERGE_TARGET,
                 )
-                if not merged_entries:
-                    raise RuntimeError(f"合并结果全部未通过校验：{list(merge_rejected)!r}")
+                # 下界守卫：合并是全特性唯一会整表替换的写路径，模型只回一两条就
+                # 会永久抹掉几十条已验证事实。低于下限一律当合并失败处理，宁可留着
+                # 没精简的表，也不接受一次无声的记忆销毁。
+                merge_floor = min(_SUMMARY_MERGE_TARGET // 2, len(summary))
+                if len(merged_entries) < merge_floor:
+                    raise RuntimeError(
+                        f"合并结果只有 {len(merged_entries)} 条，低于下限 {merge_floor}："
+                        f"{list(merge_rejected)!r}"
+                    )
                 summary = list(merged_entries)
                 merged = True
             except Exception:
@@ -780,6 +787,17 @@ def build_graph(
                     len(summary),
                     exc_info=True,
                 )
+                # 上界守卫：合并稳定失败时摘要会随每批继续变长，而它每轮都进
+                # decide prompt。丢最旧的方向与压缩上线前的硬截断一致，安全。
+                if len(summary) > _SUMMARY_MERGE_THRESHOLD * 2:
+                    dropped = len(summary) - _SUMMARY_MERGE_THRESHOLD * 2
+                    summary = summary[-_SUMMARY_MERGE_THRESHOLD * 2 :]
+                    logger.warning(
+                        "摘要超过硬顶 %d 条，丢弃最旧的 %d 条 trace_id=%s",
+                        _SUMMARY_MERGE_THRESHOLD * 2,
+                        dropped,
+                        trace_id,
+                    )
 
         logger.info(
             "历史压缩完成 trace_id=%s batch=%d accepted=%d rejected=%d "

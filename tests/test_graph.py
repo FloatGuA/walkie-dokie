@@ -1639,6 +1639,124 @@ async def test_merge_failure_keeps_unmerged_summary_without_counting_failure(
     assert state["new_compaction_request"] is False
 
 
+async def test_merge_returning_too_few_entries_is_treated_as_failure(
+    tmp_path, execution_agent, caplog
+):
+    """合并只回 2 条（远低于下限）视为合并失败：保留未合并全表，不是整表替换。
+
+    这是全特性唯一会无声销毁已沉淀记忆的写路径——模型少回几条就永久抹掉 20 条
+    已验证事实，所以下限守卫比“合并成功”本身更重要。
+    """
+    old_entries = [
+        {"fact": f"旧事实{i}", "evidence": [f"旧证据{i}"]} for i in range(20)
+    ]
+    summarizer = QueueSummarizer(
+        [({"fact": "新事实", "evidence": ["压缩原文1"]},)],
+        merge_results=[
+            (
+                {"fact": "合并事实0", "evidence": ["旧证据0"]},
+                {"fact": "合并事实1", "evidence": ["旧证据1"]},
+            )
+        ],
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    with caplog.at_level(logging.WARNING, logger=CONFIRM_LOGGER):
+        state = await graph.ainvoke(
+            _compaction_invoke(conversation_summary=old_entries),
+            config=config(),
+            durability="sync",
+        )
+
+    assert len(state["conversation_summary"]) == 21
+    assert state["conversation_summary"][0] == {
+        "fact": "旧事实0",
+        "evidence": ["旧证据0"],
+    }
+    assert state["compaction_failures"] == 0
+    assert state["pending_compaction"] == []
+    warnings = confirm_log_lines(caplog, logging.WARNING)
+    assert any("合并" in line for line in warnings)
+
+
+async def test_merge_result_is_truncated_to_target(tmp_path, execution_agent):
+    """合并回 12 条合法条目：max_entries 只放行前 10 条，超出的被机械截断。"""
+    old_entries = [
+        {"fact": f"旧事实{i}", "evidence": [f"旧证据{i}"]} for i in range(20)
+    ]
+    merged_entries = tuple(
+        {"fact": f"合并事实{i}", "evidence": [f"旧证据{i}"]} for i in range(12)
+    )
+    summarizer = QueueSummarizer(
+        [({"fact": "新事实", "evidence": ["压缩原文1"]},)],
+        merge_results=[merged_entries],
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    state = await graph.ainvoke(
+        _compaction_invoke(conversation_summary=old_entries),
+        config=config(),
+        durability="sync",
+    )
+
+    assert state["conversation_summary"] == list(merged_entries[:10])
+
+
+async def test_summary_is_capped_when_merge_keeps_failing(
+    tmp_path, execution_agent, caplog
+):
+    """合并稳定失败时摘要不得无限增长：超过硬顶就丢最旧，截到 40 条。"""
+    old_entries = [
+        {"fact": f"旧事实{i}", "evidence": [f"旧证据{i}"]} for i in range(40)
+    ]
+    summarizer = QueueSummarizer(
+        [({"fact": "新事实", "evidence": ["压缩原文1"]},)],
+        merge_results=[RuntimeError("合并后端仍然不可用")],
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    with caplog.at_level(logging.WARNING, logger=CONFIRM_LOGGER):
+        state = await graph.ainvoke(
+            _compaction_invoke(conversation_summary=old_entries),
+            config=config(),
+            durability="sync",
+        )
+
+    summary = state["conversation_summary"]
+    assert len(summary) == 40
+    # 丢最旧：旧事实0 出局，最新一条留在表尾。
+    assert summary[0] == {"fact": "旧事实1", "evidence": ["旧证据1"]}
+    assert summary[-1] == {"fact": "新事实", "evidence": ["压缩原文1"]}
+    assert state["compaction_failures"] == 0
+    warnings = confirm_log_lines(caplog, logging.WARNING)
+    assert any("40" in line for line in warnings)
+
+
+async def test_merge_cannot_introduce_evidence_from_current_batch(
+    tmp_path, execution_agent
+):
+    """二级合并的源只有旧条目 evidence 并集：拿本批 pending 原文当证据的条目被拒。"""
+    old_entries = [
+        {"fact": f"旧事实{i}", "evidence": [f"旧证据{i}"]} for i in range(20)
+    ]
+    legit = tuple(
+        {"fact": f"合并事实{i}", "evidence": [f"旧证据{i}"]} for i in range(5)
+    )
+    summarizer = QueueSummarizer(
+        [({"fact": "新事实", "evidence": ["压缩原文1"]},)],
+        merge_results=[legit + ({"fact": "越权引用本批原文", "evidence": ["压缩原文4"]},)],
+    )
+    graph, _ = make_graph(tmp_path, FakeMainAgent(), execution_agent, summarizer)
+
+    state = await graph.ainvoke(
+        _compaction_invoke(conversation_summary=old_entries),
+        config=config(),
+        durability="sync",
+    )
+
+    assert state["conversation_summary"] == list(legit)
+
+
 async def test_compact_without_summarizer_raises(tmp_path, execution_agent):
     """没注入 summarizer 却触发 compaction 是配置错误：直接抛，不静默吞。"""
     graph = build_graph(
