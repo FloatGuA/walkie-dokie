@@ -6,6 +6,9 @@
 """
 
 from walkie_dokie.main_agent.base import (
+    ConfirmationContext,
+    ConfirmationDecision,
+    ConfirmationVerdict,
     DialogueContext,
     DialogueIntent,
     FinalizeContext,
@@ -24,6 +27,9 @@ from walkie_dokie.main_agent.memory import (
 )
 
 __all__ = [
+    "ConfirmationContext",
+    "ConfirmationDecision",
+    "ConfirmationVerdict",
     "DeepSeekMainAgent",
     "DialogueContext",
     "DialogueIntent",

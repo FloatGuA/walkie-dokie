@@ -1,4 +1,5 @@
 import itertools
+import logging
 from pathlib import Path
 
 import pytest
@@ -191,6 +192,18 @@ def make_graph(tmp_path, main_agent, execution_agent):
 
 def config(user_id="u1"):
     return {"configurable": {"thread_id": f"test:{user_id}"}}
+
+
+CONFIRM_LOGGER = "walkie_dokie.orchestrator.graph"
+
+
+def confirm_log_lines(caplog, level):
+    """确认链路的审计日志：只取本 logger 指定级别的行，按发生顺序。"""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == CONFIRM_LOGGER and record.levelno == level
+    ]
 
 
 def input_reference(filename="input.docx", content=b"input"):
@@ -722,7 +735,7 @@ async def test_gray_zone_cancel_clears_pending_and_replies_deterministically(
 
 
 async def test_deterministic_cancellation_skips_model_and_cancels(
-    tmp_path, execution_agent
+    tmp_path, execution_agent, caplog
 ):
     """“算了”这类整句放弃走确定性放弃层：直接 cancel，不调模型、不反问。"""
     main_agent = JudgingFakeMainAgent([])
@@ -733,13 +746,19 @@ async def test_deterministic_cancellation_skips_model_and_cancels(
             "user_id": "u1",
             "new_text": "帮我写文档",
             "new_file": None,
+            "trace_id": "tr-cancel",
         },
         config=config(),
     )
 
+    caplog.set_level(logging.INFO, logger=CONFIRM_LOGGER)
     state = await graph.ainvoke(
         Command(resume={"text": "算了", "files": ()}), config=config()
     )
+    assert confirm_log_lines(caplog, logging.INFO) == [
+        "确认回复命中确定性放弃层，直接收尾 trace_id=tr-cancel",
+        "确认判定为放弃，清空待执行任务 trace_id=tr-cancel reason=None",
+    ]
     assert execution_agent.calls == []
     assert main_agent.judge_calls == []
     assert len(main_agent.decide_calls) == 1
@@ -753,7 +772,9 @@ async def test_deterministic_cancellation_skips_model_and_cancels(
     assert state["decision"] is None
 
 
-async def test_judge_failure_degrades_to_revise_not_execute(tmp_path, execution_agent):
+async def test_judge_failure_degrades_to_revise_not_execute(
+    tmp_path, execution_agent, caplog
+):
     """判定调用挂掉时只许降级到重新理解，绝不执行，也不把异常抛给调用方。"""
     main_agent = JudgingFakeMainAgent(
         [RuntimeError("judge 挂了")],
@@ -766,21 +787,54 @@ async def test_judge_failure_degrades_to_revise_not_execute(tmp_path, execution_
             "user_id": "u1",
             "new_text": "帮我写文档",
             "new_file": None,
+            "trace_id": "tr-degrade",
         },
         config=config(),
     )
 
+    caplog.set_level(logging.WARNING, logger=CONFIRM_LOGGER)
     state = await graph.ainvoke(
         Command(resume={"text": "嗯", "files": ()}), config=config()
     )
+    # 降级必须留痕，否则线上只看得到“又问了一轮”，看不到模型判定挂了
+    assert confirm_log_lines(caplog, logging.WARNING) == [
+        "确认判定失败，降级为 revise trace_id=tr-degrade"
+    ]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r.exc_info is not None for r in warnings] == [True]
     assert execution_agent.calls == []
     assert len(main_agent.decide_calls) == 2
     assert state["result"]["reply_text"] == "我这次没太确定，再说一次好吗？"
     assert state["result"]["success"] is True
 
 
-async def test_whitelist_and_negation_never_reach_model(tmp_path, execution_agent):
+async def test_broken_decision_shape_raises_instead_of_degrading(
+    tmp_path, execution_agent
+):
+    """decision 少字段是内部 bug，不是判定失败：必须冒泡，不许吞成 revise。
+
+    只能直接调节点：坏掉的 decision 走不到 judge_confirm，``ask_confirm``
+    自己就要读 ``decision["user_message"]`` 组 interrupt 载荷。
+    """
+    main_agent = JudgingFakeMainAgent([ConfirmationVerdict("confirm", "同意")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    judge_confirm = graph.nodes["judge_confirm"].bound
+
+    with pytest.raises(KeyError, match="user_message"):
+        await judge_confirm.ainvoke(
+            {
+                "decision": {"task": {"instruction": "写一份测试文档"}},
+                "new_text": "嗯",
+            }
+        )
+    assert main_agent.judge_calls == []
+
+
+async def test_whitelist_and_negation_never_reach_model(
+    tmp_path, execution_agent, caplog
+):
     """确定性两层各自短路：白名单直接执行、否定词直接重新理解，都不调模型。"""
+    caplog.set_level(logging.INFO, logger=CONFIRM_LOGGER)
     main_agent = JudgingFakeMainAgent(
         [],
         decisions=[
@@ -797,6 +851,7 @@ async def test_whitelist_and_negation_never_reach_model(tmp_path, execution_agen
             "user_id": "u1",
             "new_text": "帮我写文档",
             "new_file": None,
+            "trace_id": "tr-yes",
         },
         config=config(),
     )
@@ -806,6 +861,11 @@ async def test_whitelist_and_negation_never_reach_model(tmp_path, execution_agen
     assert confirmed["result"]["reply_text"] == "文档已经处理好了。"
     assert execution_agent.calls[0]["instruction"] == "写一份测试文档"
     assert main_agent.judge_calls == []
+    assert (
+        "确认回复命中白名单快路径放行，直接执行 trace_id=tr-yes"
+        in confirm_log_lines(caplog, logging.INFO)
+    )
+    caplog.clear()
 
     await graph.ainvoke(
         {
@@ -813,6 +873,7 @@ async def test_whitelist_and_negation_never_reach_model(tmp_path, execution_agen
             "user_id": "u2",
             "new_text": "帮我写文档",
             "new_file": None,
+            "trace_id": "tr-no",
         },
         config=config("u2"),
     )
@@ -822,6 +883,10 @@ async def test_whitelist_and_negation_never_reach_model(tmp_path, execution_agen
     assert refused["result"]["reply_text"] == "好的，那这次先不做。"
     assert len(execution_agent.calls) == 1
     assert main_agent.judge_calls == []
+    assert (
+        "确认回复命中否定词，硬否决进入重新理解 trace_id=tr-no"
+        in confirm_log_lines(caplog, logging.INFO)
+    )
 
 
 async def test_attachment_during_confirmation_is_not_dropped(tmp_path, execution_agent):

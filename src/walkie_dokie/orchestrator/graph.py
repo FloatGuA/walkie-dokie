@@ -618,20 +618,23 @@ def build_graph(
         }
 
     async def _judge_confirm(state: SessionState) -> dict:
-        """灰区确认回复交主 Agent 判定。异常一律吞在节点内，用户无感知。"""
+        """灰区确认回复交主 Agent 判定：模型这一步的异常吞在节点内，用户无感知。
+
+        try 只包模型调用本身。上下文组装留在外面——decision 形状坏掉是内部
+        bug，被吞成 revise 只会把它伪装成“模型判不出来”，让真正的问题查不到。
+        """
 
         decision = state["decision"]
         reply = (state.get("new_text") or "").strip()
+        context = ConfirmationContext(
+            task_instruction=(decision.get("task") or {}).get("instruction", ""),
+            proposal_message=decision["user_message"],
+            user_reply=reply,
+        )
         started = time.monotonic()
         try:
             async with asyncio.timeout(_JUDGE_TIMEOUT_SECONDS):
-                verdict = await main_agent.judge_confirmation(
-                    ConfirmationContext(
-                        task_instruction=(decision.get("task") or {}).get("instruction", ""),
-                        proposal_message=decision["user_message"],
-                        user_reply=reply,
-                    )
-                )
+                verdict = await main_agent.judge_confirmation(context)
             verdict_dict = {"decision": verdict.decision, "reason": verdict.reason}
         except Exception:
             # 降级只许落 revise（多问一轮），绝不落 confirm——判不出来时执行是

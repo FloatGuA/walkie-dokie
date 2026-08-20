@@ -242,7 +242,7 @@ class DeepSeekMainAgent(MainAgent):
             },
         )
         decision = parsed.get("decision")
-        if decision not in ("confirm", "revise", "cancel"):
+        if decision not in {"confirm", "revise", "cancel"}:
             raise RuntimeError(f"确认判定返回未知 decision：{decision!r}")
         return ConfirmationVerdict(
             decision=decision, reason=str(parsed.get("reason") or "")

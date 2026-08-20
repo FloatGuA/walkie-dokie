@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import walkie_dokie.main_agent.base as base
 from walkie_dokie.agents.base import ExecutionArtifact, ExecutionReport
 from walkie_dokie.main_agent.base import (
     ConfirmationContext,
@@ -323,6 +324,15 @@ async def test_judge_confirmation_parses_three_way_verdict():
         "user_reply": "算了，不做了",
     }
     assert completions.calls[0]["temperature"] == 0
+
+
+def test_confirmation_types_are_reexported_from_package():
+    """确认判定的三个类型和其他主 Agent 类型一样，从包根就能拿到。"""
+    import walkie_dokie.main_agent as main_agent
+
+    for name in ("ConfirmationContext", "ConfirmationDecision", "ConfirmationVerdict"):
+        assert name in main_agent.__all__
+        assert getattr(main_agent, name) is getattr(base, name)
 
 
 async def test_judge_confirmation_rejects_unknown_decision():
