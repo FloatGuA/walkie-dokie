@@ -1,5 +1,7 @@
 # 确认判定重设计（三层结构 + 模型判灰区）Implementation Plan
 
+> **状态：✅ 已于 2026-08-20 全部执行完毕**（subagent-driven；final review 后经用户拍板追加确定性放弃词层，实际交付为四层结构；golden 回归 21/21 PASSED，`pytest` 246 passed）。留档备查，不要重复执行；与实现不一致处以代码与 spec 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把"这句话是否放行执行"从 `_CONFIRM_RE` 正则独占改为三层结构：收紧白名单直接执行 → 否定词硬否决 → `MainAgent.judge_confirmation` 模型判灰区（confirm/revise/cancel），并新增 cancel 出口。
