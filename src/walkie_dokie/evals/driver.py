@@ -59,7 +59,9 @@ async def run_case(
 ) -> CaseResult:
     started = time.monotonic()
     platform = _CapturePlatform()
-    # thread_id/user_id 都带上 case.id：样本之间零共享 checkpoint 与长期档案。
+    # thread_id/user_id 都带上 case.id：单次运行内，样本之间零共享 checkpoint 与长期档案。
+    # 跨运行不隔离——这两个 key 都是跨运行稳定的，调用方必须每次运行构造全新
+    # checkpointer 和全新 memory 目录，否则上次运行的残留档案会让 memory 断言假绿/假红。
     config = {"configurable": {"thread_id": f"{_EVAL_PLATFORM}:{case.id}"}}
     observations: list[TurnObservation] = []
     failures: list[str] = []
