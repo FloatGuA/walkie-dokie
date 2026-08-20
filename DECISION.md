@@ -404,3 +404,12 @@
 - **否掉了什么，为什么**：不带用户归属的全局记账（用户明确要按用户，为多用户阶段做准备）；日阈值告警与硬限额（单人阶段拦的是自己，异常成本场景已被 max_tokens/max_retries/fail-fast 兜住）；jq 裸查（金额估算与聚合每次手写反而麻烦）。
 - **代价 / 已知不足**：summarizer is_error 分支不记账（补记需违反"不额外 try"约束，接受漏记）；eval judge 调用不记账（harness 非生产）；turns.jsonl 被全量 pytest 写脏是既有问题本次只治理了 model_calls.jsonl（conftest 隔离）。
 - **什么情况下应该重新考虑**：对外开放时 enforcement 与多用户配额一起设计；DeepSeek 公布 deepseek-chat 别名映射或变价时更新单价常量；若 is_error 漏记在真实对账中造成可感偏差，再评估结构化收集 error 路径 usage。
+
+## Admin 观测台定稿：V1 纯只读四板块、FastAPI optional extra、localhost 无鉴权
+
+- **日期**：2026-08-21
+- **背景**：用户提出做 OpenClaw 式管理后台并接入可配置项。核心张力：可写配置是 golden 回归纪律的旁路（UI 改词表/prompt 没有 TDD/review/回归兜底）。spec 见 `docs/superpowers/specs/2026-08-21-admin-console-design.md`。
+- **选了什么**：**5 个决策点用户拍板**——① 定位为开发者自己的运维观测台；② V1 四板块（回合流/成本/记忆+摘要/eval 报告）且**纯只读**；③ 可写配置连同"改配置强制过 golden 回归"机制整体挪二期，不预先猜配置项；④ FastAPI + uvicorn 作 optional extra `admin`（用户选生态而非 stdlib）；⑤ host 写死 127.0.0.1、无鉴权。checkpoint 数据用只读 SQLite 连接读取，绝不经 graph、绝不写。
+- **否掉了什么，为什么**：V1 带可写配置（回归旁路，安全边界问题不是功能清单问题）；家人/管理员面板（依赖尚未存在的多用户体系）；stdlib http.server（用户选 FastAPI 生态）；静态生成 HTML（无后台体验）；websocket 实时推送（轮询够）。
+- **代价 / 已知不足**：新增两个 optional 依赖；轮询全量解析文件（单人数据量可忽略）；checkpoint 反序列化耦合 langgraph 存储格式（测试用真实 SqliteSaver 写读兜住升级破坏）。
+- **什么情况下应该重新考虑**：二期可写配置时同步设计"配置变更→强制/提示跑 golden 回归"的机制；对外开放时补鉴权与绑定策略；数据文件超过单机可全量解析的量级时引入增量/索引。
