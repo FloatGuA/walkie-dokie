@@ -75,6 +75,17 @@ python3 -m scripts.run_golden_eval --real-execution  # 冒烟：真实 Claude/Co
 
 报告写入 `var/evals/<时间戳>.json`。退出码：0 全过 / 1 断言失败 / 2 基础设施异常。设计与决策见 `docs/superpowers/specs/2026-08-20-eval-harness-design.md` 与 DECISION.md。
 
+## 查看模型调用成本
+
+所有模型调用（DeepSeek 与压缩用的 Claude CLI）自动记账到 `var/logs/model_calls.jsonl`。查看汇总：
+
+```bash
+python3 -m scripts.report_costs --days 7                      # 终端汇总
+python3 -m scripts.report_costs --days 30 --html var/logs/costs.html  # 单文件 HTML 报表
+```
+
+金额为保守上界估算（官方定价页未确认 `deepseek-chat` 别名映射），对账以 DeepSeek 控制台账单为准。
+
 ## 合同智能
 
 原本内置的 `contract_intelligence` Data Spike 领域模块已于 2026-08-15 拆分为独立仓库
