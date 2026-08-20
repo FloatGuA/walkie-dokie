@@ -5,6 +5,7 @@ fastapi 是 ``[admin]`` extra，不装的环境直接跳过整个文件——bot
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,10 @@ from walkie_dokie.admin.data import (  # noqa: E402
     read_memory,
     read_turns,
 )
+
+# 真实的前端交付物。不从 ``app_module.INDEX_HTML_PATH`` 取：那个常量会被 paths
+# fixture 改指到 tmp，下面几条 smoke 断言的恰恰是仓库里那一份。
+REAL_INDEX_HTML = Path(app_module.__file__).with_name("index.html")
 
 
 def _write_jsonl(path, rows):
@@ -216,6 +221,51 @@ def test_eval_report_endpoint_bad_json_is_500_not_404(client, paths):
     response = client.get("/api/evals/20260821T101010Z.json")
     assert response.status_code == 500
     assert "20260821T101010Z.json" in response.json()["detail"]
+
+
+# ------------------------------------------------------- index.html smoke
+#
+# 这几条只读仓库里那份真实 index.html 的源码。前端没有构建步骤、没有单测框架，
+# 字符串断言是唯一能钉住"结构还在"的手段：四个 tab、固定 purpose 色映射、零外部
+# 资源、以及最起码的转义意识。它们挡不住渲染 bug，但挡得住"某次编辑把整块删了"。
+
+
+def _index_source() -> str:
+    return REAL_INDEX_HTML.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("tab", ["turns", "costs", "memory", "evals"])
+def test_index_html_has_all_four_tabs(tab):
+    assert f'data-tab="{tab}"' in _index_source()
+
+
+@pytest.mark.parametrize(
+    "color", ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
+)
+def test_index_html_carries_fixed_purpose_palette(color):
+    """5 个 purpose 色号照抄报表脚本，两处必须一致，否则两张图没法对着看。"""
+    assert color in _index_source()
+
+
+@pytest.mark.parametrize("scheme", ["http://", "https://"])
+def test_index_html_has_no_external_resources(scheme):
+    """单文件、零外部资源：没有 CDN、没有 web 字体。观测台要能离线开着看。"""
+    assert scheme not in _index_source()
+
+
+def test_index_html_escapes_api_text():
+    """回合输入输出、摘要 evidence 都是用户/模型产出的文本，绝不能裸拼进 DOM。"""
+    source = _index_source()
+    assert "textContent" in source
+    assert "function esc(" in source
+
+
+def test_root_serves_the_real_index_html(monkeypatch):
+    monkeypatch.setattr(app_module, "INDEX_HTML_PATH", REAL_INDEX_HTML)
+    response = TestClient(app_module.create_app()).get("/")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "观测台" in response.text
 
 
 def test_app_exposes_no_write_routes():

@@ -1,0 +1,814 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>walkie-dokie 观测台</title>
+<!--
+  单文件前端：内联 CSS/JS，零外部资源（没有 CDN、没有 web 字体）。观测台跑在
+  本机 127.0.0.1，断网也要能开着看，任何外链都是一处会转圈的空白。
+
+  只读四个 tab：回合 / 成本 / 记忆 / Eval。每 10 秒只轮询当前 tab 的端点——四个
+  一起刷等于把被观测的 bot 的日志文件每 10 秒全读一遍，观测台自己成了负载。
+
+  安全边界：turns 的输入输出、记忆的摘要 evidence 全是用户输入与模型输出，一律
+  经 textContent 落地；只有手写 SVG 那一段是拼字符串的，那里每个动态片段都过
+  esc()。绝不出现未转义的 innerHTML 拼接。
+-->
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 24px 64px; background: #fcfcfb; color: #1f1f1e;
+    font: 14px/1.55 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  h3 { font-size: 14px; font-weight: 600; margin: 0; }
+  .muted { color: #6b6a63; font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  .errbar {
+    margin: 14px 0 0; padding: 9px 12px; border-radius: 6px;
+    background: #fbeceb; border: 1px solid #f0c8c3; color: #1f1f1e; font-size: 13px;
+  }
+
+  .tabs { display: flex; gap: 4px; margin: 18px 0 20px; border-bottom: 1px solid #e8e7e4; }
+  .tab {
+    appearance: none; border: 0; background: none; cursor: pointer; color: #6b6a63;
+    font: inherit; font-size: 14px; padding: 8px 14px; margin-bottom: -1px;
+    border-bottom: 2px solid transparent;
+  }
+  .tab:hover { color: #1f1f1e; }
+  .tab.active { color: #1f1f1e; font-weight: 600; border-bottom-color: #2a78d6; }
+
+  .controls { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  .controls label { color: #6b6a63; font-size: 12px; display: flex; align-items: center; gap: 7px; }
+  .controls input, .controls select {
+    font: inherit; font-size: 13px; color: #1f1f1e; background: #fff;
+    border: 1px solid #d5d4d0; border-radius: 5px; padding: 5px 8px;
+  }
+  .controls input { width: 220px; }
+
+  .note { color: #6b6a63; font-size: 12px; margin: 4px 0 0; }
+  .note + .note { margin-top: 2px; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 44px; margin-bottom: 10px; }
+  .stat-label { color: #6b6a63; font-size: 12px; letter-spacing: 0.04em; }
+  .stat-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat.hero .stat-value { font-size: 40px; letter-spacing: -0.02em; font-variant-numeric: normal; }
+
+  h2 { font-size: 13px; font-weight: 600; margin: 32px 0 10px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; margin: 6px 0 4px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #6b6a63; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; }
+  .chart { overflow-x: auto; }
+  .chart svg { display: block; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #ececea; vertical-align: top; }
+  th { color: #6b6a63; font-weight: 500; font-size: 12px; white-space: nowrap; }
+  td { font-variant-numeric: tabular-nums; word-break: break-word; }
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: #f4f3f0; }
+  tbody tr.open { background: #eef3fb; }
+
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 9px;
+    font-size: 11px; line-height: 1.6; white-space: nowrap; border: 1px solid transparent;
+  }
+  .badge.ok { background: #e6f5ee; border-color: #bfe3d3; }
+  .badge.bad { background: #fbeceb; border-color: #f0c8c3; }
+  .badge.neutral { background: #f0efec; border-color: #e0dfda; }
+
+  .card {
+    border: 1px solid #e8e7e4; border-radius: 8px; padding: 16px 18px;
+    margin-bottom: 14px; background: #fff;
+  }
+  .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .card-sub { font-size: 12px; font-weight: 600; color: #6b6a63; margin: 16px 0 6px; }
+  .summary { list-style: none; margin: 0; padding: 0; }
+  .summary li { padding: 6px 0; border-bottom: 1px solid #f2f1ee; }
+  .summary li:last-child { border-bottom: 0; }
+  /* fact 是结论，常规字重；evidence 是原文出处，退到灰色小字，不跟结论抢注意力。 */
+  .fact { font-weight: 400; }
+  .evidence { color: #6b6a63; font-size: 12px; margin-top: 2px; }
+
+  .sparks { display: flex; flex-wrap: wrap; gap: 32px; margin-bottom: 8px; }
+  .sparks figure { margin: 0; }
+  .sparks figcaption { font-size: 12px; color: #6b6a63; margin-bottom: 4px; }
+
+  .empty { color: #6b6a63; padding: 36px 0; text-align: center; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>walkie-dokie 观测台</h1>
+    <span id="refreshed" class="muted">最后刷新 --:--:--</span>
+    <span class="muted">只读 · 本机</span>
+  </header>
+
+  <div id="error" class="errbar" hidden></div>
+
+  <nav class="tabs">
+    <button type="button" class="tab active" data-tab="turns">回合</button>
+    <button type="button" class="tab" data-tab="costs">成本</button>
+    <button type="button" class="tab" data-tab="memory">记忆</button>
+    <button type="button" class="tab" data-tab="evals">Eval</button>
+  </nav>
+
+  <section id="panel-turns" class="panel">
+    <div class="controls">
+      <label>用户 <input id="turn-user" type="text" placeholder="user_id 精确匹配"></label>
+      <label>条数
+        <select id="turn-limit">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </label>
+    </div>
+    <p id="turns-skipped" class="note" hidden></p>
+    <div id="turns-body"></div>
+  </section>
+
+  <section id="panel-costs" class="panel" hidden>
+    <div id="costs-stats" class="stats"></div>
+    <p id="costs-disclaimer" class="note"></p>
+    <p id="costs-unknown" class="note" hidden></p>
+    <p id="costs-skipped" class="note" hidden></p>
+    <h2>按日 tokens（按 purpose 堆叠）</h2>
+    <div id="costs-legend" class="legend"></div>
+    <div id="costs-chart" class="chart"></div>
+  </section>
+
+  <section id="panel-memory" class="panel" hidden>
+    <div id="memory-error" class="errbar" hidden></div>
+    <div id="memory-body"></div>
+  </section>
+
+  <section id="panel-evals" class="panel" hidden>
+    <p id="evals-skipped" class="note" hidden></p>
+    <div class="sparks">
+      <figure>
+        <figcaption>通过率 %（按运行先后）</figcaption>
+        <div id="evals-pass-chart" class="chart"></div>
+      </figure>
+      <figure>
+        <figcaption>judge clarity 均值 1–5（按运行先后）</figcaption>
+        <div id="evals-clarity-chart" class="chart"></div>
+      </figure>
+    </div>
+    <h2>运行列表（点一行看逐样本结果）</h2>
+    <div id="evals-body"></div>
+    <div id="evals-detail"></div>
+  </section>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // purpose -> 颜色是固定映射，绝不按数据里出现的先后分配：同一个 purpose 在
+  // 今天和昨天的图里必须是同一个颜色，否则两张图没法对着看。这 5 色与
+  // scripts/report_costs.py 的 PURPOSE_COLORS 逐字一致（已过 CVD/对比度校验）。
+  var PURPOSE_COLORS = {
+    decide: '#2a78d6',
+    finalize: '#eb6834',
+    judge_confirmation: '#1baf7a',
+    summarize: '#eda100',
+    merge: '#e87ba4'
+  };
+  // 日志是历史数据，可能含今天已经不存在的 purpose；给它们中性灰，不进固定色序。
+  var FALLBACK_COLOR = '#8a8880';
+
+  // 文字一律用文本色，绝不用系列色写字（浅色系列当文字读不清）。
+  var INK = '#1f1f1e';
+  var INK_MUTED = '#6b6a63';
+  var SURFACE = '#fcfcfb';
+  var GRID = '#e8e7e4';
+  var AXIS = '#d5d4d0';
+
+  var TRUNCATE = 80;
+  var POLL_MS = 10000;
+
+  var PROFILE_FIELDS = [
+    ['name', '姓名'],
+    ['department', '部门'],
+    ['job_title', '职位'],
+    ['preferred_address', '常用称呼']
+  ];
+
+  // ------------------------------------------------------------ 小工具
+
+  /** 手写 SVG 那一段要拼字符串，凡是动态片段都必须先过这里。 */
+  function esc(value) {
+    return String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    // 一律走 textContent：这些文本来自用户输入和模型输出，没有一处可以当 HTML。
+    if (text !== undefined) { node.textContent = text === null ? '' : String(text); }
+    return node;
+  }
+
+  function clear(node) {
+    while (node.firstChild) { node.removeChild(node.firstChild); }
+  }
+
+  function has(object, key) {
+    return Object.prototype.hasOwnProperty.call(object, key);
+  }
+
+  function trunc(value) {
+    var text = value === null || value === undefined ? '' : String(value);
+    return text.length > TRUNCATE ? text.slice(0, TRUNCATE) + '…' : text;
+  }
+
+  function fmtInt(value) {
+    var n = Number(value);
+    if (!isFinite(n)) { n = 0; }
+    return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  function fmtUsd(value) {
+    var n = Number(value);
+    if (!isFinite(n)) { n = 0; }
+    // 小额四位小数：$0.00 会让"确实花了钱"看起来像"没花钱"。
+    return n > 0 && n < 0.01 ? '$' + n.toFixed(4) : '$' + n.toFixed(2);
+  }
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  function clockNow() {
+    var d = new Date();
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
+  function fmtStamp(value) {
+    if (!value) { return ''; }
+    var d = new Date(value);
+    if (isNaN(d.getTime())) { return String(value); }
+    return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' +
+      pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
+  function f1(n) { return Number(n).toFixed(1); }
+
+  function purposeColor(purpose) {
+    return has(PURPOSE_COLORS, purpose) ? PURPOSE_COLORS[purpose] : FALLBACK_COLOR;
+  }
+
+  function badge(text, kind) { return el('span', 'badge ' + kind, text); }
+
+  function emptyNote(text) { return el('div', 'empty', text || '暂无数据'); }
+
+  function statTile(label, value, hero) {
+    var tile = el('div', hero ? 'stat hero' : 'stat');
+    tile.appendChild(el('div', 'stat-label', label));
+    tile.appendChild(el('div', 'stat-value', value));
+    return tile;
+  }
+
+  function setNote(id, text) {
+    var node = document.getElementById(id);
+    if (text) { node.textContent = text; node.hidden = false; }
+    else { node.textContent = ''; node.hidden = true; }
+  }
+
+  /** 单元格可以是字符串，也可以是已经建好的节点（徽标）。字符串走 textContent。 */
+  function buildTable(headers, rows) {
+    var table = el('table');
+    var headRow = el('tr');
+    headers.forEach(function (header) { headRow.appendChild(el('th', null, header)); });
+    var thead = el('thead');
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = el('tbody');
+    rows.forEach(function (cells) {
+      var row = el('tr');
+      cells.forEach(function (cell) {
+        var td = el('td');
+        if (cell && cell.nodeType === 1) { td.appendChild(cell); }
+        else { td.textContent = cell === null || cell === undefined ? '' : String(cell); }
+        row.appendChild(td);
+      });
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    return table;
+  }
+
+  // ------------------------------------------------------------ 取数
+
+  function api(path) {
+    return fetch(path, { headers: { Accept: 'application/json' } }).then(function (res) {
+      if (!res.ok) { throw new Error(path + ' 返回 HTTP ' + res.status); }
+      return res.json();
+    });
+  }
+
+  function showError(message) {
+    var bar = document.getElementById('error');
+    bar.textContent = message;
+    bar.hidden = false;
+  }
+
+  function clearError() {
+    var bar = document.getElementById('error');
+    bar.textContent = '';
+    bar.hidden = true;
+  }
+
+  // ------------------------------------------------------------ 图表
+
+  function niceMax(value) {
+    if (!(value > 0)) { return 1; }
+    var step = Math.pow(10, String(Math.round(value)).length - 1);
+    return Math.ceil(value / step) * step;
+  }
+
+  /** 顶部圆角、底部方角：柱子从基线长出来，底边必须是直的。 */
+  function topRoundedPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h);
+    return 'M' + f1(x) + ',' + f1(y + h) +
+      ' V' + f1(y + r) + ' Q' + f1(x) + ',' + f1(y) + ' ' + f1(x + r) + ',' + f1(y) +
+      ' H' + f1(x + w - r) + ' Q' + f1(x + w) + ',' + f1(y) + ' ' + f1(x + w) + ',' + f1(y + r) +
+      ' V' + f1(y + h) + ' Z';
+  }
+
+  function gridLine(x1, x2, y) {
+    return '<line x1="' + f1(x1) + '" y1="' + f1(y) + '" x2="' + f1(x2) + '" y2="' + f1(y) +
+      '" stroke="' + GRID + '" stroke-width="1"/>';
+  }
+
+  function tickText(x, y, text) {
+    return '<text x="' + f1(x) + '" y="' + f1(y) + '" text-anchor="end" font-size="11" fill="' +
+      INK_MUTED + '">' + esc(text) + '</text>';
+  }
+
+  var BAR = { PAD_L: 66, PAD_R: 20, PAD_T: 24, PAD_B: 44, PLOT_H: 230, SLOT: 58, W: 20, GAP: 2 };
+
+  function renderCostChart(agg) {
+    var host = document.getElementById('costs-chart');
+    clear(host);
+    var days = agg.days || [];
+    var byDay = agg.by_day || {};
+    var purposes = agg.purposes || [];
+    if (!days.length) { host.appendChild(emptyNote()); return; }
+
+    var dayTotals = {};
+    days.forEach(function (day) {
+      var bucket = byDay[day] || {};
+      var sum = 0;
+      Object.keys(bucket).forEach(function (purpose) { sum += Number(bucket[purpose].tokens) || 0; });
+      dayTotals[day] = sum;
+    });
+    var peak = 0;
+    days.forEach(function (day) { if (dayTotals[day] > peak) { peak = dayTotals[day]; } });
+    var yMax = niceMax(peak);
+
+    var width = BAR.PAD_L + BAR.SLOT * days.length + BAR.PAD_R;
+    var height = BAR.PAD_T + BAR.PLOT_H + BAR.PAD_B;
+    var baseY = BAR.PAD_T + BAR.PLOT_H;
+
+    // 一根 y 轴，只画 tokens。金额是另一个尺度，只出现在上面的 stat 里，绝不
+    // 叠成第二根轴。
+    var parts = ['<svg width="' + width + '" height="' + height +
+      '" role="img" aria-label="按日 tokens，按 purpose 堆叠">'];
+    for (var i = 0; i <= 4; i++) {
+      var gy = baseY - BAR.PLOT_H * i / 4;
+      parts.push(gridLine(BAR.PAD_L, width - BAR.PAD_R, gy));
+      parts.push(tickText(BAR.PAD_L - 10, gy + 4, fmtInt(yMax * i / 4)));
+    }
+
+    days.forEach(function (day, index) {
+      var slotX = BAR.PAD_L + BAR.SLOT * index;
+      var x = slotX + (BAR.SLOT - BAR.W) / 2;
+      var bucket = byDay[day] || {};
+      var present = purposes.filter(function (purpose) {
+        return bucket[purpose] && Number(bucket[purpose].tokens) > 0;
+      });
+      var cursor = baseY;
+      present.forEach(function (purpose, order) {
+        var tokens = Number(bucket[purpose].tokens);
+        var fullH = BAR.PLOT_H * tokens / yMax;
+        var isTop = order === present.length - 1;
+        var y = cursor - fullH;
+        // 2px 间隔从段**顶部**让出，不从底部裁：每段底边必须贴住下面一段，最底
+        // 那段贴住基线。从底部裁会让整根柱子浮在轴上方（这个坑踩过一次）。
+        var drawY = isTop ? y : y + BAR.GAP;
+        var drawH = Math.max(cursor - drawY, 0.5);
+        var share = dayTotals[day] ? Math.round(tokens / dayTotals[day] * 100) : 0;
+        var label = purpose + ' · ' + fmtInt(tokens) + ' tokens · ' + share + '%';
+        var tag = isTop ? 'path' : 'rect';
+        var shape = isTop
+          ? '<path d="' + topRoundedPath(x, drawY, BAR.W, drawH, 4) + '"'
+          : '<rect x="' + f1(x) + '" y="' + f1(drawY) + '" width="' + BAR.W +
+            '" height="' + f1(drawH) + '"';
+        parts.push(shape + ' fill="' + purposeColor(purpose) + '"><title>' + esc(label) +
+          '</title></' + tag + '>');
+        cursor -= fullH;
+      });
+
+      // 柱顶直接标当日总量；日期在轴下。
+      parts.push('<text x="' + f1(slotX + BAR.SLOT / 2) + '" y="' +
+        f1(baseY - BAR.PLOT_H * dayTotals[day] / yMax - 8) +
+        '" text-anchor="middle" font-size="11" fill="' + INK + '">' +
+        esc(fmtInt(dayTotals[day])) + '</text>');
+      parts.push('<text x="' + f1(slotX + BAR.SLOT / 2) + '" y="' + (baseY + 18) +
+        '" text-anchor="middle" font-size="11" fill="' + INK_MUTED + '">' +
+        esc(String(day).slice(5)) + '</text>');
+    });
+
+    parts.push('<line x1="' + BAR.PAD_L + '" y1="' + baseY + '" x2="' + (width - BAR.PAD_R) +
+      '" y2="' + baseY + '" stroke="' + AXIS + '" stroke-width="1"/>');
+    parts.push('</svg>');
+    // 拼串是手写 SVG 的代价；上面每个动态片段都过了 esc()，没有裸插入。
+    host.innerHTML = parts.join('');
+  }
+
+  function renderCostLegend(purposes) {
+    var host = document.getElementById('costs-legend');
+    clear(host);
+    purposes.forEach(function (purpose) {
+      var item = el('span', 'legend-item');
+      var swatch = el('span', 'swatch');
+      swatch.style.background = purposeColor(purpose);
+      item.appendChild(swatch);
+      item.appendChild(document.createTextNode(String(purpose)));
+      host.appendChild(item);
+    });
+  }
+
+  var LINE = { PAD_L: 44, PAD_R: 46, PAD_T: 14, PAD_B: 26, PLOT_H: 110, STEP: 40 };
+
+  /**
+   * 单系列折线小图。单系列不配图例（figcaption 已经说了画的是什么），
+   * 只在末点直接标值——每个点都标就没人读了。
+   */
+  function renderLineChart(hostId, label, values, yMax, format) {
+    var host = document.getElementById(hostId);
+    clear(host);
+    var points = [];
+    values.forEach(function (value, index) {
+      if (value !== null && value !== undefined && isFinite(value)) {
+        points.push({ index: index, value: Number(value) });
+      }
+    });
+    if (!points.length) { host.appendChild(emptyNote()); return; }
+
+    var count = values.length;
+    var plotW = Math.max((count - 1) * LINE.STEP, LINE.STEP);
+    var width = LINE.PAD_L + plotW + LINE.PAD_R;
+    var height = LINE.PAD_T + LINE.PLOT_H + LINE.PAD_B;
+    var baseY = LINE.PAD_T + LINE.PLOT_H;
+
+    function px(index) {
+      return count > 1 ? LINE.PAD_L + plotW * index / (count - 1) : LINE.PAD_L + plotW / 2;
+    }
+    function py(value) {
+      return baseY - LINE.PLOT_H * Math.max(Math.min(value, yMax), 0) / yMax;
+    }
+
+    var parts = ['<svg width="' + width + '" height="' + height + '" role="img" aria-label="' +
+      esc(label) + '">'];
+    for (var i = 0; i <= 2; i++) {
+      var gy = baseY - LINE.PLOT_H * i / 2;
+      parts.push(gridLine(LINE.PAD_L, width - LINE.PAD_R, gy));
+      parts.push(tickText(LINE.PAD_L - 8, gy + 4, format(yMax * i / 2)));
+    }
+
+    var d = points.map(function (point, order) {
+      return (order ? 'L' : 'M') + f1(px(point.index)) + ',' + f1(py(point.value));
+    }).join(' ');
+    parts.push('<path d="' + d + '" fill="none" stroke="' + PURPOSE_COLORS.decide +
+      '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>');
+
+    points.forEach(function (point) {
+      // 2px 底色圆环，点重叠时也认得出是两个点。
+      parts.push('<circle cx="' + f1(px(point.index)) + '" cy="' + f1(py(point.value)) +
+        '" r="4" fill="' + PURPOSE_COLORS.decide + '" stroke="' + SURFACE +
+        '" stroke-width="2"><title>' + esc('第 ' + (point.index + 1) + ' 次 · ' +
+        format(point.value)) + '</title></circle>');
+    });
+
+    var last = points[points.length - 1];
+    parts.push('<text x="' + f1(px(last.index) + 10) + '" y="' + f1(py(last.value) + 4) +
+      '" font-size="11" fill="' + INK + '">' + esc(format(last.value)) + '</text>');
+    parts.push('<line x1="' + LINE.PAD_L + '" y1="' + baseY + '" x2="' + (width - LINE.PAD_R) +
+      '" y2="' + baseY + '" stroke="' + AXIS + '" stroke-width="1"/>');
+    parts.push('</svg>');
+    host.innerHTML = parts.join('');
+  }
+
+  // ------------------------------------------------------------ 回合
+
+  function renderTurns(data) {
+    setNote('turns-skipped', data.skipped_lines > 0
+      ? '跳过 ' + data.skipped_lines + ' 行损坏数据' : '');
+
+    var host = document.getElementById('turns-body');
+    clear(host);
+    var turns = data.turns || [];
+    if (!turns.length) { host.appendChild(emptyNote()); return; }
+
+    var rows = turns.map(function (turn) {
+      var owner = turn.platform && turn.user_id
+        ? turn.platform + ':' + turn.user_id
+        : (turn.user_id || '');
+      var input = turn.input_text !== null && turn.input_text !== undefined
+        ? turn.input_text : turn.input_filename;
+      var output = turn.output_text !== null && turn.output_text !== undefined
+        ? turn.output_text : turn.output_filename;
+      return [
+        fmtStamp(turn.timestamp),
+        owner,
+        turn.record_type || '',
+        trunc(input),
+        trunc(output),
+        turn.duration_ms === null || turn.duration_ms === undefined
+          ? '' : fmtInt(turn.duration_ms),
+        badge(turn.success ? '成功' : '失败', turn.success ? 'ok' : 'bad'),
+        turn.run_id || ''
+      ];
+    });
+    host.appendChild(buildTable(
+      ['时间', '用户', '类型', '输入', '输出', '耗时 ms', '结果', 'run_id'], rows));
+  }
+
+  // ------------------------------------------------------------ 成本
+
+  function renderCosts(data) {
+    var agg = data.aggregate || {};
+    var totals = agg.totals || {};
+
+    var stats = document.getElementById('costs-stats');
+    clear(stats);
+    stats.appendChild(statTile('估算金额', fmtUsd(totals.cost_usd), true));
+    stats.appendChild(statTile('总调用', fmtInt(totals.calls)));
+    stats.appendChild(statTile('总 TOKENS', fmtInt(totals.tokens)));
+
+    document.getElementById('costs-disclaimer').textContent = data.disclaimer || '';
+    setNote('costs-unknown', agg.unknown_token_calls
+      ? '其中 ' + agg.unknown_token_calls + ' 次调用没拿到 usage，token 与金额未计入'
+      : '');
+    setNote('costs-skipped', data.skipped_lines > 0
+      ? '跳过 ' + data.skipped_lines + ' 行损坏数据' : '');
+
+    renderCostLegend(agg.purposes || []);
+    renderCostChart(agg);
+  }
+
+  // ------------------------------------------------------------ 记忆
+
+  function memoryCard(user) {
+    var card = el('section', 'card');
+    var head = el('div', 'card-head');
+    head.appendChild(el('h3', null, user.platform ? user.platform + ':' + user.user_id
+      : String(user.user_id || '')));
+    if (user.pending_compaction) {
+      head.appendChild(badge('待压缩 ' + user.pending_compaction + ' 条', 'neutral'));
+    }
+    card.appendChild(head);
+
+    var profile = user.profile || {};
+    card.appendChild(buildTable(['档案字段', '值'], PROFILE_FIELDS.map(function (field) {
+      var value = has(profile, field[0]) ? profile[field[0]] : null;
+      return [field[1], value === null || value === undefined || value === '' ? '—' : String(value)];
+    })));
+
+    var summary = user.summary || [];
+    card.appendChild(el('h4', 'card-sub', '会话摘要（' + summary.length + ' 条）'));
+    if (!summary.length) {
+      card.appendChild(emptyNote());
+      return card;
+    }
+    var list = el('ul', 'summary');
+    summary.forEach(function (entry) {
+      var item = el('li');
+      var fact = entry && typeof entry === 'object' ? entry.fact : entry;
+      item.appendChild(el('div', 'fact', fact === null || fact === undefined ? '' : fact));
+      if (entry && typeof entry === 'object' && entry.evidence) {
+        item.appendChild(el('div', 'evidence', '原文：' + entry.evidence));
+      }
+      list.appendChild(item);
+    });
+    card.appendChild(list);
+    return card;
+  }
+
+  function renderMemory(data) {
+    var bar = document.getElementById('memory-error');
+    if (data.checkpoint_error) {
+      bar.textContent = '读取会话 checkpoint 失败：' + data.checkpoint_error;
+      bar.hidden = false;
+    } else {
+      bar.textContent = '';
+      bar.hidden = true;
+    }
+
+    var host = document.getElementById('memory-body');
+    clear(host);
+    var users = data.users || [];
+    if (!users.length) { host.appendChild(emptyNote()); return; }
+    users.forEach(function (user) { host.appendChild(memoryCard(user)); });
+  }
+
+  // ------------------------------------------------------------ Eval
+
+  var openedReport = null;   // 当前展开的报告文件名
+  var openedPayload = null;  // 它的完整报告；轮询期间保留，避免闪成"加载中"
+
+  function passRate(report) {
+    var summary = report.summary || {};
+    var total = Number(summary.total) || 0;
+    return total ? Number(summary.passed || 0) / total * 100 : null;
+  }
+
+  function clarityAvg(report) {
+    var summary = report.summary || {};
+    return summary.judge_clarity_avg === null || summary.judge_clarity_avg === undefined
+      ? null : Number(summary.judge_clarity_avg);
+  }
+
+  function statusBadge(status) {
+    var text = status === null || status === undefined ? '—' : String(status);
+    var kind = text === 'PASSED' ? 'ok' : (text === '—' ? 'neutral' : 'bad');
+    return badge(text, kind);
+  }
+
+  function renderEvalTable(reports) {
+    var host = document.getElementById('evals-body');
+    clear(host);
+    if (!reports.length) { host.appendChild(emptyNote()); return; }
+
+    var table = el('table');
+    var headRow = el('tr');
+    ['报告', '状态', 'mode', '通过 · 失败', 'clarity 均值'].forEach(function (header) {
+      headRow.appendChild(el('th', null, header));
+    });
+    var thead = el('thead');
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = el('tbody');
+    reports.forEach(function (report) {
+      var summary = report.summary || {};
+      var clarity = clarityAvg(report);
+      var row = el('tr', openedReport === report.name ? 'clickable open' : 'clickable');
+      var cells = [
+        el('td', null, report.name),
+        el('td'),
+        el('td', null, report.mode || '—'),
+        el('td', null, (summary.passed || 0) + ' · ' + (summary.failed || 0)),
+        el('td', null, clarity === null ? '—' : clarity.toFixed(2))
+      ];
+      cells[1].appendChild(statusBadge(report.status));
+      cells.forEach(function (cell) { row.appendChild(cell); });
+      row.addEventListener('click', function () { toggleReport(report.name); });
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    host.appendChild(table);
+  }
+
+  function renderEvalDetail() {
+    var host = document.getElementById('evals-detail');
+    clear(host);
+    if (!openedReport) { return; }
+    host.appendChild(el('h2', null, openedReport + ' 逐样本结果'));
+    if (!openedPayload) { host.appendChild(emptyNote('加载中…')); return; }
+
+    var cases = openedPayload.case_results || [];
+    if (!cases.length) { host.appendChild(emptyNote()); return; }
+    var rows = cases.map(function (item) {
+      var failures = item.failures || [];
+      return [
+        item.case_id || '',
+        badge(item.passed ? '通过' : '未通过', item.passed ? 'ok' : 'bad'),
+        failures.length ? trunc(failures.join('；')) : '—',
+        item.judge && item.judge.clarity !== null && item.judge.clarity !== undefined
+          ? String(item.judge.clarity) : '—'
+      ];
+    });
+    host.appendChild(buildTable(['case_id', '结果', '失败摘要', 'judge clarity'], rows));
+  }
+
+  function toggleReport(name) {
+    if (openedReport === name) {
+      openedReport = null;
+      openedPayload = null;
+      renderEvalDetail();
+      refresh();
+      return;
+    }
+    openedReport = name;
+    openedPayload = null;
+    renderEvalDetail();
+    loadOpenedReport();
+    refresh();
+  }
+
+  function loadOpenedReport() {
+    if (!openedReport) { return Promise.resolve(); }
+    var name = openedReport;
+    return api('/api/evals/' + encodeURIComponent(name)).then(function (payload) {
+      // 请求飞在天上时用户可能已经点了别的一行，回来要先确认还是同一份。
+      if (openedReport !== name) { return; }
+      openedPayload = payload;
+      renderEvalDetail();
+    });
+  }
+
+  function renderEvals(data) {
+    setNote('evals-skipped', data.skipped_files > 0
+      ? '跳过 ' + data.skipped_files + ' 份损坏报告' : '');
+
+    var reports = data.reports || [];
+    // 接口按时间倒序（最新在前）；折线的 x 是运行先后，所以画之前要反过来。
+    var ordered = reports.slice().reverse();
+    renderLineChart('evals-pass-chart', '通过率随运行序',
+      ordered.map(passRate), 100, function (value) {
+        return Math.round(value) + '%';
+      });
+    renderLineChart('evals-clarity-chart', 'judge clarity 均值随运行序',
+      ordered.map(clarityAvg), 5, function (value) {
+        return Number(value).toFixed(1);
+      });
+
+    renderEvalTable(reports);
+    renderEvalDetail();
+  }
+
+  // ------------------------------------------------------------ 轮询与切页
+
+  // 筛选条件存在这里，不是每次轮询去读输入框：读输入框的话，用户打字打到一半
+  // 定时器就会拿着半个 user_id 去过滤，表格自己跳掉。
+  var turnFilter = { user: '', limit: '50' };
+
+  var LOADERS = {
+    turns: function () {
+      var query = '/api/turns?limit=' + encodeURIComponent(turnFilter.limit);
+      if (turnFilter.user) { query += '&user=' + encodeURIComponent(turnFilter.user); }
+      return api(query).then(renderTurns);
+    },
+    costs: function () { return api('/api/costs?days=7').then(renderCosts); },
+    memory: function () { return api('/api/memory').then(renderMemory); },
+    evals: function () {
+      return api('/api/evals').then(renderEvals).then(loadOpenedReport);
+    }
+  };
+
+  var currentTab = 'turns';
+
+  // 只刷当前 tab：四个端点一起刷等于每 10 秒把 bot 的日志文件全读一遍。
+  function refresh() {
+    LOADERS[currentTab]().then(function () {
+      clearError();
+      document.getElementById('refreshed').textContent = '最后刷新 ' + clockNow();
+    }).catch(function (error) {
+      // fetch 是真正的系统边界：服务停了、端点 500 了，页内飘一条错误条，
+      // 已经画出来的数据留在原地——白屏是最没用的失败方式。
+      showError('刷新失败：' + (error && error.message ? error.message : error));
+    });
+  }
+
+  document.querySelectorAll('.tab').forEach(function (button) {
+    button.addEventListener('click', function () {
+      currentTab = button.getAttribute('data-tab');
+      document.querySelectorAll('.tab').forEach(function (other) {
+        other.classList.toggle('active', other === button);
+      });
+      document.querySelectorAll('.panel').forEach(function (panel) {
+        panel.hidden = panel.id !== 'panel-' + currentTab;
+      });
+      refresh();
+    });
+  });
+
+  document.getElementById('turn-user').addEventListener('change', function (event) {
+    turnFilter.user = event.target.value.trim();
+    refresh();
+  });
+  document.getElementById('turn-limit').addEventListener('change', function (event) {
+    turnFilter.limit = event.target.value;
+    refresh();
+  });
+
+  refresh();
+  setInterval(refresh, POLL_MS);
+})();
+</script>
+</body>
+</html>
