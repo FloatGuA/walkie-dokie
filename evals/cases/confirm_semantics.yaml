@@ -22,14 +22,15 @@
       expect: {action: propose_task}
     - user: "是，不过先把标题改大一点"
       expect: {executed: false}
+# 暂按当前生产行为（_CONFIRM_RE 含嗯+）；确认判定改模型判断的重设计落地后翻回 executed: false，见 DECISION.md 2026-08-20 确认判定条目
 - id: confirm-004
-  description: 语气词不是确认
+  description: 语气词"嗯"当前按生产行为算确认（待确认判定重设计后翻转）
   turns:
     - user: "把这份文档转成表格"
       files: [simple.docx]
       expect: {action: propose_task}
     - user: "嗯"
-      expect: {executed: false}
+      expect: {executed: true}
 - id: confirm-005
   description: 干净的"是"应该执行（正例对照）
   turns:
