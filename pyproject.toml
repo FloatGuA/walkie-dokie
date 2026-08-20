@@ -12,6 +12,7 @@ dependencies = [
     "lark-oapi",
     "python-docx",
     "openpyxl",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
