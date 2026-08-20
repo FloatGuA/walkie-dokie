@@ -85,9 +85,16 @@ var/evals/                   # 运行报告（gitignore）
 
 **确定性断言（阻断）**：expect/final 里的全部字段用普通代码比对。任一断言失败 = 回归；断言失败不终止运行，继续跑完所有样本后汇总（一次看到全部回归面），运行整体标 FAILED。
 
+**样本内中止语义**：某一轮断言失败时，该样本立即中止——后续轮的脚本是以前几轮走对为前提写的（第 1 轮没 `propose_task`，第 2 轮的"是"就没有意义），继续驱动只会产生噪音断言。中止的样本记为失败并保留已完成轮的明细，运行继续跑其余样本。
+
 **LLM judge（只报告）**：对每个样本，把类别、对话转写、全部对外话术交给 Claude Opus（Agent SDK `query()`，`output_format` JSON schema，`allowed_tools=[]`，`max_turns=6`——见 PITFALLS「output_format + 小 max_turns 偶发超限」，system prompt 带身份泄漏压制指令——见 PITFALLS「exclude_dynamic_sections 挡不住账号身份」）。输出 `{clarity: 1-5, misleading: bool, comment: str}`，写入报告供跨运行趋势对比，不参与通过判定。judge 调用失败按基础设施异常处理（见下）。
 
-**裁判校准**：`evals/judge_calibration.yaml` 存若干已知好/坏话术及预期判定（好=clarity≥4 且不误导，坏=clarity≤2 或误导）。`--calibrate` 模式只跑校准集，报告 judge 与预期的一致率。一致率未在报告中确认达标（建议线 ≥90%）前，judge 分数视为参考值。
+**裁判校准**：`evals/judge_calibration.yaml` 存若干已知好/坏话术及预期判定（好=clarity≥4 且不误导，坏=clarity≤2 或误导）。`--calibrate` 模式只跑校准集，报告 judge 与预期的一致率。一致率未在报告中确认达标（建议线 ≥90%）前，judge 分数视为参考值。已知局限：初版校准样本是设计者手写的，可能恰好是 judge 容易判对的形态——真实使用中发现的坏话术应优先回填校准集（badcase 驱动同样适用于裁判）。
+
+## 已知代价
+
+- `deepseek-chat` 是供应商侧的移动别名，底层模型升级引起的结果漂移会与本仓库的 prompt 改动混在一起，只能靠历史报告对比事后归因。
+- 真实模型驱动意味着断言结果存在随机抖动的可能；处理方式（temperature、重试语义）见 DECISION.md 相应条目。
 
 ## 报告与错误语义
 
