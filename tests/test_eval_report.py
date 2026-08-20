@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from walkie_dokie.evals.checks import TurnObservation
 from walkie_dokie.evals.driver import CaseResult
 from walkie_dokie.evals.report import build_report, write_report
@@ -37,6 +39,19 @@ def test_build_report_summarizes_and_serializes(tmp_path):
     assert data["status"] == "FAILED"
     assert data["case_results"][1]["failures"]
     assert path.name.endswith("Z.json")
+
+
+def test_judge_dict_without_clarity_fails_fast():
+    """judge 契约固化后缺 clarity 属于 harness 坏了，不能悄悄从均值里漏掉。"""
+
+    with pytest.raises(KeyError):
+        build_report(
+            "regression",
+            "PASSED",
+            [_case(True, judge={"misleading": False})],
+            deepseek_model="deepseek-chat",
+            judge_model="opus",
+        )
 
 
 def test_infra_failure_keeps_error_and_partial_results(tmp_path):

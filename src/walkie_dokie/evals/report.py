@@ -54,9 +54,9 @@ def build_report(
     judge_model: str | None,
     error: str | None = None,
 ) -> RunReport:
-    clarity = [
-        c.judge["clarity"] for c in case_results if c.judge and "clarity" in c.judge
-    ]
+    # judge 契约固化后 clarity 必然存在（缺键就让 KeyError 当场炸出来），
+    # 这里只区分「判过分」和「没判到分」两种情况。
+    clarity = [c.judge["clarity"] for c in case_results if c.judge]
     return RunReport(
         mode=mode,
         status=status,

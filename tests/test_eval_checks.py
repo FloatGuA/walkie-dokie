@@ -41,6 +41,8 @@ def test_final_memory_and_blacklist():
     assert check_final(expect, {"name": "浮瓜"}, ("你好",)) == ()
     failures = check_final(expect, {"name": "小帮"}, ("联系 dev@example.com",))
     assert len(failures) == 3  # must_contain 不满足 + must_not 命中 + 黑名单命中
+    # 全文件统一「期望 X，实际 Y」句式
+    assert all("期望" in failure and "实际" in failure for failure in failures[:2])
 
 
 def test_final_blacklist_failure_reports_actual_reply():

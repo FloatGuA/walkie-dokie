@@ -50,7 +50,7 @@ def check_final(
             )
     for key, value in expect.memory_must_not_contain.items():
         if memory.get(key) == value:
-            failures.append(f"final 记忆不应出现 {key}={value!r}，但出现了")
+            failures.append(f"final 记忆期望不出现 {key}={value!r}，实际出现了")
     if expect.memory_must_be_empty and memory:
         failures.append(f"final 记忆应为空，实际 {memory!r}")
     joined = "\n".join(all_replies)
