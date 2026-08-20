@@ -270,6 +270,25 @@ def test_negated_or_question_delete_is_rejected(tmp_path, source):
     assert repository.load("test", "u1") == {"name": "张三"}
 
 
+def test_delete_phrased_as_shan_diao_is_applied(tmp_path):
+    repository = JsonMemoryRepository(tmp_path)
+    repository.apply(
+        "test",
+        "u1",
+        (MemoryOperation("set", "name", "张三", "我叫张三"),),
+        source_text="我叫张三",
+    )
+    source = "刚才说错了，把我的名字删掉吧"
+    changes = repository.apply(
+        "test",
+        "u1",
+        (MemoryOperation("delete", "name", None, "把我的名字删掉"),),
+        source_text=source,
+    )
+    assert [change["action"] for change in changes] == ["delete"]
+    assert repository.load("test", "u1") == {}
+
+
 def test_corrupt_profile_is_never_overwritten_by_apply(tmp_path):
     path = tmp_path / "test_u1.json"
     path.write_text("{not json", encoding="utf-8")

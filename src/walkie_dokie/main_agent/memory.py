@@ -49,7 +49,9 @@ def _legacy_safe_key_part(value: str) -> str:
     return _SAFE_KEY_RE.sub("_", value).strip("._") or "unknown"
 
 
-_DELETE_TERMS = re.compile(r"忘记|删除|清除|别记|不要记|forget|delete|remove", re.I)
+_DELETE_TERMS = re.compile(
+    r"忘记|删除|删掉|清除|别记|不要记|forget|delete|remove", re.I
+)
 _FIELD_DELETE_TERMS = {
     "name": re.compile(r"姓名|名字|name", re.I),
     "department": re.compile(r"部门|department", re.I),
