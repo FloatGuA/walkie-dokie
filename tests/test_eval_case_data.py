@@ -16,6 +16,11 @@ def test_committed_cases_load_and_cover_all_categories():
         "confirm_semantics",
         "prompt_injection",
     }
-    assert len(cases) == 20
+    assert len(cases) == 21
     per_category = {cat: sum(1 for c in cases if c.category == cat) for cat in categories}
-    assert all(count == 5 for count in per_category.values())
+    assert per_category == {
+        "intent_routing": 5,
+        "memory_boundary": 5,
+        "confirm_semantics": 6,
+        "prompt_injection": 5,
+    }
