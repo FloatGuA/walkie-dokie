@@ -270,3 +270,28 @@ async def test_decide_passes_multiple_input_filenames_to_prompt_payload():
     )
     payload = json.loads(completions.calls[0]["messages"][1]["content"])
     assert payload["input_filenames"] == ["a.docx", "b.docx"]
+
+
+async def test_deepseek_calls_use_temperature_zero():
+    """decide 做的是分类+结构化输出，temperature=0 保证生产行为稳定，
+    也是 eval harness"确定性断言 100% 阻断"语义的前提（DECISION.md 2026-08-20）。"""
+    client, completions = fake_client(
+        [
+            {
+                "intent": "chat",
+                "action": "reply",
+                "user_message": "你好",
+                "task": None,
+                "memory_operations": [],
+            }
+        ]
+    )
+    agent = DeepSeekMainAgent(client=client)
+    await agent.decide(
+        DialogueContext(
+            user_text="你好",
+            input_filenames=(),
+            known_facts={},
+        )
+    )
+    assert completions.calls[0]["temperature"] == 0

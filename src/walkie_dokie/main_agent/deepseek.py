@@ -90,6 +90,7 @@ class DeepSeekMainAgent(MainAgent):
             ],
             response_format={"type": "json_object"},
             max_tokens=1200,
+            temperature=0,
         )
         content = response.choices[0].message.content
         parsed = json.loads(content)
