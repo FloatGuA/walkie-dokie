@@ -74,8 +74,15 @@ _EXECUTION_MARKER = "execution-report.json"
 _EXECUTION_STARTED_MARKER = "execution-started.json"
 
 _CONFIRM_RE = re.compile(
-    r"^(?:是(?:的)?(?:呀|啊|呢)?|对(?:的)?(?:呀|啊|呢)?|确认|没错|可以|行|"
-    r"嗯+|好(?:的)?(?:呀|啊|呢)?|ok(?:ay)?|yes|y)[\s!！。．.]*$",
+    # 收紧版白名单：只收零歧义确认词，语气词（嗯/好/行/可以/对/ok）一律进灰区
+    # 交 judge_confirmation 判（spec 决策 3）。
+    r"^(?:是(?:的)?|确认|没错|yes|y)[\s!！。．.]*$",
+    re.IGNORECASE,
+)
+_NEGATION_RE = re.compile(
+    # 否定词硬否决层：命中即不得进 execute，模型无权推翻（spec 决策 2）。
+    # 宁宽勿漏——“不错”被误伤只是多澄清一轮，安全方向。
+    r"不|别|先|等|算了|慢|暂|停|取消|改|换|回头|以后|no|wait|cancel|hold",
     re.IGNORECASE,
 )
 _MEMORY_CONFIRM_RE = re.compile(
@@ -94,13 +101,18 @@ _MEMORY_PERSISTENCE_CLAIM_RE = re.compile(
 
 
 def _is_confirmation(reply: str) -> bool:
-    """只接受一条完整、无附加条件的肯定回复。
+    """三层确认判定的第一层：零歧义白名单快路径（零延迟、不调模型）。
 
-    旧实现用正向前缀匹配，会把“好像不对”“可以先别做”和“是，不过先改……”
-    都误判为确认。这里宁可多澄清一轮，也不带着未处理的否定/补充直接执行。
+    只认完整、无附加条件、语义无歧义的肯定回复。语气歧义词（嗯/好的/行/
+    可以/对/ok）一律不在这层放行，留给灰区的模型判定去理解上下文。
     """
 
     return bool(_CONFIRM_RE.fullmatch(reply.strip()))
+
+
+def _is_negation(reply: str) -> bool:
+    """确定性否定信号：搜索命中即硬否决，绝不进 execute。"""
+    return bool(_NEGATION_RE.search(reply.strip()))
 
 
 def _remove_unverified_memory_claim(

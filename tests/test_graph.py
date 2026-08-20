@@ -19,7 +19,7 @@ from walkie_dokie.main_agent.base import (
 )
 from walkie_dokie.main_agent.memory import JsonMemoryRepository
 from walkie_dokie.orchestrator import build_graph
-from walkie_dokie.orchestrator.graph import _is_confirmation
+from walkie_dokie.orchestrator.graph import _is_confirmation, _is_negation
 from walkie_dokie.platforms.base import IncomingFile
 
 
@@ -932,10 +932,20 @@ async def test_execute_produces_multiple_artifacts_in_result(tmp_path):
     [
         ("是", True),
         ("是的", True),
-        ("好的呢", True),
         ("确认", True),
+        ("没错", True),
         ("Yes", True),
-        ("ok", True),
+        ("y", True),
+        ("是。", True),
+        # 语气歧义词移出白名单，进灰区交模型（spec 决策 3）
+        ("嗯", False),
+        ("好的", False),
+        ("好的呢", False),
+        ("行", False),
+        ("可以", False),
+        ("ok", False),
+        ("对", False),
+        # 原有反例保持
         ("不是", False),
         ("好像不对", False),
         ("可以先别做", False),
@@ -946,3 +956,29 @@ async def test_execute_produces_multiple_artifacts_in_result(tmp_path):
 )
 def test_confirmation_requires_unambiguous_whole_reply(reply, expected):
     assert _is_confirmation(reply) is expected
+
+
+@pytest.mark.parametrize(
+    "reply,expected",
+    [
+        ("好像不对", True),
+        ("可以先别做", True),
+        ("是，不过先改一下", True),
+        ("算了", True),
+        ("等等", True),
+        ("先不用了", True),
+        ("暂时不弄", True),
+        ("取消吧", True),
+        ("换个格式", True),
+        ("no", True),
+        # 宁宽勿漏的已知误伤（安全方向：只是多澄清一轮）
+        ("不错，就这样", True),
+        # 不含否定信号的灰区词不在这层拦
+        ("嗯", False),
+        ("好的", False),
+        ("应该行吧", False),
+        ("", False),
+    ],
+)
+def test_negation_words_are_hard_vetoed(reply, expected):
+    assert _is_negation(reply) is expected
