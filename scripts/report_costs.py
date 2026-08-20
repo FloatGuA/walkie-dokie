@@ -49,7 +49,7 @@ _INK_MUTED = "#6b6a63"
 _SURFACE = "#fcfcfb"
 
 
-def estimate_cost_cny(provider: str, prompt_tokens: int, completion_tokens: int) -> float:
+def estimate_cost_usd(provider: str, prompt_tokens: int, completion_tokens: int) -> float:
     """按 token 估算金额。
 
     只有 DeepSeek 是按 token 计费的；claude-cli 走的是订阅制账号，token 数有
@@ -128,13 +128,13 @@ def aggregate(records, days: int, *, now: datetime | None = None) -> dict:
             by_owner[owner] = _blank_stats()
         _add(by_owner[owner], prompt_tokens, completion_tokens)
 
-        cost = estimate_cost_cny(item["provider"], prompt_tokens, completion_tokens)
+        cost = estimate_cost_usd(item["provider"], prompt_tokens, completion_tokens)
         owner_cost[owner] += cost
         total_cost += cost
         _add(totals, prompt_tokens, completion_tokens)
 
     user_rows = [
-        {"owner": owner, "cost_cny": owner_cost[owner], **stats}
+        {"owner": owner, "cost_usd": owner_cost[owner], **stats}
         for owner, stats in by_owner.items()
     ]
     # unknown 永远排最后：它不是某个用户，跟真实用户混在一起排会误导。
@@ -145,7 +145,7 @@ def aggregate(records, days: int, *, now: datetime | None = None) -> dict:
         "by_day": dict(by_day),
         "by_user": user_rows,
         "purposes": list(PURPOSES) + extra_purposes,
-        "totals": {**totals, "cost_cny": total_cost},
+        "totals": {**totals, "cost_usd": total_cost},
         "unknown_token_calls": unknown_token_calls,
     }
 
@@ -164,7 +164,7 @@ def _fmt_int(value: int) -> str:
     return f"{value:,}"
 
 
-def _fmt_cny(value: float) -> str:
+def _fmt_usd(value: float) -> str:
     return f"${value:.4f}" if 0 < value < 0.01 else f"${value:.2f}"
 
 
@@ -175,7 +175,7 @@ def print_report(agg: dict, days: int) -> None:
     totals = agg["totals"]
     print(f"\n近 {days} 天模型调用成本（估算）")
     print("=" * 60)
-    print(f"  估算金额   {_fmt_cny(totals['cost_cny'])}   （仅 DeepSeek 按 token 计价）")
+    print(f"  估算金额   {_fmt_usd(totals['cost_usd'])}   （仅 DeepSeek 按 token 计价）")
     print(f"  总调用     {_fmt_int(totals['calls'])}")
     print(
         f"  总 tokens  {_fmt_int(totals['tokens'])}"
@@ -213,7 +213,7 @@ def print_report(agg: dict, days: int) -> None:
     for row in agg["by_user"]:
         print(
             f"  {row['owner']:<28}{row['calls']:>6}"
-            f"{_fmt_int(row['tokens']):>12}{_fmt_cny(row['cost_cny']):>12}"
+            f"{_fmt_int(row['tokens']):>12}{_fmt_usd(row['cost_usd']):>12}"
         )
     print()
 
@@ -401,7 +401,7 @@ def _render_user_table(agg: dict) -> str:
         f"<tr><td>{html.escape(row['owner'])}</td><td>{row['calls']}</td>"
         f"<td>{_fmt_int(row['prompt_tokens'])}</td>"
         f"<td>{_fmt_int(row['completion_tokens'])}</td>"
-        f"<td>{_fmt_cny(row['cost_cny'])}</td></tr>"
+        f"<td>{_fmt_usd(row['cost_usd'])}</td></tr>"
         for row in agg["by_user"]
     ]
     return (
@@ -431,7 +431,7 @@ def render_html(agg: dict, days: int) -> str:
         body = f"""
 <div class="stats">
   <div class="hero"><div class="stat-label">估算金额</div>
-    <div class="stat-value">{_fmt_cny(totals['cost_cny'])}</div></div>
+    <div class="stat-value">{_fmt_usd(totals['cost_usd'])}</div></div>
   <div><div class="stat-label">总调用</div>
     <div class="stat-value">{_fmt_int(totals['calls'])}</div></div>
   <div><div class="stat-label">总 TOKENS</div>

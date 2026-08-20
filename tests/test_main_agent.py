@@ -483,3 +483,30 @@ async def test_contexts_default_identity_to_none(monkeypatch):
 
     assert records[0].platform is None
     assert records[0].user_id is None
+
+
+async def test_model_call_is_logged_even_when_response_json_is_invalid(monkeypatch, tmp_path):
+    """记账在 json.loads 之前：token 已经烧了就该算数，解析失败不豁免。
+    回归保护——把 log_model_call 挪到解析之后这条测试会红。"""
+    import walkie_dokie.model_call_log as model_call_log
+
+    monkeypatch.setattr(model_call_log, "MODEL_CALL_LOG_PATH", tmp_path / "calls.jsonl")
+
+    class BadJsonCompletions:
+        async def create(self, **kwargs):
+            usage = SimpleNamespace(prompt_tokens=11, completion_tokens=3)
+            message = SimpleNamespace(content="不是 JSON")
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=BadJsonCompletions()))
+    agent = DeepSeekMainAgent(client=client)
+    with pytest.raises(Exception):
+        await agent.decide(
+            DialogueContext(user_text="你好", input_filenames=(), known_facts={})
+        )
+    import json as _json
+
+    lines = (tmp_path / "calls.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = _json.loads(lines[0])
+    assert record["purpose"] == "decide" and record["prompt_tokens"] == 11

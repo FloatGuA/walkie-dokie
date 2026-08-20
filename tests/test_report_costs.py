@@ -4,7 +4,7 @@ from scripts.report_costs import (
     PURPOSE_COLORS,
     PURPOSES,
     aggregate,
-    estimate_cost_cny,
+    estimate_cost_usd,
     render_html,
 )
 
@@ -107,9 +107,9 @@ def test_cost_is_estimated_from_deepseek_tokens_only():
         now=NOW,
     )
 
-    assert agg["totals"]["cost_cny"] == estimate_cost_cny("deepseek", 1_000_000, 0)
-    assert agg["totals"]["cost_cny"] > 0
-    assert estimate_cost_cny("claude-cli", 5_000_000, 5_000_000) == 0.0
+    assert agg["totals"]["cost_usd"] == estimate_cost_usd("deepseek", 1_000_000, 0)
+    assert agg["totals"]["cost_usd"] > 0
+    assert estimate_cost_usd("claude-cli", 5_000_000, 5_000_000) == 0.0
 
 
 def test_by_user_rows_are_grouped_and_sorted_by_tokens():
@@ -160,7 +160,7 @@ def test_empty_input_produces_an_empty_but_valid_aggregate():
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "tokens": 0,
-        "cost_cny": 0.0,
+        "cost_usd": 0.0,
     }
 
 
