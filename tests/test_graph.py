@@ -691,8 +691,9 @@ async def test_gray_zone_cancel_clears_pending_and_replies_deterministically(
 ):
     """cancel 出口：确定性话术、清空待执行任务、但保留 active_artifacts。
 
-    触发词刻意选“撤回这个请求吧”——“算了/不做了”都含否定词表字符，会被硬否决
-    层先拦成 revise，根本到不了模型（见 test_negation_words_are_hard_vetoed）。
+    触发词刻意选“撤回这个请求吧”——“算了/不做了”会被更早的确定性放弃层
+    （_is_cancellation）直接路由 cancel_task，到不了模型；本测试要的是绕过
+    全部四层确定性预判、真正落进模型 cancel 分支的说法。
     """
     assert _is_negation("撤回这个请求吧") is False
     previous = input_reference("上一份产物.docx", b"old")

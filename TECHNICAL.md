@@ -22,8 +22,17 @@ InboundEvent
         → main_agent.decide
           ├─ reply → END
           └─ ask_confirm(interrupt)
-               ├─ 补充/否定 → collect → main_agent
-               └─ 确认 → prepare_execution → execute → END
+               resume 后四层确定性预判（`_route_confirm`，纯函数）：
+               ├─ 白名单（是/是的/确认/没错）→ prepare_execution → execute → END
+               ├─ 放弃词完整匹配（算了/不做了/取消…）→ cancel_task（清 pending、
+               │   固定话术、保留 active_artifacts）→ END
+               ├─ 否定词命中（硬否决，模型无权推翻）→ collect → main_agent
+               └─ 灰区 → judge_confirm 节点（main_agent.judge_confirmation，
+                     用户零感知，verdict 只进日志）
+                     ├─ confirm → prepare_execution → execute → END
+                     ├─ revise → collect → main_agent
+                     └─ cancel → cancel_task → END
+                   判定异常在节点内降级为 revise，绝不降级为 confirm
   → ExecutionReport
   → main_agent.finalize
   → 文件、文字投递
@@ -40,6 +49,7 @@ InboundEvent
 3. `use_previous_artifact` 只有主 Agent 能根据“继续修改刚才的文件”等语义设置。执行层不会自行猜测上一轮文件。
 4. `finalize(FinalizeContext) -> str` 把内部执行报告改写成用户回复。finalize 失败时使用确定性完成文案，不重新执行已经产生的副作用。
 5. 主 Agent 只收到 artifact 文件名等元数据，不获得任意文件系统工具。
+6. `judge_confirmation(ConfirmationContext) -> ConfirmationVerdict` 对灰区确认回复输出 confirm/revise/cancel 三分类；只在四层确定性预判都不命中时被调用。不变式：该路径上任何异常/非法输出只允许落向 revise（多澄清一轮），绝不落向 confirm（误执行）。
 
 ### 长期记忆治理
 

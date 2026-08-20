@@ -15,7 +15,7 @@
 | 长期记忆 | `main_agent/memory.py` | 20 | 已实现，白名单字段+evidence 校验+确认落盘 | 相对成熟；真实 DeepSeek 对抗性 eval 仍未跑（见下方 Evaluation harness） |
 | 短期历史 | `orchestrator/state.py` / `graph.py` | 含在 graph 41 个测试里 | 已实现（原文/历史直接带入 prompt） | 未压缩，长对话会持续膨胀 token |
 | 记忆压缩（compaction） | 无 | 0 | **未实现**，仅 DECISION.md 有设计稿（2026-08-18 那条） | 不是"代码合格与否"的问题——先决定做不做，再谈质量 |
-| 任务分配/控制平面 | `orchestrator/graph.py` | 41 | 已实现，测得最重的模块 | 全项目相对最扎实的部分 |
+| 任务分配/控制平面 | `orchestrator/graph.py` | 86 | 已实现，测得最重的模块 | 全项目相对最扎实的部分；2026-08-20 确认判定升级为四层结构（白名单/放弃层/否定否决/模型判灰区+cancel 出口），审计日志全程可归因 |
 | 时间窗口/debounce | `orchestrator/debounce.py` | 9 | 已实现 | 2026-08-20 补了两个用 `asyncio.gather` 真并发验证的回归测试（`handle_event` 双发、`dispatch_fresh` vs `handle_event` 竞态），确认现有 `UserLocks` 确实序列化了这两个场景，无需生产代码改动 |
 
 ## 二、工程能力层面
@@ -37,3 +37,4 @@
 - 2026-08-20：可观测性/Trace 项已实现（`orchestrator/debounce.py` + `SessionState.trace_id`），TDD 全程覆盖，`pytest` 140 passed。
 - 2026-08-20：debounce+graph 并发场景补了两个真并发回归测试（Task 1/2），确认现有锁机制已正确工作，无需修复。
 - 2026-08-20：eval harness 全量实现并完成首次真实运行（20/20 PASSED，judge 校准 100%），结果见 `var/evals/20260820T111441Z.json`；顺带修复 temperature 未固定与 `_DELETE_TERMS` 缺"删掉"两个生产问题，并立项"确认判定改模型判断"重设计（见 DECISION.md）。
+- 2026-08-20：确认判定四层结构落地并验收（golden 21/21，`var/evals/20260820T150924Z.json`）；final review 发现并经用户拍板修复 cancel 出口错位（补确定性放弃词层）。

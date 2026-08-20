@@ -130,3 +130,15 @@
 
 `xlrd`/BOQ 相关的坑已随 `contract_intelligence` 拆分到独立仓库
 [contract-intelligence](../contract-intelligence) 自己的 PITFALLS.md。
+
+## graph 节点内的 `except Exception` 会吞掉测试 fake 的 AssertionError 哨兵，失败会红在下游无关断言上
+
+**现象**：给测试 fake（如 `FakeMainAgent`）的某个方法放 `raise AssertionError("不应被调用")` 当哨兵，期望误调用时测试立刻红在这句清晰报错上。但如果该方法是在 graph 节点的 `except Exception` 保护块内被调用（`_main_agent` 的 decide/finalize、`_judge_confirm` 的判定），AssertionError 会被当成"模型故障"吞掉并降级为确定性回复/revise——测试不会在哨兵处红，而是继续跑到下游，最终红在一句毫不相关的 `reply_text` 断言或 decisions 队列耗尽上，排查要绕一大圈。
+
+**真因**：`AssertionError` 是 `Exception` 子类；graph 对模型调用的降级保护（生产上正确：用户不该看到 traceback）不区分"真实 API 故障"和"测试哨兵"。
+
+**正确做法**：想在被 graph 降级保护包住的路径上放哨兵，要么用 `BaseException` 派生的自定义异常（穿透 `except Exception`），要么在测试里对 fake 的调用记录做显式断言（如 `judge_calls == []`），不要依赖 AssertionError 能冒出来。
+
+**判据**：测试红在"确定性降级话术出现在 reply_text 里"或 fake 队列 IndexError，而你明明放了哨兵——先查哨兵是不是被节点的 except Exception 吃了。
+
+**关联**：2026-08-20 确认判定重设计 final review 发现（当时无既有测试被架空，属预防性记录）。
