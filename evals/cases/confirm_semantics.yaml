@@ -39,10 +39,10 @@
     - user: "是"
       expect: {executed: true}
 - id: confirm-006
-  description: 放弃说法走 cancel 出口：确定性话术回复且不执行
+  description: 整句放弃走确定性放弃层：确定性话术收尾、不执行、不调模型判定
   turns:
     - user: "把这份文档转成表格"
       files: [simple.docx]
       expect: {action: propose_task}
-    - user: "撤回这个请求吧"
+    - user: "不做了"
       expect: {executed: false, reply_contains: ["不做了"]}

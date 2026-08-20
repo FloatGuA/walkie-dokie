@@ -23,6 +23,7 @@ from walkie_dokie.main_agent.memory import JsonMemoryRepository
 from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.graph import (
     _CANCEL_REPLY,
+    _is_cancellation,
     _is_confirmation,
     _is_negation,
 )
@@ -720,6 +721,38 @@ async def test_gray_zone_cancel_clears_pending_and_replies_deterministically(
     assert execution_agent.calls == []
 
 
+async def test_deterministic_cancellation_skips_model_and_cancels(
+    tmp_path, execution_agent
+):
+    """“算了”这类整句放弃走确定性放弃层：直接 cancel，不调模型、不反问。"""
+    main_agent = JudgingFakeMainAgent([])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我写文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+
+    state = await graph.ainvoke(
+        Command(resume={"text": "算了", "files": ()}), config=config()
+    )
+    assert execution_agent.calls == []
+    assert main_agent.judge_calls == []
+    assert len(main_agent.decide_calls) == 1
+    assert state["result"] == {
+        "reply_text": _CANCEL_REPLY,
+        "artifacts": [],
+        "success": True,
+    }
+    assert state["pending_instruction"] is None
+    assert state["pending_files"] == ()
+    assert state["decision"] is None
+
+
 async def test_judge_failure_degrades_to_revise_not_execute(tmp_path, execution_agent):
     """判定调用挂掉时只许降级到重新理解，绝不执行，也不把异常抛给调用方。"""
     main_agent = JudgingFakeMainAgent(
@@ -1184,3 +1217,29 @@ def test_confirmation_requires_unambiguous_whole_reply(reply, expected):
 )
 def test_negation_words_are_hard_vetoed(reply, expected):
     assert _is_negation(reply) is expected
+
+
+@pytest.mark.parametrize(
+    "reply,expected",
+    [
+        ("算了", True),
+        ("算了吧", True),
+        ("不做了", True),
+        ("不用了", True),
+        ("不弄了", True),
+        ("取消", True),
+        ("取消吧", True),
+        ("别弄了", True),
+        ("不要了", True),
+        ("算了。", True),
+        # 带后续内容的不是放弃：整句还有修改诉求，落到否定层走 revise 更安全
+        ("算了，先改个标题", False),
+        ("不太行", False),
+        ("嗯", False),
+        ("", False),
+        # 模型 cancel 分支仍需覆盖的说法：确定性层不认，留给灰区
+        ("撤回这个请求吧", False),
+    ],
+)
+def test_cancellation_is_whole_reply_only(reply, expected):
+    assert _is_cancellation(reply) is expected

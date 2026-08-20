@@ -6,13 +6,15 @@ LangGraph 在这里是控制平面，不是主 Agent：它只负责累积跨消�
 
     collect -> main_agent --+-- reply ---------------------------> END
                              +-- ask_confirm -+-- prepare -> execute -> END
+                                              +-- cancel_task ---------> END
                                               +-- collect --------...
                                               +-- judge_confirm -+-- prepare -> ...
                                                                  +-- cancel_task -> END
                                                                  +-- collect ----...
 
-确认回复分三层判定：零歧义白名单直接执行、否定词硬否决直接重新理解，剩下的
-灰区才进 ``judge_confirm`` 调主 Agent。模型调用只在节点里，路由函数保持纯函数。
+确认回复分四层判定：零歧义白名单直接执行、整句放弃直接收尾、否定词硬否决直接
+重新理解，剩下的灰区才进 ``judge_confirm`` 调主 Agent。模型调用只在节点里，
+路由函数保持纯函数。
 
 ``ask_memory`` 相关节点仅保留用于恢复升级前已经暂停的 checkpoint；新回合的
 长期记忆在确定性证据校验通过后隐式写入，不再要求用户二次确认。
@@ -96,6 +98,12 @@ _NEGATION_RE = re.compile(
     r"不|别|先|等|算了|慢|暂|停|取消|改|换|回头|以后|no|wait|cancel|hold",
     re.IGNORECASE,
 )
+_CANCEL_RE = re.compile(
+    # 确定性放弃层：整句就是“别做了”的常见说法，直接走 cancel_task 收尾
+    # （spec 决策 4）。必须排在否定层之前，否则这些词全被否定层拦去 collect，
+    # 用户说“算了”反而被反问一轮。
+    r"^(?:算了(?:吧)?|不做了|不用了|不弄了|取消(?:吧)?|别弄了|不要了)[\s，,。．.！!]*$"
+)
 _MEMORY_CONFIRM_RE = re.compile(
     r"^(?:记住|保存|确认保存|可以记住|是|yes|ok)[\s!！。．.]*$", re.IGNORECASE
 )
@@ -124,6 +132,16 @@ def _is_confirmation(reply: str) -> bool:
 def _is_negation(reply: str) -> bool:
     """确定性否定信号：搜索命中即硬否决，绝不进 execute。"""
     return bool(_NEGATION_RE.search(reply.strip()))
+
+
+def _is_cancellation(reply: str) -> bool:
+    """确定性放弃信号：整句就是“别做了”，直接收尾，不再反问。
+
+    刻意用 fullmatch：“算了，先改个标题”带着后续诉求，不是放弃，会落到否定层
+    走重新理解——判错方向也只是多问一轮，安全。
+    """
+
+    return bool(_CANCEL_RE.fullmatch(reply.strip()))
 
 
 def _remove_unverified_memory_claim(
@@ -420,7 +438,10 @@ async def _ask_memory(state: SessionState) -> dict:
 
 
 async def _route_confirm(state: SessionState) -> str:
-    """确认回复的三层分流：确定性放行 -> 确定性否决 -> 灰区交模型。
+    """确认回复的分流：确定性放行 -> 确定性放弃 -> 确定性否决 -> 灰区交模型。
+
+    放弃层必须排在否定层前面：常见放弃说法都含否定词表里的字符，顺序反过来就
+    全被拦去 collect 反问一轮，正是 spec 决策 4 要修的体验。
 
     路由本身保持纯函数（不调模型），灰区只是把控制权交给 ``judge_confirm``
     节点，模型调用集中在那里。
@@ -436,7 +457,15 @@ async def _route_confirm(state: SessionState) -> str:
     ):
         return "save_memory_task"
     if _is_confirmation(reply):
+        logger.info(
+            "确认回复命中白名单快路径放行，直接执行 trace_id=%s", state.get("trace_id")
+        )
         return "execute"
+    if _is_cancellation(reply):
+        logger.info(
+            "确认回复命中确定性放弃层，直接收尾 trace_id=%s", state.get("trace_id")
+        )
+        return "cancel_task"
     if _is_negation(reply):
         logger.info("确认回复命中否定词，硬否决进入重新理解 trace_id=%s", state.get("trace_id"))
         return "collect"
@@ -459,10 +488,9 @@ async def _route_after_judge(state: SessionState) -> str:
 async def _cancel_task(state: SessionState) -> dict:
     """用户放弃这次任务：清空待执行内容，用确定性话术收尾。
 
-    注意这条出口在实践中是少数路径：否定词硬否决优先于模型，意味着大部分放弃
-    说法（“算了”“不做了”“先不用了”）在 ``_route_confirm`` 就被拦下走 collect
-    重新理解，根本到不了模型。cancel 出口服务的是绕过否定词表的放弃说法——两
-    条路都不会误执行，差别只是收尾话术由谁给。
+    两条入口都会到这里：``_route_confirm`` 的确定性放弃层（“算了”“不做了”这类
+    整句放弃，零延迟不调模型），以及 ``judge_confirm`` 判 cancel 的灰区说法
+    （“撤回这个请求吧”这种不在词表里的表达）。
     """
 
     reply = (state.get("new_text") or "").strip()
@@ -896,6 +924,7 @@ def build_graph(
         {
             "execute": "prepare_execution",
             "save_memory_task": "save_memory_task",
+            "cancel_task": "cancel_task",
             "judge_confirm": "judge_confirm",
             "collect": "collect",
         },
