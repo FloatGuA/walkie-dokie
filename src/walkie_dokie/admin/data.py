@@ -1,4 +1,4 @@
-"""观测台的数据读取层：把 var/logs 下的 JSONL 变成面板要的形状。
+"""观测台的数据读取层：把 var/ 下的 JSONL、记忆文件与 eval 报告变成面板要的形状。
 
 只读，不写任何文件，也不 import fastapi——HTTP 层（Task 4）依赖这里，反过来不行，
 这样这些函数在没装 admin extra 的环境里照样能跑、能测。
@@ -10,6 +10,7 @@
 
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 
@@ -19,6 +20,11 @@ from walkie_dokie.main_agent.memory import JsonMemoryRepository
 logger = logging.getLogger(__name__)
 
 COST_DISCLAIMER = "金额为保守上界估算，对账以控制台账单为准"
+
+# eval 报告的文件名格式，对应 ``evals.report.write_report`` 写的 UTC 时间戳
+# （``%Y%m%dT%H%M%SZ.json``）。这条正则同时是白名单：``name`` 来自 URL，只有
+# fullmatch 通过的才允许拼进路径。
+_EVAL_NAME_RE = re.compile(r"^\d{8}T\d{6}Z\.json$")
 
 
 def _read_jsonl(path: Path) -> tuple[list[dict], int]:
@@ -211,3 +217,65 @@ def read_memory(memory_dir: Path, checkpoint_db: Path) -> dict:
 
     users.sort(key=lambda user: (user["platform"], user["user_id"]))
     return {"users": users, "checkpoint_error": checkpoint_error}
+
+
+def list_eval_reports(evals_dir: Path) -> dict:
+    """eval 报告索引，最新在前。
+
+    只返回列表页要的摘要字段——逐 case 的 ``case_results`` 动辄几十 KB，全塞进
+    索引会让"看一眼跑没跑过"这个动作把所有报告都读一遍。明细走
+    ``read_eval_report``。
+
+    文件名就是 UTC 时间戳，字典序倒排即时间倒序，不必解析时间也不必读文件内容
+    排序——报告被拷贝/触碰过 mtime 就不可信了。
+
+    坏 JSON 跳过并计入 ``skipped_files``（同 ``skipped_lines`` 的哲学：一份写了
+    一半的报告不该让另外二十份从看板上消失）。名字不合规的文件根本不算报告，
+    不计数。目录不存在 → 空态。
+    """
+    if not evals_dir.is_dir():
+        return {"reports": [], "skipped_files": 0}
+
+    reports: list[dict] = []
+    skipped = 0
+    for path in sorted(evals_dir.iterdir(), key=lambda p: p.name, reverse=True):
+        if not _EVAL_NAME_RE.fullmatch(path.name):
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.exception("eval 报告不可读，已跳过 path=%s", path)
+            skipped += 1
+            continue
+        if not isinstance(raw, dict):
+            logger.warning("eval 报告不是 JSON 对象，已跳过 path=%s", path)
+            skipped += 1
+            continue
+        reports.append(
+            {
+                "name": path.name,
+                "status": raw.get("status"),
+                "mode": raw.get("mode"),
+                "summary": raw.get("summary") or {},
+                "git_commit": raw.get("git_commit"),
+            }
+        )
+    return {"reports": reports, "skipped_files": skipped}
+
+
+def read_eval_report(evals_dir: Path, name: str) -> dict:
+    """按文件名读整份报告（含 ``case_results``）。
+
+    ``name`` 直接来自 URL，所以先过白名单正则再拼路径：正则里没有 ``/`` 也没有
+    ``.``（除了固定的 ``.json``），``../`` 这类穿越根本拼不出来。绝不改成"拼完
+    再检查是否落在目录内"——那种写法在符号链接上会漏。
+
+    这里的坏 JSON 不像 ``list_eval_reports`` 那样吞掉：用户点开的就是这一份，
+    静默返回空报告等于骗人，让 ``JSONDecodeError`` 抛给上层。
+    """
+    if not _EVAL_NAME_RE.fullmatch(name):
+        raise ValueError(f"非法的 eval 报告名: {name!r}")
+    path = evals_dir / name
+    if not path.is_file():
+        raise FileNotFoundError(f"eval 报告不存在: {name}")
+    return json.loads(path.read_text(encoding="utf-8"))

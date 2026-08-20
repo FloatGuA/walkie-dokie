@@ -3,9 +3,16 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from walkie_dokie.admin.data import read_costs, read_memory, read_turns
+from walkie_dokie.admin.data import (
+    list_eval_reports,
+    read_costs,
+    read_eval_report,
+    read_memory,
+    read_turns,
+)
 from walkie_dokie.agents.base import ExecutionAgent, ExecutionReport
 from walkie_dokie.main_agent.base import MainAgent, MainAgentDecision
 from walkie_dokie.main_agent.memory import JsonMemoryRepository
@@ -286,3 +293,123 @@ def test_read_memory_keeps_unreadable_profile_as_empty(tmp_path):
     assert len(result["users"]) == 1
     assert result["users"][0]["profile"] == {}
     assert result["users"][0]["user_id"] == "v2_aaa_bbb.json"
+
+
+def _write_eval_report(evals_dir: Path, name: str, **fields) -> Path:
+    evals_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "mode": "regression",
+        "status": "PASSED",
+        "git_commit": "abc1234",
+        "summary": {"total": 1, "passed": 1, "failed": 0, "judge_clarity_avg": 3.5},
+        "case_results": [{"case_id": "c1", "passed": True}],
+    }
+    report.update(fields)
+    path = evals_dir / name
+    path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_list_eval_reports_newest_first(tmp_path):
+    evals_dir = tmp_path / "evals"
+    _write_eval_report(evals_dir, "20260820T105503Z.json", status="FAILED_INFRA")
+    _write_eval_report(
+        evals_dir,
+        "20260820T185856Z.json",
+        mode="real-execution",
+        git_commit="01ae0fc",
+        summary={"total": 23, "passed": 23, "failed": 0, "judge_clarity_avg": 3.4},
+    )
+
+    result = list_eval_reports(evals_dir)
+
+    assert [r["name"] for r in result["reports"]] == [
+        "20260820T185856Z.json",
+        "20260820T105503Z.json",
+    ]
+    newest = result["reports"][0]
+    assert newest["status"] == "PASSED"
+    assert newest["mode"] == "real-execution"
+    assert newest["git_commit"] == "01ae0fc"
+    assert newest["summary"] == {
+        "total": 23,
+        "passed": 23,
+        "failed": 0,
+        "judge_clarity_avg": 3.4,
+    }
+    assert result["reports"][1]["status"] == "FAILED_INFRA"
+    assert result["skipped_files"] == 0
+    # 列表页只放摘要字段，逐 case 的明细留给 read_eval_report——否则一页就要
+    # 把几十份报告的全文都塞进来。
+    assert "case_results" not in newest
+
+
+def test_list_eval_reports_empty_dir(tmp_path):
+    empty = tmp_path / "evals"
+    empty.mkdir()
+    assert list_eval_reports(empty) == {"reports": [], "skipped_files": 0}
+    assert list_eval_reports(tmp_path / "absent") == {"reports": [], "skipped_files": 0}
+
+
+def test_list_eval_reports_skips_broken_and_foreign_files(tmp_path):
+    evals_dir = tmp_path / "evals"
+    _write_eval_report(evals_dir, "20260820T111441Z.json")
+    (evals_dir / "20260820T150924Z.json").write_text("{半个 JSON", encoding="utf-8")
+    # 名字不合规的一律不算数，也不该计入 skipped_files：它们本来就不是报告。
+    (evals_dir / "notes.txt").write_text("随手记", encoding="utf-8")
+    (evals_dir / "20260820T161933Z.json.bak").write_text("{}", encoding="utf-8")
+
+    result = list_eval_reports(evals_dir)
+
+    assert [r["name"] for r in result["reports"]] == ["20260820T111441Z.json"]
+    assert result["skipped_files"] == 1
+
+
+def test_list_eval_reports_tolerates_missing_fields(tmp_path):
+    evals_dir = tmp_path / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir / "20260820T111441Z.json").write_text("{}", encoding="utf-8")
+
+    report = list_eval_reports(evals_dir)["reports"][0]
+
+    assert report["name"] == "20260820T111441Z.json"
+    assert report["status"] is None
+    assert report["mode"] is None
+    assert report["git_commit"] is None
+    assert report["summary"] == {}
+
+
+def test_read_eval_report_returns_full_document(tmp_path):
+    evals_dir = tmp_path / "evals"
+    _write_eval_report(evals_dir, "20260820T185856Z.json", error=None)
+
+    result = read_eval_report(evals_dir, "20260820T185856Z.json")
+
+    assert result["status"] == "PASSED"
+    assert result["case_results"] == [{"case_id": "c1", "passed": True}]
+
+
+def test_read_eval_report_rejects_path_traversal(tmp_path):
+    """name 直接来自 URL，只有白名单正则挡在中间——这条防线塌了就是任意文件读。"""
+    evals_dir = tmp_path / "evals"
+    evals_dir.mkdir()
+    (tmp_path / "secret.json").write_text('{"secret": 1}', encoding="utf-8")
+
+    for bad in [
+        "../../etc/passwd",
+        "../secret.json",
+        "20260820T111441Z.json.bak",
+        "20260820T111441Z.json/../../secret.json",
+        "/etc/passwd",
+        "",
+        "20260820T111441Z.json\n",
+    ]:
+        with pytest.raises(ValueError):
+            read_eval_report(evals_dir, bad)
+
+
+def test_read_eval_report_missing_file(tmp_path):
+    evals_dir = tmp_path / "evals"
+    evals_dir.mkdir()
+    with pytest.raises(FileNotFoundError):
+        read_eval_report(evals_dir, "20260820T111441Z.json")
