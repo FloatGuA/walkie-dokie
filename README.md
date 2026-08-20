@@ -62,6 +62,19 @@ python scripts/run_mvp.py
 
 用户明确说出的姓名、部门、职位或常用称呼会在逐字证据校验通过后自动写入长期记忆，并透明回显实际变更，不再要求二次确认。单独发送 `/long-term-memory` 可查看当前保存的全部长期记忆；该命令不经过模型。
 
+## 运行 Golden Eval（回归评估）
+
+改 prompt / 记忆逻辑后手动跑（联网、花钱，标准 `pytest` 不含它）。必须从仓库根目录运行，需要 `.env` 里的 `DEEPSEEK_API_KEY` 和本机 Claude 登录态（judge 用）：
+
+```bash
+export EVAL_REPLY_BLACKLIST="你的邮箱,Claude"   # 敏感话术黑名单，不入库
+python3 -m scripts.run_golden_eval --calibrate  # 先校准 judge（6 次调用）
+python3 -m scripts.run_golden_eval              # 全量回归：真实 DeepSeek + fake 执行后端
+python3 -m scripts.run_golden_eval --real-execution  # 冒烟：真实 Claude/Codex 执行后端
+```
+
+报告写入 `var/evals/<时间戳>.json`。退出码：0 全过 / 1 断言失败 / 2 基础设施异常。设计与决策见 `docs/superpowers/specs/2026-08-20-eval-harness-design.md` 与 DECISION.md。
+
 ## 合同智能
 
 原本内置的 `contract_intelligence` Data Spike 领域模块已于 2026-08-15 拆分为独立仓库

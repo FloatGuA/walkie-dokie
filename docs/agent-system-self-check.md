@@ -24,8 +24,8 @@
 |------|------|--------|------|
 | 可观测性 / Trace | ✅ 已实现（2026-08-20）：`Debouncer` 窗口触发时生成 trace_id，随 `SessionState` checkpoint 落盘并贯穿 debounce→main_agent→execute→投递；confirm-race resume 沿用原 id 不重开。与 `execution_id`（幂等身份）并存不合并 | 已闭环 | debounce+graph 并发场景测试已于 2026-08-20 补齐（见第一张表 debounce 行） |
 | 幂等与失败语义 | started marker 已挡住部分场景，未区分可重试 vs 永久失败，无 backoff/熔断 | 高（已在 PROGRESS.md P0） | 外部调用（DeepSeek/Claude/Codex/飞书）都需要 |
-| Evaluation harness（golden set 回归） | DECISION.md 已拍板"fail-fast"策略，但真正的 golden set 尚未建立 | **高** | 最容易被拖欠——prompt 改坏了不会报错，只会悄悄变差 |
-| Guardrails（输入侧） | 输出侧已有 Office 主动内容校验 + 执行 agent 最小权限沙箱；输入侧（用户原文喂进 main_agent 决策前）无注入检测 | 中 | 输出侧方向是对的，输入侧是缺口 |
+| Evaluation harness（golden set 回归） | ✅ 已实现（2026-08-20）：四类 20 样本端到端回归（真实 DeepSeek + fake 执行）+ Opus judge 话术评分（只报告）+ judge 校准集（一致率 100%），报告存 `var/evals/`，手动 `python3 -m scripts.run_golden_eval` | 已闭环（样本随 badcase 增长） | 首跑 20/20 PASSED、clarity 均值 3.45；`--real-execution` 冒烟未跑 |
+| Guardrails（输入侧） | 输出侧已有 Office 主动内容校验 + 执行 agent 最小权限沙箱；输入侧（用户原文喂进 main_agent 决策前）无注入检测 | 中 | 输出侧方向是对的，输入侧是缺口。已有第一条基线证据：eval 首跑 inject-002 显示"索要系统提示词"会让模型把内部设定原文抛给用户（确定性黑名单没拦住，judge 抓到的） |
 | 成本与延迟预算 | 无 token 用量/单用户成本埋点 | 中（开放前必须） | 按量计费 API，异常重试或超长文件可能打飞成本 |
 | 人工兜底路径 | 有 ask_confirm 交互，但无"多次失败后转人工/明确说不会"的出口 | 中 | PROGRESS.md P2 已提到中老年用户体验，这是其中一角 |
 
@@ -36,3 +36,4 @@
 - 2026-08-20：首次建立，随本次进度汇报会话产出。
 - 2026-08-20：可观测性/Trace 项已实现（`orchestrator/debounce.py` + `SessionState.trace_id`），TDD 全程覆盖，`pytest` 140 passed。
 - 2026-08-20：debounce+graph 并发场景补了两个真并发回归测试（Task 1/2），确认现有锁机制已正确工作，无需修复。
+- 2026-08-20：eval harness 全量实现并完成首次真实运行（20/20 PASSED，judge 校准 100%），结果见 `var/evals/20260820T111441Z.json`；顺带修复 temperature 未固定与 `_DELETE_TERMS` 缺"删掉"两个生产问题，并立项"确认判定改模型判断"重设计（见 DECISION.md）。
