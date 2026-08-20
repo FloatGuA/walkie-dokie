@@ -52,7 +52,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 
 - v2 尚未在正常部署 OS 上跑完真实 `DeepSeek → AsyncSqliteSaver → Claude → 飞书` 全链路。
 - 当前 Codex 受管 sandbox 禁止 asyncio socketpair/self-pipe 唤醒；历史同步图因此看似卡死，`aiosqlite` 的 worker thread 在这里也受影响。离线 `InMemorySaver` 通过不能替代生产 SQLite 冒烟。
-- golden eval 的 `--real-execution` 冒烟模式（真实 Claude/Codex 执行后端跑 document_task 样本）尚未运行过；回归模式（fake 执行后端）已于 2026-08-20 首跑 20/20 通过。
+- golden eval `--real-execution` 冒烟已于 2026-08-21 达成目标：两个真正触发执行的样本（intent-004/confirm-005）经真实 Claude 后端生成文档并通过 OOXML 校验全链路 PASSED；运行在第 16 个样本因 DeepSeek 瞬时超时被 FAILED_INFRA 正确中止（防线按设计工作，见 PITFALLS 重试窗口条目），未跑到的 inject 样本不触发执行层、real 模式无增量信息，按 fail-fast 决策不重跑。Codex 后端仍未登录未冒烟。
 - 确认判定四层结构的灰区判定只在离线 fake 与 21 样本 golden 回归上验证过；真实多用户长期使用中模型对灰区词的判定分布（尤其"好的/行"类）尚无数据，样本按 badcase 驱动继续回填。
 - Claude 真实冒烟当前被账户月度额度上限拒绝，尚未进入工具调用；安全配置和错误路径已加载，但正常 docx/xlsx 生成、超时、取消后的子进程/远端状态仍需在额度恢复后重新冒烟。
 - Codex 最小权限 profile 已做本地命令隔离测试，但独立 `var/codex_home` 尚未登录，真实模型文档任务仍未冒烟。
