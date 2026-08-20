@@ -51,9 +51,13 @@ ask_confirm resume
       1. 有新文件 → collect                     （现状保留）
       2. "是并记住" 正则 → save_memory_task      （现状保留）
       3. 收紧白名单完整匹配 → execute            （零延迟快路径）
-      4. 否定词硬命中 → collect                  （硬否决；宽匹配可接受——
+      4. 放弃词完整匹配（算了/不做了/取消…）→ cancel_task
+         （2026-08-20 final review 后用户拍板补层：否则"算了"会先被
+         否定层拦去 revise 被反问——正是决策 4 否掉的体验；完整匹配
+         保证"算了，先改标题"这类带后续内容的落到否定层走 revise）
+      5. 否定词硬命中 → collect                  （硬否决；宽匹配可接受——
          误把"不错"否决只是多澄清一轮，安全方向）
-      5. 其余（灰区）→ judge_confirm 节点
+      6. 其余（灰区）→ judge_confirm 节点
   → judge_confirm: verdict = main_agent.judge_confirmation(...)
       ├─ confirm → execute
       ├─ revise  → collect（main_agent 重新理解，现状路径）
