@@ -142,3 +142,13 @@
 **判据**：测试红在"确定性降级话术出现在 reply_text 里"或 fake 队列 IndexError，而你明明放了哨兵——先查哨兵是不是被节点的 except Exception 吃了。
 
 **关联**：2026-08-20 确认判定重设计 final review 发现（当时无既有测试被架空，属预防性记录）。
+
+## graph 节点超时小于 DeepSeek 客户端超时的两倍时，`max_retries=1` 的重试永远完不成
+
+**现象**：`AsyncOpenAI(timeout=45, max_retries=1)` 看起来有一次重试兜底，但真实运行中一次 API 慢就直接把整轮 eval 打成 FAILED_INFRA（2026-08-21 凌晨 --real-execution 冒烟第 16 个样本实测），重试从未生效过。
+
+**真因**：模型调用外面包着 graph 节点的 `asyncio.timeout`（decide/finalize 60s，judge_confirmation 30s）。客户端第一次尝试要 45s 才超时，重试需要再一个 45s——decide 的重试只剩 15s 窗口，judge 的重试窗口是负的。节点超时先到，`CancelledError` 取消一切，客户端的重试配置形同虚设。
+
+**正确做法**：要让重试真正可用，必须满足 节点超时 > 客户端单次超时 × (1+max_retries) + 余量；否则就承认"节点超时即失败、无重试"，把 `max_retries` 显式设 0 免得给人虚假安全感。本项目当前按 fail-fast 决策接受前者语义（临时故障提前结束、修复后重跑），未改配置。
+
+**判据**：任何"客户端带重试 + 外层再包超时"的组合，先算一遍窗口数学，别默认重试存在。
