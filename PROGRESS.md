@@ -1,6 +1,6 @@
 # walkie-dokie — Progress
 
-更新时间：2026-08-20（Asia/Shanghai）
+更新时间：2026-08-21（Asia/Shanghai）
 
 ## 合同智能已拆分
 
@@ -37,7 +37,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 生产入口所有 fresh/resume invoke 都显式使用 `durability="sync"`；`prepare_execution` 的 execution ID/workdir checkpoint 完成后才进入执行。独立元数据区的 started/report marker 会在未知结果时拒绝自动重跑，并覆盖“报告已返回但后置 checkpoint 失败”的常见窗口。
 - 主 Agent/执行 Agent 的业务异常都结束为明确失败回合；turn log 失败不再把成功执行变成 pending execute。
 - 上一轮输出 artifact 可由 MainAgent 通过 `use_previous_artifact` 显式选入下一任务，“继续修改刚才文件”不再只有文字上下文却拿不到文件。
-- 确认词使用完整匹配；“好像不对”“可以先别做”“是，不过先改”不会误执行。
+- 确认词使用完整匹配；“好像不对”“可以先别做”“是，不过先改”不会误执行。（2026-08-20 已升级为四层确认判定结构，见下方条目；该保证仍成立，由否定词硬否决层承接。）
 - 标准 `pytest` 不再收集时启动真实 backend smoke script；两个脚本已有 `__main__` guard，pytest 配置限定 `tests/`。
 - ExecutionAgent prompt-injection 权限边界已收紧：Claude 使用 fail-closed Bash sandbox，Codex 使用最小 permission profile；两者都无执行网络、无 MCP/skills/子 Agent、无应用 secret 环境变量，只能写本轮 workspace。Codex profile 已在宿主 Linux 实测不能读取项目 README 或独立 CODEX_HOME，同时能写指定 workspace 并加载 python-docx/openpyxl。
 - `.docx/.xlsx` 在执行前后经过确定性 OOXML 校验；宏、嵌入对象、外部关系、危险字段/公式、异常 ZIP 会被拒绝。graph 会再次验证执行报告和产物，不信任 backend 自报路径。
@@ -45,6 +45,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 防抖窗口内的多文件处理缺口已解决：debounce 此前实现中 `_files` 为单槽 dict，同一窗口内连发多个文件会静默覆盖丢失（见 DECISION.md "orchestrator 加回一道确认环节"条目的 2026-08-17 实现状态注记）；多文件执行会话完整设计（DECISION.md 2026-08-18）已定稿并全量实现，`pending_files` 改为队列结构、`ExecutionReport.artifacts` 支持多输出、文件名碰撞通过 `display_filename` 去重、部分校验失败排除而非整批拒绝，对应测试已全量覆盖。
 - 补上了 debounce→main_agent→execute→投递这条链路此前完全没有的追踪标识：`Debouncer` 窗口触发时生成 `trace_id`，随 `SessionState` 落盘 checkpoint；confirm-race 的 resume 分支不重新生成，沿用 snapshot 里已有的值，使"提议→确认→执行→投递"全程共用一个 id 而不被 interrupt 拆成两段。顺带把 `run_mvp.py` 里一直硬编码 `run_id=None` 的 conversation TurnRecord 换成了真实 trace_id。有意不与 `execution_id`（`workspace.py` 生成、绑定 started-marker 幂等逻辑的那个）合并，两者现在并存。TDD 全程覆盖，2026-08-20，`pytest` 140 passed（原 129 + 新增 5 个 debounce/run_mvp 测试；另有 6 个既有测试因回调/参数签名变化同步更新但断言不变）。
 - 确认判定从正则独占重设计为四层结构并全量验收：收紧白名单（是/是的/确认/没错）零延迟放行 → 确定性放弃词完整匹配（算了/不做了/取消）直接走新的 `cancel_task` 出口（清 pending、固定话术、保留 active_artifacts）→ 否定词硬否决（模型无权推翻）→ 灰区交 `MainAgent.judge_confirmation` 三分类（confirm/revise/cancel，专用小 prompt，用户零感知，verdict/reason 只进 trace 日志）。判定异常在节点内降级为 revise 绝不 confirm；eval 的 `RecordingMainAgent` 覆盖新方法保证判定层故障仍触发 FAILED_INFRA。golden 回归 21/21 PASSED（含标定点实测：真实 DeepSeek 对"嗯"判 revise「态度模糊，无法明确确认执行」724ms；"不做了"走确定性放弃层），judge clarity 均值 3.57。confirm-004 已翻回 executed:false（还清 DECISION 暂翻转欠账）。2026-08-20，`pytest` 246 passed（197 → 246）。
+- `--real-execution` 冒烟（2026-08-21）：intent-004/confirm-005 经真实 Claude 后端生成文档并通过 OOXML 校验全链路 PASSED；运行因 DeepSeek 瞬时超时在第 16 样本被 FAILED_INFRA 正确中止（防线按设计工作，见 PITFALLS 重试窗口条目），inject 样本不触发执行层无增量信息，按 fail-fast 决策不重跑。
 - eval harness（golden set 回归）全量实现并完成首次真实运行：端到端 driver 复用生产 `_invoke_from_event`/`deliver_graph_output` 驱动真 graph（真实 DeepSeek + fake 执行后端 + InMemorySaver），四类 20 样本（意图路由/记忆边界/确认词/prompt injection）确定性断言阻断 + Claude Opus judge 话术评分只报告，报告存 `var/evals/`。首跑 **20/20 PASSED**（含"删掉"删除记忆、四条 injection 全拦住），judge 校准集经三轮迭代达 **100% 一致率**（迭代结论：校准样本必须带场景 context；judge 对歧义确认的标准比样本作者更严且立场与本项目适老化一致），全量话术 clarity 均值 3.45。judge 首跑即产出增量发现：inject-002 的回复把内部设定原文抛给用户——确定性黑名单（"Claude"/邮箱）没拦住，属输入侧 Guardrails 立项的第一条基线证据。顺带修了两个生产 bug：DeepSeek 调用未设 temperature（现固定 0）、`_DELETE_TERMS` 缺"删掉"。运行入口 `python3 -m scripts.run_golden_eval`（须仓库根目录，`--calibrate` 校准 judge，`--real-execution` 冒烟真实执行后端），`EVAL_REPLY_BLACKLIST` 环境变量装敏感话术黑名单不入库。2026-08-20，`pytest` 197 passed（142 → 197）。
 - debounce+graph 并发场景补了两个 `asyncio.gather` 真并发回归测试（此前 7 个 debounce 测试全是顺序模拟）：同一 session 两条 `handle_event` 同时到达、以及 `dispatch_fresh` 与 `handle_event` confirm-resume 竞态（即 commit `1201650` 修过的那类 bug 的场景），均确认共享 `UserLocks` 实例下 `graph.aget_state`/`ainvoke` 严格序列化不交错；每个测试都先用"两把独立锁"版本验证过自身能检测到交错（RED）再切回生产接线（GREEN）。无生产代码改动。2026-08-20，`pytest` 142 passed。
 
@@ -52,9 +53,8 @@ PlatformAdapter → Session coordination → LangGraph control plane
 
 - v2 尚未在正常部署 OS 上跑完真实 `DeepSeek → AsyncSqliteSaver → Claude → 飞书` 全链路。
 - 当前 Codex 受管 sandbox 禁止 asyncio socketpair/self-pipe 唤醒；历史同步图因此看似卡死，`aiosqlite` 的 worker thread 在这里也受影响。离线 `InMemorySaver` 通过不能替代生产 SQLite 冒烟。
-- golden eval `--real-execution` 冒烟已于 2026-08-21 达成目标：两个真正触发执行的样本（intent-004/confirm-005）经真实 Claude 后端生成文档并通过 OOXML 校验全链路 PASSED；运行在第 16 个样本因 DeepSeek 瞬时超时被 FAILED_INFRA 正确中止（防线按设计工作，见 PITFALLS 重试窗口条目），未跑到的 inject 样本不触发执行层、real 模式无增量信息，按 fail-fast 决策不重跑。Codex 后端仍未登录未冒烟。
 - 确认判定四层结构的灰区判定只在离线 fake 与 21 样本 golden 回归上验证过；真实多用户长期使用中模型对灰区词的判定分布（尤其"好的/行"类）尚无数据，样本按 badcase 驱动继续回填。
-- Claude 真实冒烟当前被账户月度额度上限拒绝，尚未进入工具调用；安全配置和错误路径已加载，但正常 docx/xlsx 生成、超时、取消后的子进程/远端状态仍需在额度恢复后重新冒烟。
+- Claude 后端的正常 docx 生成已由 2026-08-21 `--real-execution` 冒烟覆盖（2 样本全链路 PASSED）；超时、取消后的子进程/远端状态清理仍未专项冒烟。
 - Codex 最小权限 profile 已做本地命令隔离测试，但独立 `var/codex_home` 尚未登录，真实模型文档任务仍未冒烟。
 - 飞书重投、发送半成功、进程在 checkpoint/投递边界崩溃尚无端到端故障注入测试。
 
@@ -74,9 +74,11 @@ PlatformAdapter → Session coordination → LangGraph control plane
       repository 保守校验 → 通过后隐式落盘，并透明回显实际变更
 
   reply → END
-  propose_task → ask_confirm interrupt
-      补充/否定 → collect → main_agent
-      “是” → prepare_execution → execute
+  propose_task → ask_confirm interrupt（resume 后四层判定，详见 TECHNICAL.md）
+      白名单确认 → prepare_execution → execute
+      放弃词完整匹配 → cancel_task（清任务+固定话术）→ END
+      否定词/revise → collect → main_agent
+      灰区 → judge_confirm（模型三分类）→ 上述三个出口之一
 
   精确命令 /long-term-memory → 确定性读取当前用户全部长期档案
 
@@ -95,7 +97,6 @@ PlatformAdapter → Session coordination → LangGraph control plane
 2. 增加持久 inbox/outbox：`InboundEvent.event_id` 去重；文件与文字分别记录 delivery ack/retry。现在图成功后平台发送失败会丢结果，文件成功而文字失败会半投递。
 3. 将 execution idempotency 扩展到 backend 边界。started marker 会在结果未知时拒绝自动重跑，但无法判断 coding agent 是否已经完成，只能转人工恢复；这仍不是 exactly-once。
 4. 公开给开发者本人以外的人之前，将当前订阅登录改为合规服务鉴权，并把已启用的进程级 OS sandbox 再放进专用服务账号 + container/cgroup，补齐 CPU、内存、进程数和磁盘配额。
-5. `orchestrator/debounce.py` 补并发场景测试：现有 7 个测试都是正常路径，上一轮 confirm-race 静默丢文件的 critical bug 就是从这里漏出来的，说明测试盲区不止一处。做完 trace_id（上条）之后紧接着做，方便复查时能看清完整链路。详见 `docs/agent-system-self-check.md` 的自查清单。
 
 ### P1：状态和部署边界
 
