@@ -332,3 +332,21 @@
 - **否掉了什么，为什么**：合并成一个字段——`execution_id` 目前直接绑定 started/report marker 幂等逻辑（`_execution_was_started`/`_mark_execution_started`/`_load_execution_marker` 都以 workdir 名即 execution_id 为准），且只在 `_prepare_execution` 之后才存在；而 trace_id 需要在此之前（debounce 阶段、甚至提议被拒绝走 `reply → END` 从不进入执行）就已经产生并可用于日志。把两者合一要么把 execution_id 的生成提前到 debounce（会打乱"确认前不能有外部副作用目录"这条既有边界，参见上方"多文件执行会话设计"决策里否掉的"工作区创建提前"选项），要么让 trace_id 退化成只在执行阶段才存在（就失去了覆盖提议/确认阶段的意义）。两者都不划算，不如接受两个字段并存。
 - **代价 / 已知不足**：同一次任务的日志里会同时出现两个格式相同的短 id（trace_id 和 execution_id），初读代码/日志的人容易误以为是同一个东西或多余重复；文档（`orchestrator/state.py` 的字段注释、本条决策）是目前唯一区分两者的地方。
 - **什么情况下应该重新考虑**：如果以后 execution_id 的幂等身份逻辑被重新设计成不再绑定 workdir 目录名（比如换成独立的幂等 key），可以重新评估要不要把 trace_id 并入；如果实测发现两个 id 在日志排查中确实经常被人搞混、造成实际排障成本，应该优先加清晰的日志字段前缀/文档提醒，而不是仓促合并。
+
+## Eval harness（golden set 回归）设计定稿：端到端 graph、回归 fake 执行/冒烟真执行、确定性断言阻断 + Opus judge 只报告
+
+- **日期**：2026-08-20
+- **背景**：改 prompt/记忆逻辑不会报错只会悄悄变差，自查清单把 eval harness 列为优先级"高"的欠账；DECISION.md 2026-08-13 只拍板了 fail-fast 原则，样本、组织、运行方式全未设计。完整 spec 见 `docs/superpowers/specs/2026-08-20-eval-harness-design.md`。
+- **选了什么**：**6 个决策点全部用户拍板**——① 评估切面打端到端整个 graph（多轮）；② 回归集注入 FakeExecutionAgent、`--real-execution` 冒烟走真实后端，MainAgent 始终真实 DeepSeek，个人使用阶段继续订阅登录；③ 样本四类全收（意图路由/记忆边界/确认词语义/prompt injection），每类 5-8 个共 20-30 样本，此后 badcase 驱动增长；④ 判分=确定性断言 + Claude CLI Opus judge 评话术，judge 配校准集验证裁判本身；⑤ 独立脚本手动跑、报告存 var/evals/，确定性断言 100% 阻断、judge 分数只报告不阻断；⑥ 敏感话术黑名单（开发者邮箱等）从环境变量加载不入公开仓库。
+- **否掉了什么，为什么**：只打 `MainAgent.decide` 单轮切面（易归因但覆盖不了确认流转与记忆落盘，用户明确要端到端）；回归也走真实执行后端（慢、烧订阅额度、执行层抖动会让 fail-fast 把整批标 FAILED 污染回归信号）；只做确定性断言不加 judge（话术清晰度对中老年用户是真实盲区，用户听完确定性断言 vs judge 的完整解释后维持要 judge）；judge 分数也阻断（judge 自身会抖，起步阶段会训练出"忽略红灯"习惯，校准一致率≥90% 达标前只当参考）；pytest marker 方式运行（模糊"标准 pytest 不联网"铁律，且不适合产出可对比历史报告）；GitHub CI（judge 依赖本机 Claude 订阅登录态，CI 无解）。
+- **代价 / 已知不足**：`deepseek-chat` 是移动别名，供应商升级引起的漂移与本仓库 prompt 改动混在一起只能事后归因；初版 judge 校准样本是设计者手写的，可能恰好是 judge 容易判对的形态；话术风格好坏（超出清晰度/误导性）不评。
+- **什么情况下应该重新考虑**：judge 校准一致率稳定 ≥90% 后可讨论把 judge 升级为阻断项；出现对外接口时订阅登录必须换 API key（既有决策）；样本数随 badcase 回填超过 ~60 个时重新评估运行时长与组织方式。
+
+## DeepSeekMainAgent 调用显式设 temperature=0
+
+- **日期**：2026-08-20
+- **背景**：eval harness 采用"确定性断言 100% 阻断"，但 `deepseek.py` 的 `chat.completions.create` 没设 temperature（默认 1.0），同一样本的 action/intent 可能随机抖动，把非回归的抖动标成 FAILED。
+- **选了什么**：**用户拍板**——生产代码给 DeepSeek 调用显式加 `temperature=0`。`decide` 做的是分类+结构化输出（intent 路由、TaskContract、memory operations），不是创意写作，低温让生产行为更稳定可预测，顺带让 eval 阻断语义站得住。作为小的生产改动进 eval harness 实现计划，走 TDD。
+- **否掉了什么，为什么**：不动生产、eval 失败样本自动重试 1 次——会把"100% 阻断"稀释成"重试后 100%"，且掩盖真实的决策边界不稳定；什么都不做先观察抖动率——观察窗口内的每次假 FAILED 都在消耗对 eval 信号的信任。
+- **代价 / 已知不足**：`finalize` 的话术会变得每次一致、缺少变化（该任务要的是清晰不是花样，可接受）；temperature=0 不等于完全确定（供应商侧仍可能有微小非确定性），只是把抖动压到最低。
+- **什么情况下应该重新考虑**：如果实测发现 temperature=0 下话术生硬到影响中老年用户理解（P2 交互重设计阶段验证），可以只给 finalize 路径回调温度、decide 保持 0。
