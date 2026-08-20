@@ -1,5 +1,7 @@
 # 短期历史压缩（Compaction）Implementation Plan
 
+> **状态：✅ 已于 2026-08-21 全部执行完毕**（subagent-driven；final review 后补 merge 双向守卫/usage 日志/duration 修正；真实 haiku 标定通过；`pytest` 290 passed）。留档备查，不要重复执行；与实现不一致处以代码与 spec 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 被 12 条窗口挤出的历史消息不再静默丢弃：攒满 6 条压成带逐字 evidence 的摘要条目（Claude CLI haiku 抽取 + 纯代码校验），随 checkpoint 持久并作为 facts 注入 MainAgent。
