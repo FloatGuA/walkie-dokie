@@ -35,8 +35,10 @@ from walkie_dokie.main_agent import (
     LONG_TERM_MEMORY_COMMAND,
     render_memory_snapshot,
 )
+from walkie_dokie.main_agent.summarizer import ClaudeAgentSummarizer
 from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.debounce import Debouncer
+from walkie_dokie.orchestrator.graph import COMPACTION_BATCH_SIZE
 from walkie_dokie.orchestrator.locks import UserLocks
 from walkie_dokie.platforms.base import IncomingFile, InboundEvent, OutboundMessage
 from walkie_dokie.platforms.feishu import FeishuAdapter
@@ -170,6 +172,24 @@ async def deliver_graph_output(
     )
 
 
+async def maybe_run_compaction(graph, config: dict, summarizer) -> None:
+    """投递完成后、仍在 session 锁内发起的后台压缩回合。"""
+
+    if summarizer is None:
+        return
+    snapshot = await graph.aget_state(config=config)
+    if snapshot.next or snapshot.interrupts:
+        return  # interrupt 等待中不触发；对该状态做非 resume invoke 是未定义行为
+    pending = snapshot.values.get("pending_compaction") or []
+    if len(pending) < COMPACTION_BATCH_SIZE:
+        return
+    await graph.ainvoke(
+        {"new_compaction_request": True}, config=config, durability="sync"
+    )
+    # 刻意不调用 deliver_graph_output：compaction 无用户输出，且 deliver 对
+    # pending_files 非空的状态会重发“收到文件”提示。
+
+
 async def _log_conversation_turn(
     *,
     platform_name: str,
@@ -215,6 +235,7 @@ async def dispatch_fresh(
     files: tuple[IncomingFile, ...],
     locks: UserLocks,
     trace_id: str,
+    summarizer=None,
 ) -> None:
     session_key = _session_key(platform_name, user_id)
     started = time.monotonic()
@@ -265,6 +286,16 @@ async def dispatch_fresh(
             output_text, output_filename, output_success = await deliver_graph_output(
                 platform, user_id, state, trace_id=trace_id
             )
+            try:
+                # 压缩失败不改变本轮业务结果：compact 节点内部已有重试语义，这层
+                # 兜的是 invoke 本身的意外（如 checkpoint IO 错）。
+                await maybe_run_compaction(
+                    graph, {"configurable": {"thread_id": session_key}}, summarizer
+                )
+            except Exception:
+                logger.exception(
+                    "压缩回合失败 session=%s trace_id=%s", session_key, trace_id
+                )
         except Exception as exc:
             delivery_error = str(exc)
             # 文件可能已经成功而文字失败；不能再追加一条“处理失败”制造更多
@@ -303,6 +334,7 @@ async def handle_event(
     locks: UserLocks,
     memory_repository: JsonMemoryRepository,
     event: InboundEvent,
+    summarizer=None,
 ) -> None:
     if not event.text and event.file is None:
         return
@@ -377,6 +409,13 @@ async def handle_event(
                     output_text, output_filename, output_success = await deliver_graph_output(
                         platform, event.user_id, resumed_state, trace_id=trace_id
                     )
+                    try:
+                        # 同 dispatch_fresh：压缩失败只记录，不改变本轮业务结果。
+                        await maybe_run_compaction(graph, config, summarizer)
+                    except Exception:
+                        logger.exception(
+                            "压缩回合失败 session=%s trace_id=%s", session_key, trace_id
+                        )
                 except Exception as exc:
                     delivery_error = str(exc)
                     logger.exception(
@@ -444,17 +483,27 @@ async def main():
         main_agent = DeepSeekMainAgent()
         backend = ClaudeAgentSDKBackend()
         memory_repository = JsonMemoryRepository()
+        summarizer = ClaudeAgentSummarizer()
         graph = build_graph(
             main_agent,
             backend,
             memory_repository,
             checkpointer=checkpointer,
+            summarizer=summarizer,
         )
         locks = UserLocks()
         debouncer = Debouncer(
             DEBOUNCE_WINDOW_SECONDS,
             on_ready=lambda platform_name, user_id, text, files, trace_id: dispatch_fresh(
-                graph, platform, platform_name, user_id, text, files, locks, trace_id
+                graph,
+                platform,
+                platform_name,
+                user_id,
+                text,
+                files,
+                locks,
+                trace_id,
+                summarizer=summarizer,
             ),
         )
 
@@ -472,6 +521,7 @@ async def main():
                     locks,
                     memory_repository,
                     event,
+                    summarizer=summarizer,
                 )
             except asyncio.CancelledError:
                 raise

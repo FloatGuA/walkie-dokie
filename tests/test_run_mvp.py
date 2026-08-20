@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import walkie_dokie.artifacts as artifact_store
@@ -535,3 +536,215 @@ async def test_pending_files_notice_uses_deduped_display_name():
     text = platform.sent[0][1].text
     assert text.count("报价单.xlsx") == 1
     assert "报价单-2.xlsx" in text
+
+
+class CompactionGraph:
+    """fake Graph：``aget_state`` 按调用次序返回不同快照（第一次给回合本身的
+    resume 判定，第二次给投递后的 compaction 判定），并记录每次 ainvoke 的输入
+    和 durability。"""
+
+    def __init__(self, snapshots, *, compaction_error=None):
+        self._snapshots = list(snapshots)
+        self._compaction_error = compaction_error
+        self.state_calls = 0
+        self.invocations = []
+
+    async def aget_state(self, config):
+        snapshot = self._snapshots[min(self.state_calls, len(self._snapshots) - 1)]
+        self.state_calls += 1
+        return snapshot
+
+    async def ainvoke(self, value, config, durability=None):
+        self.invocations.append((value, durability))
+        if isinstance(value, dict) and value.get("new_compaction_request"):
+            if self._compaction_error is not None:
+                raise self._compaction_error
+            return {}
+        return {
+            "result": {"artifacts": [], "reply_text": "好的。", "success": True}
+        }
+
+
+def _idle_snapshot(pending_count):
+    return SimpleNamespace(
+        next=(),
+        interrupts=(),
+        values={
+            "pending_compaction": [
+                {"role": "user", "content": f"m{i}"} for i in range(pending_count)
+            ]
+        },
+    )
+
+
+def _compaction_invocations(graph):
+    return [
+        (value, durability)
+        for value, durability in graph.invocations
+        if isinstance(value, dict) and "new_compaction_request" in value
+    ]
+
+
+async def test_compaction_triggers_after_delivery_when_batch_full(monkeypatch):
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    graph = CompactionGraph([_idle_snapshot(0), _idle_snapshot(6)])
+    platform = FakePlatform()
+
+    await dispatch_fresh(
+        graph,
+        platform,
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        summarizer=object(),
+    )
+
+    assert len(graph.invocations) == 2
+    assert graph.invocations[1] == ({"new_compaction_request": True}, "sync")
+    # compaction 回合没有用户输出：deliver_graph_output 只能为正常回合跑一次。
+    assert [message.text for _user, message in platform.sent] == ["好的。"]
+    assert records[0].success is True
+
+
+async def test_compaction_skipped_when_pending_below_threshold(monkeypatch):
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    graph = CompactionGraph([_idle_snapshot(0), _idle_snapshot(5)])
+
+    await dispatch_fresh(
+        graph,
+        FakePlatform(),
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        summarizer=object(),
+    )
+
+    assert len(graph.invocations) == 1
+    assert _compaction_invocations(graph) == []
+
+
+async def test_compaction_skipped_while_waiting_for_confirmation(monkeypatch):
+    """对 interrupt 等待态做非 resume 的 compaction invoke 是未定义行为：带旗标的
+    checkpoint 会落盘、interrupt 重抛、compact 根本不跑，旗标就此粘滞。"""
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    waiting = SimpleNamespace(
+        next=("ask_confirm",),
+        interrupts=(object(),),
+        values={
+            "pending_compaction": [
+                {"role": "user", "content": f"m{i}"} for i in range(6)
+            ]
+        },
+    )
+    graph = CompactionGraph([_idle_snapshot(0), waiting])
+
+    await dispatch_fresh(
+        graph,
+        FakePlatform(),
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        summarizer=object(),
+    )
+
+    assert _compaction_invocations(graph) == []
+
+
+async def test_compaction_skipped_when_summarizer_none(monkeypatch):
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    graph = CompactionGraph([_idle_snapshot(0), _idle_snapshot(6)])
+
+    await dispatch_fresh(
+        graph,
+        FakePlatform(),
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="t1",
+    )
+
+    # 没有 summarizer 时连状态都不该查：aget_state 只有回合本身调用了一次。
+    assert graph.state_calls == 1
+    assert _compaction_invocations(graph) == []
+
+
+async def test_compaction_invoke_failure_does_not_fail_turn(monkeypatch, caplog):
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    graph = CompactionGraph(
+        [_idle_snapshot(0), _idle_snapshot(6)],
+        compaction_error=RuntimeError("checkpoint 写失败"),
+    )
+    platform = FakePlatform()
+
+    with caplog.at_level(logging.ERROR, logger="scripts.run_mvp"):
+        await dispatch_fresh(
+            graph,
+            platform,
+            "test",
+            "u1",
+            "你是谁？",
+            (),
+            UserLocks(),
+            trace_id="t1",
+            summarizer=object(),
+        )
+
+    assert records[0].success is True
+    assert [message.text for _user, message in platform.sent] == ["好的。"]
+    assert any(record.exc_info for record in caplog.records)
+
+
+async def test_compaction_triggers_after_confirm_resume_delivery(monkeypatch):
+    """第二个触发点：handle_event 的确认恢复分支投递完成后同样要触发压缩。"""
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    waiting = SimpleNamespace(
+        next=("ask_confirm",), interrupts=(object(),), values={"trace_id": "t0"}
+    )
+    graph = CompactionGraph([waiting, _idle_snapshot(6)])
+
+    await handle_event(
+        graph,
+        FakePlatform(),
+        object(),  # debouncer.add is unreachable once resumed_state is set
+        UserLocks(),
+        object(),  # memory_repository is unreachable outside /long-term-memory
+        InboundEvent("test", "u1", "是", None),
+        summarizer=object(),
+    )
+
+    assert graph.invocations[1] == ({"new_compaction_request": True}, "sync")
