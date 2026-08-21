@@ -13,6 +13,10 @@
    一律复位重寄——宁可重发一次，不可静默丢件。
 4. 去重：inbox_seen 挡住平台的重复推送（飞书会重投），7 天 TTL。
 
+outbox 表是永久投递账本，**有意不清理**：跟 inbox_seen 的 7 天 TTL 不对称是设计
+而非疏漏——去重记录过期即无用，投递记录过期仍是"这条到底寄没寄出去"的唯一证据。
+单用户量级下全表扫描实测无感，多用户上量再考虑 status 索引。
+
 时间一律由调用方以 ``now: datetime`` 注入，模块内不读时钟：退避表是分钟级的，
 测试要能瞬间把时钟推到 10 分钟后。
 """
@@ -243,10 +247,11 @@ class Outbox:
     def record_event(self, event_id: str, *, now: datetime) -> None:
         """记下这条事件已经见过。重复落记是静默 no-op。
 
-        OR IGNORE 不是防御性兜底：两条重复推送并发到达时都会先 seen_event 得到
-        False 再各自 record，普通 INSERT 在这里必然撞 PRIMARY KEY。忽略而不是
-        覆盖，是因为 seen_at 撑着 7 天 TTL——每重投一次就刷新时间戳的话，去重记录
-        会被平台的重试永远续命。
+        OR IGNORE 是前瞻防御，不是当下的并发兜底：单事件循环下 seen_event→record
+        之间没有 await，同一进程内不存在两条重复推送都读到 False 的窗口。留着是为
+        了未来多进程/多副本共享同一个 db 的场景——那时普通 INSERT 会撞 PRIMARY KEY。
+        忽略而不是覆盖，是因为 seen_at 撑着 7 天 TTL——每重投一次就刷新时间戳的话，
+        去重记录会被平台的重试永远续命。
         """
         with self._connect() as connection:
             connection.execute(

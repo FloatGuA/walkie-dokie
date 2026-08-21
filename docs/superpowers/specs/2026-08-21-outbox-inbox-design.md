@@ -54,7 +54,7 @@ workspace 文件"用完不自动删"的既有策略保证 file payload 的路径
 ### 2. `deliver_graph_output` 拆分（`scripts/run_mvp.py`）
 
 - `build_outbound_messages(state) -> list[tuple[kind, payload]]`：纯函数，迁移现有全部组装逻辑（interrupt 确认话术、"收到文件请说明"、文件在前文字在后、result 空态等），只组装不发送。
-- 回合终点改为：`outbox.enqueue(...)` → turn log（success=图成功且入队成功；error 不再承载投递失败）→ compaction 检查 → 放锁 → `worker_wakeup.set()`。用户等待时长 = 图 + 本地入队。
+- 回合终点改为：`outbox.enqueue(...)` → compaction 检查 → turn log（success=图成功且入队成功；error 不再承载投递失败）→ 放锁 → `worker_wakeup.set()`。用户等待时长 = 图 + 本地入队（时长在入队完成的一刻定格，不含其后的 compaction）。compaction 排在 turn log 之前沿用 pre-branch 顺序且有专测：代价是崩在 compaction 中时这一轮的 turn log 缺失，但输出已经入队，没有业务损失。
 - 两个调用点（dispatch_fresh / handle_event resume 分支）同改；异常路径的 fallback 话术同样走 enqueue（不再直接 send）。
 
 ### 3. 投递 worker（`scripts/run_mvp.py` 内常驻 asyncio task）
