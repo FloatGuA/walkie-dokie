@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,8 @@ from scripts.run_mvp import (
     _invoke_from_event,
     _waiting_for_confirmation,
     build_outbound_messages,
+    deliver_due_once,
+    delivery_worker,
     dispatch_fresh,
     handle_event,
 )
@@ -1331,3 +1334,203 @@ async def test_confirm_resume_output_is_enqueued_and_wakes_worker(
     ]
     assert platform.sent == []
     assert wakeup.is_set()
+
+
+# --- 投递 worker -------------------------------------------------------------
+# 时间一律用固定时钟往前推（``now=`` 注入），不 monkeypatch time：退避表是
+# 30s/2m/10m，真等一遍要 11 分钟，假时钟让"到期没到期"变成纯断言。约定同
+# tests/test_outbox.py。
+
+T0 = datetime(2026, 8, 21, 10, 0, 0)
+
+
+class DeliveryPlatform:
+    """投递侧的 fake 平台：记录每次成功 send，可编程抛错 / 长睡（测超时）。"""
+
+    def __init__(self, *, error=None, error_users=(), delay=None):
+        self.sent = []
+        self._error = error
+        self._error_users = set(error_users)
+        self._delay = delay
+
+    async def send(self, user_id, message):
+        if self._delay is not None:
+            await asyncio.sleep(self._delay)
+        if self._error is not None and (
+            not self._error_users or user_id in self._error_users
+        ):
+            raise RuntimeError(self._error)
+        self.sent.append((user_id, message))
+
+
+def _workspace_reference(monkeypatch, tmp_path, filename, content):
+    root = tmp_path / "workspaces"
+    root.mkdir(exist_ok=True)
+    artifact = root / filename
+    artifact.write_bytes(content)
+    monkeypatch.setattr(artifact_store, "WORKSPACES_ROOT", root)
+    return artifact_store.output_artifact_reference(
+        artifact, filename, "application/octet-stream"
+    )
+
+
+async def test_deliver_due_once_sends_in_order_and_marks_delivered(
+    monkeypatch, tmp_path, outbox, db_path, caplog
+):
+    """一个回合的两条消息必须按 seq 先后寄出：文件先到，"都改好了"后到。
+
+    ``due_batch`` 每 session 只给队头，所以"发完一条才轮到下一条"这件事由连续
+    两次 ``deliver_due_once`` 体现——中间那条 delivered 之前，第二条取不出来。
+    """
+
+    reference = _workspace_reference(monkeypatch, tmp_path, "result.docx", b"document")
+    outbox.enqueue(
+        "test:u1",
+        "t1",
+        [("file", reference), ("text", {"text": "都改好了"})],
+        now=T0,
+    )
+    platform = DeliveryPlatform()
+
+    caplog.set_level(logging.INFO, logger="scripts.run_mvp")
+    assert await deliver_due_once(outbox, platform, now=T0) == 1
+    assert len(platform.sent) == 1
+    assert await deliver_due_once(outbox, platform, now=T0) == 1
+
+    assert [user_id for user_id, _message in platform.sent] == ["u1", "u1"]
+    first, second = platform.sent[0][1], platform.sent[1][1]
+    assert first.text is None
+    assert first.file.filename == "result.docx"
+    assert first.file.content == b"document"
+    assert second.file is None
+    assert second.text == "都改好了"
+
+    rows = _outbox_rows(db_path)
+    assert [row["status"] for row in rows] == ["delivered", "delivered"]
+    assert all(row["delivered_at"] == T0.isoformat() for row in rows)
+    # 送达日志带 trace_id/session，死信排查时靠它把一条消息和回合串起来。
+    delivered_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "送达" in record.getMessage()
+    ]
+    assert len(delivered_logs) == 2
+    assert "t1" in delivered_logs[0] and "test:u1" in delivered_logs[0]
+
+
+async def test_send_failure_backs_off_then_dead(outbox, db_path, caplog):
+    """三档退避（30s/2m/10m）全部用完之后的第 4 次失败才转死信；期间不到点不取件。"""
+
+    outbox.enqueue("test:u1", "t1", [("text", {"text": "都改好了"})], now=T0)
+    platform = DeliveryPlatform(error="平台 500")
+    caplog.set_level(logging.INFO, logger="scripts.run_mvp")
+
+    assert await deliver_due_once(outbox, platform, now=T0) == 1
+    row = _outbox_rows(db_path)[0]
+    assert (row["status"], row["attempts"]) == ("pending", 1)
+    assert row["next_attempt_at"] == (T0 + timedelta(seconds=30)).isoformat()
+    assert "平台 500" in row["last_error"]
+
+    # 退避窗口内不取件：差 1 秒也不发。
+    assert await deliver_due_once(outbox, platform, now=T0 + timedelta(seconds=29)) == 0
+
+    assert await deliver_due_once(outbox, platform, now=T0 + timedelta(seconds=30)) == 1
+    row = _outbox_rows(db_path)[0]
+    assert (row["status"], row["attempts"]) == ("pending", 2)
+    assert row["next_attempt_at"] == (T0 + timedelta(seconds=150)).isoformat()
+
+    assert await deliver_due_once(outbox, platform, now=T0 + timedelta(seconds=150)) == 1
+    row = _outbox_rows(db_path)[0]
+    assert (row["status"], row["attempts"]) == ("pending", 3)
+    assert row["next_attempt_at"] == (T0 + timedelta(seconds=750)).isoformat()
+
+    assert await deliver_due_once(outbox, platform, now=T0 + timedelta(seconds=750)) == 1
+    row = _outbox_rows(db_path)[0]
+    assert (row["status"], row["attempts"]) == ("dead", 4)
+    assert platform.sent == []
+    assert [item["id"] for item in outbox.dead_letters("test:u1")] == [row["id"]]
+    # 死信 WARNING 是 mark_failed 自带的，worker 不再补一条——一次死信一条告警。
+    dead_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "死信" in record.getMessage()
+    ]
+    assert len(dead_warnings) == 1
+
+
+async def test_single_failure_does_not_block_other_sessions(outbox, db_path):
+    """同一批里一条 send 抛错，绝不能带走本批其余会话的投递。"""
+
+    outbox.enqueue("test:u1", "t1", [("text", {"text": "给 u1 的"})], now=T0)
+    outbox.enqueue("test:u2", "t2", [("text", {"text": "给 u2 的"})], now=T0)
+    platform = DeliveryPlatform(error="只有 u1 失败", error_users={"u1"})
+
+    assert await deliver_due_once(outbox, platform, now=T0) == 2
+
+    assert [user_id for user_id, _message in platform.sent] == ["u2"]
+    rows = {row["session_key"]: row for row in _outbox_rows(db_path)}
+    assert rows["test:u1"]["status"] == "pending"
+    assert rows["test:u1"]["attempts"] == 1
+    assert rows["test:u2"]["status"] == "delivered"
+
+
+async def test_worker_startup_resets_sending_and_redelivers(outbox, db_path, caplog):
+    """进程崩在 sending 上：启动 reset 之后必须重寄，且只留下一条 delivered。"""
+
+    outbox.enqueue("test:u1", "t1", [("text", {"text": "都改好了"})], now=datetime.now())
+    stuck_id = _outbox_rows(db_path)[0]["id"]
+    outbox.mark_sending(stuck_id)
+    platform = DeliveryPlatform()
+    caplog.set_level(logging.INFO, logger="scripts.run_mvp")
+
+    task = asyncio.create_task(delivery_worker(outbox, platform, asyncio.Event()))
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if platform.sent:
+                break
+        # 再给它几轮空转的机会，确认不会重复寄第二次。
+        await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert len(platform.sent) == 1
+    assert platform.sent[0][1].text == "都改好了"
+    rows = _outbox_rows(db_path)
+    assert [row["status"] for row in rows] == ["delivered"]
+    assert any(
+        "重" in record.getMessage() and record.levelno == logging.INFO
+        for record in caplog.records
+    )
+
+
+async def test_send_timeout_counts_as_failure(monkeypatch, outbox, db_path):
+    """卡住的 send 不能把 worker 一起卡死：超时按一次投递失败算，进退避表。"""
+
+    monkeypatch.setattr("scripts.run_mvp._SEND_TIMEOUT_SECONDS", 0.01)
+    outbox.enqueue("test:u1", "t1", [("text", {"text": "都改好了"})], now=T0)
+    platform = DeliveryPlatform(delay=5)
+
+    assert await deliver_due_once(outbox, platform, now=T0) == 1
+
+    row = _outbox_rows(db_path)[0]
+    assert (row["status"], row["attempts"]) == ("pending", 1)
+    assert "TimeoutError" in row["last_error"]
+    assert platform.sent == []
+
+
+async def test_file_payload_resolves_reference(monkeypatch, tmp_path, outbox, db_path):
+    """file 行只存路径引用，bytes 在发送这一刻才从磁盘读出来交给平台。"""
+
+    reference = _workspace_reference(monkeypatch, tmp_path, "报表.xlsx", b"\x50\x4b\x03\x04")
+    outbox.enqueue("test:u1", "t1", [("file", reference)], now=T0)
+    platform = DeliveryPlatform()
+
+    assert await deliver_due_once(outbox, platform, now=T0) == 1
+
+    _user_id, message = platform.sent[0]
+    assert message.file.filename == "报表.xlsx"
+    assert message.file.content == b"\x50\x4b\x03\x04"
+    assert message.file.mime_type == reference["mime_type"]
+    assert _outbox_rows(db_path)[0]["status"] == "delivered"

@@ -24,7 +24,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
-from walkie_dokie.artifacts import display_name, store_incoming_file
+from walkie_dokie.artifacts import (
+    display_name,
+    resolve_artifact_reference,
+    store_incoming_file,
+)
 from walkie_dokie.logging_config import setup_logging
 from walkie_dokie.main_agent import (
     DeepSeekMainAgent,
@@ -38,13 +42,20 @@ from walkie_dokie.orchestrator.debounce import Debouncer
 from walkie_dokie.orchestrator.graph import COMPACTION_BATCH_SIZE
 from walkie_dokie.orchestrator.locks import UserLocks
 from walkie_dokie.orchestrator.outbox import Outbox
-from walkie_dokie.platforms.base import IncomingFile, InboundEvent
+from walkie_dokie.platforms.base import IncomingFile, InboundEvent, OutboundMessage
 from walkie_dokie.platforms.feishu import FeishuAdapter
 from walkie_dokie.turn_log import TurnRecord, log_turn
 
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_WINDOW_SECONDS = 10.0
+# 单条 send 的上限。平台 SDK 自己的超时不可靠（连上了但不返回），worker 是单
+# 协程串行发件，一条卡住就等于整个投递停摆——宁可当失败进退避表重发一次。
+_SEND_TIMEOUT_SECONDS = 30
+# 空批时最多睡这么久；入队方 wakeup.set() 会提前叫醒，所以这只是兜底轮询周期。
+_IDLE_POLL_SECONDS = 1.0
+# inbox 去重表的 TTL 清理节流：删的是 7 天前的行，一小时一次远远够用。
+_SEEN_PURGE_INTERVAL_SECONDS = 3600.0
 # v2 状态 schema 引入 MainAgent decision，不能拿旧 draft_task_prompt checkpoint
 # 直接恢复；开发阶段明确换一份数据库，旧库保留供复盘，不做破坏性删除。
 CHECKPOINT_DB_PATH = Path(__file__).parent.parent / "var" / "checkpoints-v2.db"
@@ -192,6 +203,111 @@ def _wake_delivery_worker(wakeup: asyncio.Event | None) -> None:
 
     if wakeup is not None:
         wakeup.set()
+
+
+def _outbound_from_row(row: dict) -> OutboundMessage:
+    """outbox 行 -> 平台出站消息。file 行的 bytes 到这一刻才从磁盘读出来。
+
+    引用解析（越界/不存在/文件名不一致）失败会抛，调用方按一次投递失败处理：
+    产物没了是这条消息的问题，不该让整个 worker 陪葬。
+    """
+
+    payload = row["payload"]
+    if row["kind"] == "file":
+        path = resolve_artifact_reference(payload)
+        return OutboundMessage(
+            file=IncomingFile(
+                filename=payload["filename"],
+                content=path.read_bytes(),
+                mime_type=payload["mime_type"],
+            )
+        )
+    return OutboundMessage(text=payload["text"])
+
+
+async def deliver_due_once(outbox: Outbox, platform, *, now: datetime) -> int:
+    """把当前到期的一批（每 session 至多一条队头）寄出去，返回处理条数。
+
+    一条 send 抛错绝不中断本批其余条目：这一批里每个会话互不相干，u1 的平台
+    500 不该让 u2 的文件也压到下一轮。失败一律走 ``mark_failed``（退避/死信由
+    它决定），成功走 ``mark_delivered``。
+    """
+
+    rows = outbox.due_batch(now)
+    for row in rows:
+        session_key = row["session_key"]
+        # 队列里存的是 session_key（platform:user_id），平台要的是 user_id。
+        user_id = session_key.split(":", 1)[1]
+        outbox.mark_sending(row["id"])
+        try:
+            message = _outbound_from_row(row)
+            async with asyncio.timeout(_SEND_TIMEOUT_SECONDS):
+                await platform.send(user_id, message)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "消息投递失败 session=%s trace_id=%s id=%d kind=%s error=%s",
+                session_key,
+                row["trace_id"],
+                row["id"],
+                row["kind"],
+                error,
+            )
+            # 重试排期的 INFO 和转死信的 WARNING 都由 mark_failed 自己记，这里
+            # 不重复——死信告警重复两条会让"一条告警=一次人工介入"失效。
+            outbox.mark_failed(row["id"], error, now=now)
+        else:
+            outbox.mark_delivered(row["id"], now=now)
+            logger.info(
+                "消息已送达 session=%s trace_id=%s id=%d kind=%s attempts=%d",
+                session_key,
+                row["trace_id"],
+                row["id"],
+                row["kind"],
+                row["attempts"] + 1,
+            )
+    return len(rows)
+
+
+async def delivery_worker(outbox: Outbox, platform, wakeup: asyncio.Event) -> None:
+    """常驻投递协程：整个进程里唯一会调 ``platform.send`` 的地方。
+
+    启动先 ``reset_sending``——上次进程崩在 sending 上时没人知道平台收到没有，
+    一律重寄（at-least-once：宁可重发一次，不可静默丢件）。
+
+    然后永循环取件。有件就立刻取下一批（连发同一会话的后续消息不必等一轮
+    轮询），空批则等 ``wakeup`` 或 1 秒超时——入队方 set 之后这里立刻醒。
+
+    外层兜住所有异常并继续：投递系统存活优先于任何单轮的正确性，worker 死了
+    等于所有用户的消息全部停发。
+    """
+
+    reset = outbox.reset_sending()
+    if reset:
+        logger.info("投递 worker 启动：%d 条卡在 sending 的消息将重寄", reset)
+    last_purge: float | None = None
+    while True:
+        try:
+            now = datetime.now()
+            handled = await deliver_due_once(outbox, platform, now=now)
+            if (
+                last_purge is None
+                or time.monotonic() - last_purge >= _SEEN_PURGE_INTERVAL_SECONDS
+            ):
+                last_purge = time.monotonic()
+                purged = outbox.purge_expired_seen(now=now)
+                if purged:
+                    logger.info("清理过期的事件去重记录 %d 条", purged)
+            if handled == 0:
+                try:
+                    await asyncio.wait_for(wakeup.wait(), timeout=_IDLE_POLL_SECONDS)
+                except TimeoutError:
+                    pass  # 没人叫醒就是没新件，正常路径
+                wakeup.clear()
+        except Exception:
+            logger.exception("投递 worker 本轮异常，继续下一轮")
+            # 故障持续时（比如库文件锁死）不空转刷屏，退到轮询周期上重试。
+            await asyncio.sleep(_IDLE_POLL_SECONDS)
 
 
 async def maybe_run_compaction(graph, config: dict, summarizer) -> None:
@@ -557,6 +673,10 @@ async def main():
         )
 
         platform.start()
+        # 不做优雅停机：进程退出就地停发，未送达的消息下次启动由 reset_sending +
+        # due_batch 接着寄——这正是 at-least-once 想要的语义。局部变量持有引用，
+        # 免得 task 被 GC 掉（asyncio 只持弱引用）。
+        delivery_task = asyncio.create_task(delivery_worker(outbox, platform, wakeup))
         logger.info("MVP 胶水循环已启动，会话状态落盘到 %s，等待飞书消息……（Ctrl+C 停止）", CHECKPOINT_DB_PATH)
 
         in_flight: set[asyncio.Task] = set()
