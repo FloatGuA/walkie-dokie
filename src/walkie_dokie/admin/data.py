@@ -229,6 +229,103 @@ def read_memory(memory_dir: Path, checkpoint_db: Path) -> dict:
     return {"users": users, "checkpoint_error": checkpoint_error}
 
 
+def list_sessions(
+    turns_path: Path,
+    memory_dir: Path,
+    checkpoint_db: Path,
+    model_calls_path: Path,
+) -> dict:
+    """一行一个用户的 session 索引：回合数、失败数、成本、记忆状态。
+
+    三个源（回合日志 / 记忆 / 成本）按 ``(platform, user_id)`` 取**并集**，理由同
+    ``read_memory``：只显示交集会让"只落了日志还没写记忆"和"记忆在但日志被轮转过"
+    这两种最该被看见的状态从列表上消失。
+
+    每个源都复用既有读取函数，绝不在这里重新解析 JSONL 或重算成本——抄一份聚合，
+    列表页和成本页迟早会给出两个对不上的数字。
+
+    成本沿用 ``read_costs`` 的默认 7 天窗口：侧栏的金额是"最近一周"的量级参考，
+    不是这个用户的历史总额（历史总额没有任何一个源存着，现算要全量扫）。
+
+    排序：按 ``last_active`` 倒序，从没落过回合的排最后（不是排最前，也不是按
+    名字插进中间）——运维台第一眼要看的是"刚刚谁在说话"。
+    """
+    turn_records, turn_skipped = _read_jsonl(turns_path)
+    memory = read_memory(memory_dir, checkpoint_db)
+    costs = read_costs(model_calls_path)
+
+    sessions: dict[tuple[str, str], dict] = {}
+
+    def bucket(platform: str, user_id: str) -> dict:
+        key = (platform, user_id)
+        if key not in sessions:
+            sessions[key] = {
+                "platform": platform,
+                "user_id": user_id,
+                "last_active": None,
+                "turn_count": 0,
+                "failed_count": 0,
+                "cost_usd": 0.0,
+                "cost_calls": 0,
+                "has_profile": False,
+                "summary_count": 0,
+                "pending_compaction": 0,
+            }
+        return sessions[key]
+
+    for record in turn_records:
+        user_id = record.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            # 归不到任何用户的回合没法在这个视图里显示。它仍然出现在回合详情里，
+            # 这里不编一个空用户出来占一行。
+            continue
+        platform = record.get("platform")
+        entry = bucket(platform if isinstance(platform, str) else "", user_id)
+        entry["turn_count"] += 1
+        # 缺 success 字段的按成功算：把"字段没写"渲染成红点会让看板天天飘红。
+        if not record.get("success", True):
+            entry["failed_count"] += 1
+        stamp = record.get("timestamp")
+        if isinstance(stamp, str) and (
+            entry["last_active"] is None or stamp > entry["last_active"]
+        ):
+            entry["last_active"] = stamp
+
+    for user in memory["users"]:
+        entry = bucket(user["platform"], user["user_id"])
+        entry["has_profile"] = bool(user["profile"])
+        entry["summary_count"] = len(user["summary"])
+        entry["pending_compaction"] = user["pending_compaction"]
+
+    for row in costs["aggregate"]["by_user"]:
+        platform, separator, user_id = str(row["owner"]).partition(":")
+        if not separator:
+            # aggregate 把没有 platform/user_id 的调用归到 "unknown"，它不是某个
+            # 用户，拆不回二元组，也不该在 session 列表里冒充一行。
+            continue
+        entry = bucket(platform, user_id)
+        entry["cost_usd"] = row["cost_usd"]
+        entry["cost_calls"] = row["calls"]
+
+    rows = list(sessions.values())
+    active = sorted(
+        [row for row in rows if row["last_active"]],
+        key=lambda row: row["last_active"],
+        reverse=True,
+    )
+    silent = sorted(
+        [row for row in rows if not row["last_active"]],
+        key=lambda row: (row["platform"], row["user_id"]),
+    )
+    return {
+        "sessions": active + silent,
+        # 两个 JSONL 都在这个视图里出数据，坏行合并计数：页面只有一句"跳过 N 行"，
+        # 分开报会让人以为另一个文件是干净的。
+        "skipped_lines": turn_skipped + costs["skipped_lines"],
+        "checkpoint_error": memory["checkpoint_error"],
+    }
+
+
 def list_eval_reports(evals_dir: Path) -> dict:
     """eval 报告索引，最新在前。
 

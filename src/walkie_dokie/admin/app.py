@@ -1,4 +1,4 @@
-"""观测台的 HTTP 层：把 ``admin.data`` 的五个读取函数暴露成六个只读端点。
+"""观测台的 HTTP 层：把 ``admin.data`` 的六个读取函数暴露成七个只读端点。
 
 全只读，没有任何 POST/PUT/DELETE——这个面板只看被观测的 bot，绝不改它的数据。
 路由只做三件事：读模块常量拿路径、调 data 层、把返回的 dict 原样交出去。
@@ -21,6 +21,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from walkie_dokie import model_call_log, turn_log
 from walkie_dokie.admin.data import (
     list_eval_reports,
+    list_sessions,
     read_costs,
     read_eval_report,
     read_memory,
@@ -60,6 +61,10 @@ def create_app() -> FastAPI:
         if not INDEX_HTML_PATH.is_file():
             raise HTTPException(status_code=404, detail="index.html 不存在")
         return FileResponse(INDEX_HTML_PATH)
+
+    @app.get("/api/sessions")
+    def sessions() -> dict:
+        return list_sessions(TURNS_PATH, MEMORY_DIR, CHECKPOINT_DB, MODEL_CALLS_PATH)
 
     @app.get("/api/turns")
     def turns(limit: int = 50, user: str | None = None) -> dict:

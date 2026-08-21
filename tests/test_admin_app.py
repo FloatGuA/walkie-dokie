@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from walkie_dokie.admin import app as app_module  # noqa: E402
 from walkie_dokie.admin.data import (  # noqa: E402
     list_eval_reports,
+    list_sessions,
     read_costs,
     read_memory,
     read_turns,
@@ -157,6 +158,59 @@ def test_memory_endpoint_empty_state(client):
     response = client.get("/api/memory")
     assert response.status_code == 200
     assert response.json() == {"users": [], "checkpoint_error": None}
+
+
+def test_sessions_endpoint_passes_through(client, paths):
+    from datetime import datetime
+
+    _write_jsonl(
+        paths.turns,
+        [
+            {"timestamp": "2026-08-20T09:00:00", "platform": "feishu", "user_id": "ou_alice",
+             "record_type": "conversation", "success": True},
+            {"timestamp": "2026-08-20T09:30:00", "platform": "feishu", "user_id": "ou_alice",
+             "record_type": "conversation", "success": False, "error": "炸了"},
+            {"timestamp": "2026-08-20T08:00:00", "platform": "eval", "user_id": "t-x1",
+             "record_type": "conversation", "success": True},
+        ],
+    )
+    _write_jsonl(
+        paths.model_calls,
+        [
+            {
+                "timestamp": datetime.now().isoformat(),
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "purpose": "decide",
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "platform": "feishu",
+                "user_id": "ou_alice",
+            }
+        ],
+    )
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    # 薄透传：HTTP 层不重新包装字段，响应就是 data 层返回的那个 dict。
+    assert response.json() == list_sessions(
+        paths.turns, paths.memory, paths.checkpoint, paths.model_calls
+    )
+    sessions = response.json()["sessions"]
+    assert [s["user_id"] for s in sessions] == ["ou_alice", "t-x1"]
+    assert sessions[0]["platform"] == "feishu"
+    assert sessions[0]["turn_count"] == 2
+    assert sessions[0]["failed_count"] == 1
+    assert sessions[0]["cost_usd"] > 0
+
+
+def test_sessions_endpoint_empty_state(client):
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    assert response.json() == {
+        "sessions": [],
+        "skipped_lines": 0,
+        "checkpoint_error": None,
+    }
 
 
 def _write_report(evals_dir, name, payload):

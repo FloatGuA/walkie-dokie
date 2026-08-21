@@ -8,6 +8,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from walkie_dokie.admin.data import (
     list_eval_reports,
+    list_sessions,
     read_costs,
     read_eval_report,
     read_memory,
@@ -314,6 +315,164 @@ def test_read_memory_keeps_unreadable_profile_as_empty(tmp_path):
     assert len(result["users"]) == 1
     assert result["users"][0]["profile"] == {}
     assert result["users"][0]["user_id"] == "v2_aaa_bbb.json"
+
+
+# --- list_sessions -------------------------------------------------------
+# session 列表是观测台的主视图：一行一个用户，聚合了他的回合数、失败数、成本和
+# 记忆状态。四个数据源各自可能缺失，测试要钉住"任何一个源里出现过的用户都不许
+# 从列表上消失"。
+
+
+def _write_model_calls(path: Path, rows):
+    """带今天时间戳的调用日志——read_costs 的窗口按真实时钟算，写死日期会过期。"""
+    _write_jsonl(
+        path,
+        [
+            {
+                "timestamp": datetime.now().isoformat(),
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "purpose": "decide",
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                **row,
+            }
+            for row in rows
+        ],
+    )
+
+
+def _session(result, platform, user_id):
+    matches = [
+        s
+        for s in result["sessions"]
+        if s["platform"] == platform and s["user_id"] == user_id
+    ]
+    assert len(matches) == 1, f"{platform}:{user_id} 未唯一出现于 {result['sessions']}"
+    return matches[0]
+
+
+async def test_list_sessions_unions_turns_memory_and_costs(tmp_path):
+    turns = tmp_path / "turns.jsonl"
+    memory_dir = tmp_path / "memory"
+    db = tmp_path / "cp.db"
+    calls = tmp_path / "model_calls.jsonl"
+
+    _write_jsonl(turns, [
+        {"timestamp": "2026-08-20T09:00:00", "platform": "feishu", "user_id": "ou_alice",
+         "record_type": "conversation", "success": True},
+        {"timestamp": "2026-08-20T09:00:30", "platform": "feishu", "user_id": "ou_alice",
+         "record_type": "execution", "success": False, "error": "炸了"},
+        {"timestamp": "2026-08-20T10:00:00", "platform": "eval", "user_id": "t-x1",
+         "record_type": "conversation", "success": True},
+    ])
+    _write_profile(memory_dir, "feishu", "ou_alice", {"name": "浮瓜"})
+    _write_profile(memory_dir, "feishu", "ou_bob", {"name": "老王"})
+    await _seed_checkpoint(
+        db,
+        memory_dir,
+        platform="feishu",
+        user_id="ou_alice",
+        summary=[{"fact": "孙女叫小雨", "evidence": ["我孙女小雨"]}],
+        pending=[{"role": "user", "content": "旧消息"}],
+    )
+    _write_model_calls(calls, [
+        {"platform": "feishu", "user_id": "ou_alice"},
+        {"platform": "test", "user_id": "u_costonly"},
+    ])
+
+    result = list_sessions(turns, memory_dir, db, calls)
+
+    assert result["checkpoint_error"] is None
+    assert result["skipped_lines"] == 0
+
+    alice = _session(result, "feishu", "ou_alice")
+    assert alice["turn_count"] == 2
+    assert alice["failed_count"] == 1
+    assert alice["last_active"] == "2026-08-20T09:00:30"
+    assert alice["has_profile"] is True
+    assert alice["summary_count"] == 1
+    assert alice["pending_compaction"] == 1
+    assert alice["cost_usd"] > 0
+    assert alice["cost_calls"] == 1
+
+    # 只有回合、没档案没成本的用户
+    evaluated = _session(result, "eval", "t-x1")
+    assert evaluated["turn_count"] == 1
+    assert evaluated["failed_count"] == 0
+    assert evaluated["has_profile"] is False
+    assert evaluated["summary_count"] == 0
+    assert evaluated["cost_usd"] == 0
+    assert evaluated["cost_calls"] == 0
+
+    # 只有成本、还没落过回合日志的用户（比如日志被轮转过）
+    cost_only = _session(result, "test", "u_costonly")
+    assert cost_only["turn_count"] == 0
+    assert cost_only["last_active"] is None
+    assert cost_only["cost_usd"] > 0
+
+    # 只有档案、没有 thread 对得上的：文件名逆不回 ID，按 read_memory 的形状原样出现
+    orphan_name = JsonMemoryRepository(memory_dir)._path("feishu", "ou_bob").name
+    orphan = _session(result, "", orphan_name)
+    assert orphan["has_profile"] is True
+    assert orphan["turn_count"] == 0
+    assert orphan["last_active"] is None
+
+
+def test_list_sessions_orders_by_last_active_desc_with_none_last(tmp_path):
+    turns = tmp_path / "turns.jsonl"
+    calls = tmp_path / "model_calls.jsonl"
+    _write_jsonl(turns, [
+        {"timestamp": "2026-08-20T08:00:00", "platform": "feishu", "user_id": "old"},
+        {"timestamp": "2026-08-20T20:00:00", "platform": "feishu", "user_id": "fresh"},
+        {"timestamp": "2026-08-20T12:00:00", "platform": "feishu", "user_id": "mid"},
+    ])
+    _write_model_calls(calls, [{"platform": "feishu", "user_id": "silent"}])
+
+    result = list_sessions(turns, tmp_path / "absent-memory", tmp_path / "absent.db", calls)
+
+    # 最近说过话的排最前；从没落过回合的排最后，不许插到中间去
+    assert [s["user_id"] for s in result["sessions"]] == ["fresh", "mid", "old", "silent"]
+
+
+def test_list_sessions_empty_state(tmp_path):
+    assert list_sessions(
+        tmp_path / "absent-turns.jsonl",
+        tmp_path / "absent-memory",
+        tmp_path / "absent.db",
+        tmp_path / "absent-calls.jsonl",
+    ) == {"sessions": [], "skipped_lines": 0, "checkpoint_error": None}
+
+
+def test_list_sessions_counts_skipped_lines_from_both_logs(tmp_path):
+    turns = tmp_path / "turns.jsonl"
+    calls = tmp_path / "model_calls.jsonl"
+    _write_jsonl(turns, [
+        {"timestamp": "2026-08-20T08:00:00", "platform": "feishu", "user_id": "u1"},
+        "半行被截断{",
+    ])
+    _write_jsonl(calls, ["也是坏行{", "[1, 2]"])
+
+    result = list_sessions(turns, tmp_path / "absent-memory", tmp_path / "absent.db", calls)
+
+    # 两个 JSONL 都在这个视图里出数据，坏行合并计数，不静默吞掉
+    assert result["skipped_lines"] == 3
+    assert [s["user_id"] for s in result["sessions"]] == ["u1"]
+
+
+def test_list_sessions_reports_checkpoint_error(tmp_path):
+    db = tmp_path / "garbage.db"
+    db.write_text("这不是 sqlite 文件", encoding="utf-8")
+    turns = tmp_path / "turns.jsonl"
+    _write_jsonl(turns, [
+        {"timestamp": "2026-08-20T08:00:00", "platform": "feishu", "user_id": "u1"},
+    ])
+
+    result = list_sessions(turns, tmp_path / "absent-memory", db, tmp_path / "absent.jsonl")
+
+    assert result["checkpoint_error"]
+    # checkpoint 挂了不该让整张列表消失，回合那一半照常出
+    assert _session(result, "feishu", "u1")["turn_count"] == 1
 
 
 def _write_eval_report(evals_dir: Path, name: str, **fields) -> Path:
