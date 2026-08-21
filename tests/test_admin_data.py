@@ -48,6 +48,23 @@ def test_read_turns_skips_bad_lines_and_reports_count(tmp_path):
     assert result["skipped_lines"] == 1
 
 
+def test_read_turns_skips_non_dict_lines(tmp_path):
+    """合法 JSON 但不是对象的行也是坏行。
+
+    ``null`` / 数组 / 裸字符串都能被 ``json.loads`` 解析，混进 records 后
+    ``read_turns(user=...)`` 会在 ``item.get`` 上炸成 500，页面上就是整个回合表
+    消失。守门放在读取处，坏行照常计入 ``skipped_lines``。
+    """
+    path = tmp_path / "turns.jsonl"
+    _write_jsonl(path, ["null", "[1, 2]", '"str"', {"timestamp": "t1", "user_id": "u1"}])
+
+    result = read_turns(path)
+
+    assert result["turns"] == [{"timestamp": "t1", "user_id": "u1"}]
+    assert result["skipped_lines"] == 3
+    assert read_turns(path, user="u1")["turns"] == [{"timestamp": "t1", "user_id": "u1"}]
+
+
 def test_read_turns_missing_file_is_empty_state(tmp_path):
     result = read_turns(tmp_path / "absent.jsonl")
     assert result == {"turns": [], "skipped_lines": 0}
@@ -168,6 +185,10 @@ async def test_read_memory_merges_profiles_and_checkpoint_summary(tmp_path):
     assert user["profile"] == {"name": "浮瓜", "department": "研发"}
     assert user["summary"] == [{"fact": "孙女叫小雨", "evidence": ["我孙女小雨"]}]
     assert user["pending_compaction"] == 2
+    # evidence 是 list[str]（Summarizer 的契约，原样穿过 checkpoint）。钉住它，
+    # 因为前端要按数组渲染——退回标量的那天，页面会把多条原文粘成一串。
+    for entry in user["summary"]:
+        assert isinstance(entry["evidence"], list)
 
 
 async def test_read_memory_shows_checkpoint_user_without_profile(tmp_path):

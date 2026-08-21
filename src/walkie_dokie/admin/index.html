@@ -81,6 +81,9 @@
   .badge.bad { background: #fbeceb; border-color: #f0c8c3; }
   .badge.neutral { background: #f0efec; border-color: #e0dfda; }
 
+  /* 只给回合表的错误列。status 徽标已经用配色表达了成败，这里是那句"为什么"。 */
+  .cell-error { color: #e34948; font-size: 12px; }
+
   .card {
     border: 1px solid #e8e7e4; border-radius: 8px; padding: 16px 18px;
     margin-bottom: 14px; background: #fff;
@@ -139,6 +142,8 @@
     <p id="costs-disclaimer" class="note"></p>
     <p id="costs-unknown" class="note" hidden></p>
     <p id="costs-skipped" class="note" hidden></p>
+    <h2>按用户</h2>
+    <div id="costs-users"></div>
     <h2>按日 tokens（按 purpose 堆叠）</h2>
     <div id="costs-legend" class="legend"></div>
     <div id="costs-chart" class="chart"></div>
@@ -540,11 +545,14 @@
         turn.duration_ms === null || turn.duration_ms === undefined
           ? '' : fmtInt(turn.duration_ms),
         badge(turn.success ? '成功' : '失败', turn.success ? 'ok' : 'bad'),
+        // 失败回合光有红徽标等于只说"炸了"不说为什么，得跳去翻 JSONL 才知道。
+        turn.error === null || turn.error === undefined || turn.error === ''
+          ? '' : el('span', 'cell-error', trunc(turn.error)),
         turn.run_id || ''
       ];
     });
     host.appendChild(buildTable(
-      ['时间', '用户', '类型', '输入', '输出', '耗时 ms', '结果', 'run_id'], rows));
+      ['时间', '用户', '类型', '输入', '输出', '耗时 ms', '结果', '错误', 'run_id'], rows));
   }
 
   // ------------------------------------------------------------ 成本
@@ -566,11 +574,47 @@
     setNote('costs-skipped', data.skipped_lines > 0
       ? '跳过 ' + data.skipped_lines + ' 行损坏数据' : '');
 
+    renderCostUsers(agg.by_user || []);
     renderCostLegend(agg.purposes || []);
     renderCostChart(agg);
   }
 
+  /**
+   * 按用户的小表。堆叠图回答"什么时候花的、花在哪个 purpose"，回答不了"谁在花"，
+   * 而聚合里 by_user 是现成的（已按 tokens 倒序、unknown 排最后）。
+   */
+  function renderCostUsers(rows) {
+    var host = document.getElementById('costs-users');
+    clear(host);
+    if (!rows.length) { host.appendChild(emptyNote()); return; }
+    host.appendChild(buildTable(
+      ['用户', '调用', 'tokens', '估算金额'],
+      rows.map(function (row) {
+        return [
+          String(row.owner === null || row.owner === undefined ? '' : row.owner),
+          fmtInt(row.calls),
+          fmtInt(row.tokens),
+          fmtUsd(row.cost_usd)
+        ];
+      })));
+  }
+
   // ------------------------------------------------------------ 记忆
+
+  /**
+   * evidence 是 list[str]（Summarizer 的契约）：多条原文各自成片段，用全角竖线
+   * 分隔。绝不直接拼数组——JS 会用逗号把两条原文粘成一句读不断的话，而原文本身
+   * 就常带逗号。空数组返回空串，让调用方整块不渲染，不留一个孤零零的"原文："。
+   */
+  function evidenceText(evidence) {
+    if (Array.isArray(evidence)) {
+      return evidence
+        .filter(function (piece) { return piece !== null && piece !== undefined && piece !== ''; })
+        .map(function (piece) { return String(piece); })
+        .join('　|　');
+    }
+    return evidence === null || evidence === undefined ? '' : String(evidence);
+  }
 
   function memoryCard(user) {
     var card = el('section', 'card');
@@ -599,8 +643,9 @@
       var item = el('li');
       var fact = entry && typeof entry === 'object' ? entry.fact : entry;
       item.appendChild(el('div', 'fact', fact === null || fact === undefined ? '' : fact));
-      if (entry && typeof entry === 'object' && entry.evidence) {
-        item.appendChild(el('div', 'evidence', '原文：' + entry.evidence));
+      var evidence = evidenceText(entry && typeof entry === 'object' ? entry.evidence : null);
+      if (evidence) {
+        item.appendChild(el('div', 'evidence', '原文：' + evidence));
       }
       list.appendChild(item);
     });

@@ -97,6 +97,8 @@ python3 -m scripts.run_admin --port 8788
 # 浏览器打开 http://127.0.0.1:8788
 ```
 
+Host 头不是 `127.0.0.1` / `localhost` 的请求一律 400（挡 DNS rebinding）。注意 WSL2 下"本机"的边界包含 Windows 宿主：WSL 的 localhost 端口会被自动转发，宿主浏览器直接 `http://127.0.0.1:8788` 就能打开这个面板。
+
 数据每 10 秒自动刷新。可写配置为二期（连同"改配置强制过 golden 回归"机制一起设计，见 DECISION.md）。
 
 ## 合同智能

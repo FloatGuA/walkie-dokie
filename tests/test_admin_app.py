@@ -56,7 +56,9 @@ def paths(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(paths):
-    return TestClient(app_module.create_app())
+    # base_url 必须是真实的本机 host：TrustedHostMiddleware 只认 127.0.0.1 /
+    # localhost，TestClient 默认的 "testserver" 会被挡成 400。
+    return TestClient(app_module.create_app(), base_url="http://127.0.0.1")
 
 
 def test_root_serves_index_html(client, paths):
@@ -106,8 +108,11 @@ def test_costs_endpoint_passes_through_days(client, paths):
                 "provider": "deepseek",
                 "model": "deepseek-chat",
                 "purpose": "decide",
-                "input_tokens": 100,
-                "output_tokens": 20,
+                # 字段名照 ModelCallRecord：写错名字的话 aggregate 会当成"没拿到
+                # usage"，calls 照样是 1，断言却什么都没验证。
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "platform": "feishu",
                 "user_id": "u1",
             }
         ],
@@ -115,7 +120,16 @@ def test_costs_endpoint_passes_through_days(client, paths):
     response = client.get("/api/costs", params={"days": 3})
     assert response.status_code == 200
     assert response.json() == read_costs(paths.model_calls, days=3)
-    assert response.json()["aggregate"]["totals"]["calls"] == 1
+    aggregate = response.json()["aggregate"]
+    assert aggregate["totals"]["calls"] == 1
+    assert aggregate["totals"]["tokens"] == 120
+    assert aggregate["unknown_token_calls"] == 0
+    # 成本页的"按用户"小表直接吃这一段，形状要钉住。
+    row = aggregate["by_user"][0]
+    assert row["owner"] == "feishu:u1"
+    assert row["calls"] == 1
+    assert row["tokens"] == 120
+    assert row["cost_usd"] > 0
 
 
 def test_costs_endpoint_empty_state_keeps_disclaimer(client, paths):
@@ -260,12 +274,37 @@ def test_index_html_escapes_api_text():
     assert "function esc(" in source
 
 
+@pytest.mark.parametrize(
+    "needle",
+    [
+        # evidence 是 list[str]：数组必须按数组渲染，退回 '原文：' + entry.evidence
+        # 会把多条原文用逗号粘成一串、空数组渲染出一个孤零零的"原文："。
+        "Array.isArray",
+        "'错误'",       # 回合表的错误列：失败回合的原因不能只留一个红徽标
+        "by_user",     # 成本页的"按用户"小表，直接吃聚合里现成的这一段
+    ],
+)
+def test_index_html_keeps_review_fixes(needle):
+    assert needle in _index_source()
+
+
 def test_root_serves_the_real_index_html(monkeypatch):
     monkeypatch.setattr(app_module, "INDEX_HTML_PATH", REAL_INDEX_HTML)
-    response = TestClient(app_module.create_app()).get("/")
+    response = TestClient(app_module.create_app(), base_url="http://127.0.0.1").get("/")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert "观测台" in response.text
+
+
+def test_rejects_requests_with_foreign_host_header(paths):
+    """只绑 127.0.0.1 挡不住 DNS rebinding：浏览器照样会把请求发到本机端口上。
+
+    Host 头不是本机名的一律 400——这台面板无鉴权且把用户档案全摊开，多这一道
+    比什么都便宜。
+    """
+    client = TestClient(app_module.create_app(), base_url="http://evil.example.com")
+    for path in ["/", "/api/turns", "/api/memory"]:
+        assert client.get(path).status_code == 400
 
 
 def test_app_exposes_no_write_routes():

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from walkie_dokie import model_call_log, turn_log
 from walkie_dokie.admin.data import (
@@ -44,6 +45,13 @@ INDEX_HTML_PATH = Path(__file__).parent / "index.html"
 def create_app() -> FastAPI:
     """组装只读观测台。工厂而不是模块级单例：测试可以按需拿一份干净的 app。"""
     app = FastAPI(title="walkie-dokie 观测台", docs_url=None, redoc_url=None)
+
+    # 只绑 127.0.0.1 挡不住 DNS rebinding：恶意页面把自己的域名解析到 127.0.0.1，
+    # 用户浏览器就会带着那个域名的 Host 头请求这个无鉴权面板，把回合日志和用户
+    # 档案读走。校验 Host 头是这一类攻击的标准解，starlette 自带，零新依赖。
+    app.add_middleware(
+        TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"]
+    )
 
     @app.get("/")
     def index() -> FileResponse:

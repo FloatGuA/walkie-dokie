@@ -28,7 +28,12 @@ _EVAL_NAME_RE = re.compile(r"^\d{8}T\d{6}Z\.json$")
 
 
 def _read_jsonl(path: Path) -> tuple[list[dict], int]:
-    """读 JSONL，返回（成功解析的行, 跳过的坏行数）。文件不存在 → ([], 0)。"""
+    """读 JSONL，返回（成功解析的 JSON 对象, 跳过的坏行数）。文件不存在 → ([], 0)。
+
+    "解析成功"不等于"能用"：``null``、数组、裸字符串都是合法 JSON，但下游一律
+    按 dict 用（``item.get(...)``、``item["timestamp"]``）。不在这里挡住的话，
+    半行被截断成 ``"abc`` 之外的坏数据会一路飘到调用方炸成 500，整张表消失。
+    """
     if not path.exists():
         return [], 0
 
@@ -39,9 +44,14 @@ def _read_jsonl(path: Path) -> tuple[list[dict], int]:
             if not line.strip():
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError:
                 skipped += 1
+                continue
+            if not isinstance(record, dict):
+                skipped += 1
+                continue
+            records.append(record)
     return records, skipped
 
 
@@ -115,8 +125,8 @@ def _read_checkpoint_users(checkpoint_db: Path) -> tuple[list[dict], str | None]
     if not checkpoint_db.exists():
         return [], None
 
-    # 延迟到这里再 import：没跑过图的环境（比如只看成本页）不该因为缺 langgraph
-    # 就连 data.py 都导不进来。
+    # 延迟到这里再 import 纯粹是省开销：langgraph 是本项目的核心依赖，必然装着，
+    # 但只看成本页的请求没必要为此付它那串 import 的时间。
     from langgraph.checkpoint.sqlite import SqliteSaver
 
     users: list[dict] = []
