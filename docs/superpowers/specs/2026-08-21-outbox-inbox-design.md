@@ -14,7 +14,7 @@
 |---|--------|------|----------------|
 | 1 | 总体形态 | **用户拍板**：方案 B 完全异步 outbox——所有出站消息一律先持久化入队，独立投递 worker 消费；理由：宁可设计之初多付出，换系统稳固性（含面试叙事价值）。用户在听完通俗解释（发件箱/邮递员比方）后确认理解并选择 | 方案 A（同步先试失败才落 outbox）——改动面小但锁内仍等网络，且异步化的存量投资要二次支付 |
 | 2 | 存储 | 独立 SQLite `var/outbox.db`（stdlib sqlite3，WAL；inbox 去重表同库） | 复用 checkpoints-v2.db（生命周期互相牵扯、langgraph 升级风险）；jsonl（状态更新不适合追加文件） |
-| 3 | 重试语义 | 退避 30s/2m/10m 共 3 次；败进死信（dead）不自动打扰用户（"发送失败"通知本身也可能发不出去；死信进控制台数据源人工处理） | 无限重试（永久故障的死信堵队列头） |
+| 3 | 重试语义 | 退避 30s/2m/10m 三档全用（第 1/2/3 次失败分别等 30s/2m/10m，第 4 次失败进死信 dead）不自动打扰用户（"发送失败"通知本身也可能发不出去；死信进控制台数据源人工处理） | 无限重试（永久故障的死信堵队列头） |
 | 4 | 投递保证 | at-least-once：发送前置 `sending` 预章，重启把 `sending` 复位 `pending` 重寄——崩溃窗口内宁可用户偶收重复也不丢结果（窗口毫秒级，概率极低） | at-most-once（sending 直接判死——退回接近现状，只是丢得有记录） |
 
 技术细节（设计给定，经用户确认的整体设计一并批准）：保序=每 session 只发最早未终态消息，**终态（delivered/dead）放行后续**（死信不堵队列，代价是死信造成的半投递进死信区人工补）；inbox 去重**先记 seen 再处理**（防重复处理优先于防极小概率丢弃——飞书重投时首次处理往往正在进行）；turn log `success` 语义收窄为"图产出成功且已入队"。
@@ -48,7 +48,7 @@ workspace 文件"用完不自动删"的既有策略保证 file payload 的路径
 
 ### 1. `orchestrator/outbox.py`（新）：存储层 + 语义
 
-- `Outbox(db_path)`：`enqueue(session_key, trace_id, messages)`（messages=有序 (kind, payload) 列表，事务内批量插入，seq 递增）；`due_batch(now)`（每 session 取最早未终态且 due 的一条——保序 SQL）；`mark_sending(id)` / `mark_delivered(id)` / `mark_failed(id, error, now)`（退避表 [30s, 120s, 600s]，第 3 次失败置 dead + WARNING）；`reset_sending()`（启动恢复：sending→pending，attempts 不变）；`seen_event(event_id)` / `record_event(event_id)`；`purge_expired_seen(now)`（7 天）。
+- `Outbox(db_path)`：`enqueue(session_key, trace_id, messages)`（messages=有序 (kind, payload) 列表，事务内批量插入，seq 递增）；`due_batch(now)`（每 session 取最早未终态且 due 的一条——保序 SQL）；`mark_sending(id)` / `mark_delivered(id)` / `mark_failed(id, error, now)`（退避表 [30s, 120s, 600s] 三档全用，第 4 次失败置 dead + WARNING）；`reset_sending()`（启动恢复：sending→pending，attempts 不变）；`seen_event(event_id)` / `record_event(event_id)`；`purge_expired_seen(now)`（7 天）。
 - 全部同步 sqlite3 调用（本地毫秒级，无需 aiosqlite；调用点都在 async 函数中但阻塞时长可忽略——与 turn_log 同一取舍）。
 
 ### 2. `deliver_graph_output` 拆分（`scripts/run_mvp.py`）
@@ -69,7 +69,7 @@ workspace 文件"用完不自动删"的既有策略保证 file payload 的路径
 ## 语义要点（全部要有测试）
 
 1. 保序：同 session 前一条 pending/sending 时后一条绝不发；delivered/dead 放行。
-2. 退避与死信：30s/2m/10m；第 3 次失败置 dead + WARNING；dead 不再被取件。
+2. 退避与死信：30s/2m/10m；第 4 次失败置 dead + WARNING（三档退避全部用尽）；dead 不再被取件。
 3. at-least-once：sending 崩溃 → 启动 reset → 重寄；重寄成功仅一次 delivered 记录。
 4. 半投递：文件 delivered、文字 dead（或反之）各自独立终态，死信区可查（admin 数据源后续接入，本轮不做 UI）。
 5. 入队失败（磁盘错）：fail fast 冒泡——比照 turn_log 无兜底哲学；这是比平台网络更内环的故障。
