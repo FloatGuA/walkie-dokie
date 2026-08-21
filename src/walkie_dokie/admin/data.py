@@ -262,6 +262,7 @@ def list_sessions(
             sessions[key] = {
                 "platform": platform,
                 "user_id": user_id,
+                "display_name": "",
                 "last_active": None,
                 "turn_count": 0,
                 "failed_count": 0,
@@ -293,7 +294,13 @@ def list_sessions(
 
     for user in memory["users"]:
         entry = bucket(user["platform"], user["user_id"])
-        entry["has_profile"] = bool(user["profile"])
+        profile = user["profile"]
+        entry["has_profile"] = bool(profile)
+        # 侧栏显示人名而不是一串 ou_ 开头的 ID。档案在这里已经读过了，顺手带上
+        # 名字，省得前端为了一个字段再打一次 /api/memory。名字可能是任何东西
+        # （模型抽出来的），不是非空字符串就当没有，让前端退回 user_id。
+        name = profile.get("name")
+        entry["display_name"] = name if isinstance(name, str) and name else ""
         entry["summary_count"] = len(user["summary"])
         entry["pending_compaction"] = user["pending_compaction"]
 

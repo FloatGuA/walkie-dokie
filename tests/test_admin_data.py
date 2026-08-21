@@ -395,6 +395,9 @@ async def test_list_sessions_unions_turns_memory_and_costs(tmp_path):
     assert alice["pending_compaction"] == 1
     assert alice["cost_usd"] > 0
     assert alice["cost_calls"] == 1
+    # 侧栏要显示人名而不是一串 ou_ 开头的 ID。名字在档案里，list_sessions 已经
+    # 读过档案了，顺手带出来——不然侧栏为了一个名字要多打一次 /api/memory。
+    assert alice["display_name"] == "浮瓜"
 
     # 只有回合、没档案没成本的用户
     evaluated = _session(result, "eval", "t-x1")
@@ -404,6 +407,8 @@ async def test_list_sessions_unions_turns_memory_and_costs(tmp_path):
     assert evaluated["summary_count"] == 0
     assert evaluated["cost_usd"] == 0
     assert evaluated["cost_calls"] == 0
+    # 没档案就没有名字：留空，由前端退回 user_id，绝不在这里编一个占位名
+    assert evaluated["display_name"] == ""
 
     # 只有成本、还没落过回合日志的用户（比如日志被轮转过）
     cost_only = _session(result, "test", "u_costonly")
