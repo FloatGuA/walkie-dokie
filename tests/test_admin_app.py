@@ -294,17 +294,56 @@ def test_eval_report_endpoint_bad_json_is_500_not_404(client, paths):
 # ------------------------------------------------------- index.html smoke
 #
 # 这几条只读仓库里那份真实 index.html 的源码。前端没有构建步骤、没有单测框架，
-# 字符串断言是唯一能钉住"结构还在"的手段：四个 tab、固定 purpose 色映射、零外部
+# 字符串断言是唯一能钉住"结构还在"的手段：视图入口、固定 purpose 色映射、零外部
 # 资源、以及最起码的转义意识。它们挡不住渲染 bug，但挡得住"某次编辑把整块删了"。
+#
+# session 式改版把四个平级 tab 换成了"侧栏 + 三个视图"，旧断言逐条换成了等价物：
+#   data-tab="turns"  -> data-view="session"（回合改成 session 详情里的对话回放）
+#   data-tab="memory" -> 无独立视图，档案/摘要并进 session 信息卡，改由
+#                        test_index_html_consumes_every_read_endpoint 钉住
+#                        /api/memory 仍被消费
+#   data-tab="costs"  -> data-view="costs"
+#   data-tab="evals"  -> data-view="evals"
+#   '错误'（回合表的错误列）-> 'bubble-error'（气泡下的红色错误行）
 
 
 def _index_source() -> str:
     return REAL_INDEX_HTML.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("tab", ["turns", "costs", "memory", "evals"])
-def test_index_html_has_all_four_tabs(tab):
-    assert f'data-tab="{tab}"' in _index_source()
+@pytest.mark.parametrize("view", ["session", "costs", "evals"])
+def test_index_html_has_all_three_views(view):
+    assert f'data-view="{view}"' in _index_source()
+
+
+def test_index_html_has_the_session_sidebar():
+    """侧栏是整个改版的骨架：没有它就退回成了一堆孤立的表。"""
+    source = _index_source()
+    assert 'class="sidebar"' in source
+    assert 'id="session-list"' in source
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["/api/sessions", "/api/turns", "/api/memory", "/api/costs", "/api/evals"],
+)
+def test_index_html_consumes_every_read_endpoint(endpoint):
+    """五个只读端点一个都不能在改版里掉队（记忆那一份最容易被顺手删掉）。"""
+    assert endpoint in _index_source()
+
+
+@pytest.mark.parametrize("channel", ["飞书", "评估", "测试"])
+def test_index_html_maps_platform_to_chinese_channel(channel):
+    """平台标识是英文代号，看板上一律显示中文渠道名。"""
+    assert channel in _index_source()
+
+
+def test_index_html_keeps_the_conversation_timeline():
+    """对话回放时间轴是这一版唯一的签名元素，退回裸表格就等于改版没做。"""
+    source = _index_source()
+    assert 'class="timeline"' in source or "'timeline'" in source
+    assert "bubble-user" in source
+    assert "bubble-bot" in source
 
 
 @pytest.mark.parametrize(
@@ -334,8 +373,10 @@ def test_index_html_escapes_api_text():
         # evidence 是 list[str]：数组必须按数组渲染，退回 '原文：' + entry.evidence
         # 会把多条原文用逗号粘成一串、空数组渲染出一个孤零零的"原文："。
         "Array.isArray",
-        "'错误'",       # 回合表的错误列：失败回合的原因不能只留一个红徽标
-        "by_user",     # 成本页的"按用户"小表，直接吃聚合里现成的这一段
+        # 失败回合的原因不能只留一个红点。旧版是回合表的"错误"列，改版后是气泡
+        # 下面那行红字，标记随之从 '错误' 换成它的 class。
+        "bubble-error",
+        "by_user",     # 总成本视图的"按用户"小表，直接吃聚合里现成的这一段
     ],
 )
 def test_index_html_keeps_review_fixes(needle):

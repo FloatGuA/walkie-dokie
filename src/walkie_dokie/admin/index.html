@@ -6,72 +6,193 @@
 <title>walkie-dokie 观测台</title>
 <!--
   单文件前端：内联 CSS/JS，零外部资源（没有 CDN、没有 web 字体）。观测台跑在
-  本机 127.0.0.1，断网也要能开着看，任何外链都是一处会转圈的空白。
+  本机，断网也要能开着看，任何外链都是一处会转圈的空白。所谓"数据感"全部靠系统
+  等宽字体，不靠下载字体。
 
-  只读四个 tab：回合 / 成本 / 记忆 / Eval。每 10 秒只轮询当前 tab 的端点——四个
-  一起刷等于把被观测的 bot 的日志文件每 10 秒全读一遍，观测台自己成了负载。
+  版式是 session 式而不是四个平级 tab：左侧固定侧栏列出所有 session（一行一个
+  用户），右侧要么是某个 session 的详情（信息卡 + 对话回放时间轴），要么是两个
+  全局视图（总成本 / Eval）。观测台的第一个问题永远是"刚刚谁在说话、说得怎么
+  样"，平级 tab 逼人先选数据源再找人。
+
+  签名元素只有对话回放时间轴一个，其余一律安静：无阴影堆砌、无渐变、无动画。
+
+  只轮询当前视图要用的端点（10s）：侧栏在所有视图里都在，所以每次都刷
+  /api/sessions；详情视图另外刷 /api/turns + /api/memory；成本/Eval 视图刷各自
+  的端点。绝不四个端点一起刷——那等于每 10 秒把被观测 bot 的日志全读一遍，观测
+  台自己成了负载。
 
   安全边界：turns 的输入输出、记忆的摘要 evidence 全是用户输入与模型输出，一律
   经 textContent 落地；只有手写 SVG 那一段是拼字符串的，那里每个动态片段都过
   esc()。绝不出现未转义的 innerHTML 拼接。
 -->
 <style>
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 28px 24px 64px; background: #fcfcfb; color: #1f1f1e;
-    font: 14px/1.55 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  :root {
+    --canvas: #f7f6f3;
+    --card: #fcfcfb;
+    --line: #e8e7e2;
+    --ink: #1f1f1e;
+    --muted: #6b6a63;
+    --accent: #2a78d6;
+    --bubble-user: #eaf2fc;
+    --strip: #f2f1ee;
+    --fail: #e34948;
+    --ok: #1baf7a;
+    --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
   }
-  .wrap { max-width: 1080px; margin: 0 auto; }
 
-  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
-  h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
-  h3 { font-size: 14px; font-weight: 600; margin: 0; }
-  .muted { color: #6b6a63; font-size: 12px; font-variant-numeric: tabular-nums; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--canvas); color: var(--ink);
+    font: 400 13px/1.6 "PingFang SC", "Noto Sans CJK SC", -apple-system, "Segoe UI", sans-serif;
+  }
+  /* ids / 时间 / 数字 / token：一律等宽小一号。运维台读的是数据，不是文章。 */
+  .mono { font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+  .shell { display: flex; height: 100%; }
+
+  /* ---------------------------------------------------------- 侧栏 */
+  .sidebar {
+    width: 240px; flex: 0 0 240px; height: 100%; overflow-y: auto;
+    border-right: 1px solid var(--line); background: var(--card);
+    display: flex; flex-direction: column;
+  }
+  .brand { font-size: 15px; font-weight: 650; padding: 16px 16px 12px; letter-spacing: -0.01em; }
+  .side-head {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: var(--muted);
+    padding: 8px 16px 4px;
+  }
+  .session-list { flex: 1 1 auto; padding-bottom: 8px; }
+
+  .s-row {
+    display: flex; gap: 8px; align-items: flex-start; width: 100%; text-align: left;
+    appearance: none; background: none; border: 0; border-left: 3px solid transparent;
+    padding: 8px 12px 8px 13px; cursor: pointer; color: inherit; font: inherit;
+  }
+  .s-row:hover { background: var(--strip); }
+  .s-row.is-active { border-left-color: var(--accent); background: var(--bubble-user); }
+  .s-avatar {
+    flex: 0 0 auto; width: 24px; height: 24px; border-radius: 8px; margin-top: 1px;
+    background: var(--accent); color: #fff; font-size: 12px; line-height: 24px;
+    text-align: center; font-weight: 600;
+  }
+  .s-body { min-width: 0; flex: 1 1 auto; }
+  .s-name {
+    display: block; font-size: 13px; font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .s-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+  .s-time { color: var(--muted); }
+  .s-fail { color: var(--fail); font-family: var(--mono); font-size: 11px; }
+
+  .chip {
+    display: inline-block; padding: 0 6px; border-radius: 8px;
+    font-size: 11px; line-height: 17px; white-space: nowrap;
+    background: var(--strip); color: var(--muted);
+  }
+
+  .global-nav { border-top: 1px solid var(--line); padding: 6px 0; }
+  .nav-item {
+    display: block; width: 100%; text-align: left; appearance: none; background: none;
+    border: 0; border-left: 3px solid transparent; padding: 7px 12px 7px 13px;
+    cursor: pointer; color: var(--muted); font: inherit; font-size: 13px;
+  }
+  .nav-item:hover { background: var(--strip); color: var(--ink); }
+  .nav-item.is-active { border-left-color: var(--accent); background: var(--bubble-user); color: var(--ink); font-weight: 500; }
+  .side-foot { padding: 8px 16px 12px; color: var(--muted); border-top: 1px solid var(--line); }
+  .side-note { margin: 0; padding: 4px 16px 8px; color: var(--muted); font-size: 11px; }
+
+  /* ---------------------------------------------------------- 主区 */
+  .main { flex: 1 1 auto; height: 100%; overflow-y: auto; padding: 24px 28px 64px; }
+  .view { max-width: 880px; }
+  .view[hidden] { display: none; }
+
+  h1.title { font-size: 18px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; font-weight: 600; margin: 28px 0 8px; }
+  .muted { color: var(--muted); }
 
   .errbar {
-    margin: 14px 0 0; padding: 9px 12px; border-radius: 6px;
-    background: #fbeceb; border: 1px solid #f0c8c3; color: #1f1f1e; font-size: 13px;
+    margin: 0 0 16px; padding: 8px 12px; border-radius: 8px;
+    background: #fbeceb; border: 1px solid #f0c8c3; color: var(--ink); font-size: 13px;
   }
 
-  .tabs { display: flex; gap: 4px; margin: 18px 0 20px; border-bottom: 1px solid #e8e7e4; }
-  .tab {
-    appearance: none; border: 0; background: none; cursor: pointer; color: #6b6a63;
-    font: inherit; font-size: 14px; padding: 8px 14px; margin-bottom: -1px;
-    border-bottom: 2px solid transparent;
+  .card {
+    border: 1px solid var(--line); border-radius: 8px; padding: 16px;
+    background: var(--card); margin-bottom: 24px;
   }
-  .tab:hover { color: #1f1f1e; }
-  .tab.active { color: #1f1f1e; font-weight: 600; border-bottom-color: #2a78d6; }
-
-  .controls { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
-  .controls label { color: #6b6a63; font-size: 12px; display: flex; align-items: center; gap: 7px; }
-  .controls input, .controls select {
-    font: inherit; font-size: 13px; color: #1f1f1e; background: #fff;
-    border: 1px solid #d5d4d0; border-radius: 5px; padding: 5px 8px;
+  .card-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .p-chip {
+    border: 1px solid var(--line); border-radius: 8px; padding: 3px 8px;
+    background: #fff; font-size: 12px;
   }
-  .controls input { width: 220px; }
+  .p-chip .p-label { color: var(--muted); margin-right: 6px; font-size: 11px; }
 
-  .note { color: #6b6a63; font-size: 12px; margin: 4px 0 0; }
-  .note + .note { margin-top: 2px; }
+  .mini-stats { display: flex; flex-wrap: wrap; gap: 28px; margin-top: 16px; }
+  .mini-label { color: var(--muted); font-size: 11px; letter-spacing: 0.04em; }
+  .mini-value { font-family: var(--mono); font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .mini-value.is-fail { color: var(--fail); }
 
+  .summary-fold { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .summary-fold > summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+  .sum-list { list-style: none; margin: 8px 0 0; padding: 0; }
+  .sum-list li { padding: 6px 0; border-bottom: 1px solid var(--strip); }
+  .sum-list li:last-child { border-bottom: 0; }
+  /* fact 是结论，加粗；evidence 是原文出处，退到灰色小字。 */
+  .fact { font-weight: 600; }
+  .evidence { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  /* ------------------------------------------------ 对话回放时间轴（签名元素） */
+  .timeline { position: relative; margin-top: 4px; }
+  .timeline::before {
+    content: ""; position: absolute; left: 5px; top: 8px; bottom: 8px;
+    width: 2px; background: var(--line);
+  }
+  .tl-item { position: relative; padding-left: 28px; margin-bottom: 20px; }
+  .tl-dot {
+    position: absolute; left: 0; top: 6px; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--card); border: 2px solid var(--accent);
+  }
+  .tl-dot.is-fail { background: var(--fail); border-color: var(--fail); }
+  .tl-dot.is-exec { background: var(--card); border-color: var(--line); }
+  .bubble-row { display: flex; margin-bottom: 6px; }
+  .bubble-row.is-user { justify-content: flex-end; }
+  .bubble {
+    max-width: 76%; padding: 8px 12px; border-radius: 12px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .bubble-user { background: var(--bubble-user); }
+  .bubble-bot { background: #fff; border: 1px solid var(--line); }
+  .bubble-bot.is-fail { border-color: var(--fail); }
+  .bubble-file { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .bubble-error { color: var(--fail); font-size: 12px; margin: 2px 0 4px; word-break: break-word; }
+  .tl-meta { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .strip-row { display: flex; justify-content: center; }
+  .sys-strip {
+    background: var(--strip); color: var(--muted); border-radius: 8px;
+    padding: 4px 10px; font-family: var(--mono); font-size: 11px;
+  }
+
+  /* ---------------------------------------------------------- 全局视图 */
   .stats { display: flex; flex-wrap: wrap; gap: 44px; margin-bottom: 10px; }
-  .stat-label { color: #6b6a63; font-size: 12px; letter-spacing: 0.04em; }
-  .stat-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .stat.hero .stat-value { font-size: 40px; letter-spacing: -0.02em; font-variant-numeric: normal; }
+  .stat-label { color: var(--muted); font-size: 11px; letter-spacing: 0.04em; }
+  .stat-value { font-family: var(--mono); font-size: 20px; font-variant-numeric: tabular-nums; }
+  .stat.hero .stat-value { font-size: 34px; letter-spacing: -0.02em; }
 
-  h2 { font-size: 13px; font-weight: 600; margin: 32px 0 10px; }
+  .note { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
   .legend { display: flex; flex-wrap: wrap; gap: 18px; margin: 6px 0 4px; }
-  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #6b6a63; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
   .swatch { width: 10px; height: 10px; border-radius: 2px; }
   .chart { overflow-x: auto; }
   .chart svg { display: block; }
 
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #ececea; vertical-align: top; }
-  th { color: #6b6a63; font-weight: 500; font-size: 12px; white-space: nowrap; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; white-space: nowrap; }
   td { font-variant-numeric: tabular-nums; word-break: break-word; }
   tbody tr.clickable { cursor: pointer; }
-  tbody tr.clickable:hover { background: #f4f3f0; }
-  tbody tr.open { background: #eef3fb; }
+  tbody tr.clickable:hover { background: var(--strip); }
+  tbody tr.open { background: var(--bubble-user); }
 
   .badge {
     display: inline-block; padding: 1px 7px; border-radius: 9px;
@@ -79,97 +200,69 @@
   }
   .badge.ok { background: #e6f5ee; border-color: #bfe3d3; }
   .badge.bad { background: #fbeceb; border-color: #f0c8c3; }
-  .badge.neutral { background: #f0efec; border-color: #e0dfda; }
-
-  /* 只给回合表的错误列。status 徽标已经用配色表达了成败，这里是那句"为什么"。 */
-  .cell-error { color: #e34948; font-size: 12px; }
-
-  .card {
-    border: 1px solid #e8e7e4; border-radius: 8px; padding: 16px 18px;
-    margin-bottom: 14px; background: #fff;
-  }
-  .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
-  .card-sub { font-size: 12px; font-weight: 600; color: #6b6a63; margin: 16px 0 6px; }
-  .summary { list-style: none; margin: 0; padding: 0; }
-  .summary li { padding: 6px 0; border-bottom: 1px solid #f2f1ee; }
-  .summary li:last-child { border-bottom: 0; }
-  /* brief 定的对比：fact 是结论，加粗；evidence 是原文出处，退到灰色小字。 */
-  .fact { font-weight: 600; }
-  .evidence { color: #6b6a63; font-size: 12px; margin-top: 2px; }
+  .badge.neutral { background: var(--strip); border-color: var(--line); }
 
   .sparks { display: flex; flex-wrap: wrap; gap: 32px; margin-bottom: 8px; }
   .sparks figure { margin: 0; }
-  .sparks figcaption { font-size: 12px; color: #6b6a63; margin-bottom: 4px; }
+  .sparks figcaption { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 
-  .empty { color: #6b6a63; padding: 36px 0; text-align: center; font-size: 13px; }
+  .empty { color: var(--muted); padding: 36px 0; text-align: center; font-size: 13px; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>walkie-dokie 观测台</h1>
-    <span id="refreshed" class="muted">最后刷新 --:--:--</span>
-    <span class="muted">只读 · 本机</span>
-  </header>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">小帮 控制台</div>
+    <div class="side-head">SESSIONS</div>
+    <div id="session-list" class="session-list"></div>
+    <p id="sessions-skipped" class="side-note" hidden></p>
+    <nav class="global-nav">
+      <button type="button" class="nav-item" data-view="costs">▤　总成本</button>
+      <button type="button" class="nav-item" data-view="evals">◫　Eval</button>
+    </nav>
+    <div class="side-foot mono">只读 · 本机 · <span id="refreshed">--:--:--</span></div>
+  </aside>
 
-  <div id="error" class="errbar" hidden></div>
+  <main id="main" class="main">
+    <div id="error" class="errbar" hidden></div>
+    <div id="cp-error" class="errbar" hidden></div>
 
-  <nav class="tabs">
-    <button type="button" class="tab active" data-tab="turns">回合</button>
-    <button type="button" class="tab" data-tab="costs">成本</button>
-    <button type="button" class="tab" data-tab="memory">记忆</button>
-    <button type="button" class="tab" data-tab="evals">Eval</button>
-  </nav>
+    <section id="view-session" class="view" data-view="session">
+      <div id="session-card"></div>
+      <div id="session-turns"></div>
+    </section>
 
-  <section id="panel-turns" class="panel">
-    <div class="controls">
-      <label>用户 <input id="turn-user" type="text" placeholder="user_id 精确匹配"></label>
-      <label>条数
-        <select id="turn-limit">
-          <option value="20">20</option>
-          <option value="50" selected>50</option>
-          <option value="100">100</option>
-          <option value="200">200</option>
-        </select>
-      </label>
-    </div>
-    <p id="turns-skipped" class="note" hidden></p>
-    <div id="turns-body"></div>
-  </section>
+    <section id="view-costs" class="view" data-view="costs" hidden>
+      <h1 class="title">总成本</h1>
+      <div id="costs-stats" class="stats"></div>
+      <p id="costs-disclaimer" class="note"></p>
+      <p id="costs-unknown" class="note" hidden></p>
+      <p id="costs-skipped" class="note" hidden></p>
+      <h2>按用户</h2>
+      <div id="costs-users"></div>
+      <h2>按日 tokens（按 purpose 堆叠）</h2>
+      <div id="costs-legend" class="legend"></div>
+      <div id="costs-chart" class="chart"></div>
+    </section>
 
-  <section id="panel-costs" class="panel" hidden>
-    <div id="costs-stats" class="stats"></div>
-    <p id="costs-disclaimer" class="note"></p>
-    <p id="costs-unknown" class="note" hidden></p>
-    <p id="costs-skipped" class="note" hidden></p>
-    <h2>按用户</h2>
-    <div id="costs-users"></div>
-    <h2>按日 tokens（按 purpose 堆叠）</h2>
-    <div id="costs-legend" class="legend"></div>
-    <div id="costs-chart" class="chart"></div>
-  </section>
-
-  <section id="panel-memory" class="panel" hidden>
-    <div id="memory-error" class="errbar" hidden></div>
-    <div id="memory-body"></div>
-  </section>
-
-  <section id="panel-evals" class="panel" hidden>
-    <p id="evals-skipped" class="note" hidden></p>
-    <div class="sparks">
-      <figure>
-        <figcaption>通过率 %（按运行先后）</figcaption>
-        <div id="evals-pass-chart" class="chart"></div>
-      </figure>
-      <figure>
-        <figcaption>judge clarity 均值 1–5（按运行先后）</figcaption>
-        <div id="evals-clarity-chart" class="chart"></div>
-      </figure>
-    </div>
-    <h2>运行列表（点一行看逐样本结果）</h2>
-    <div id="evals-body"></div>
-    <div id="evals-detail"></div>
-  </section>
+    <section id="view-evals" class="view" data-view="evals" hidden>
+      <h1 class="title">Eval</h1>
+      <p id="evals-skipped" class="note" hidden></p>
+      <div class="sparks">
+        <figure>
+          <figcaption>通过率 %（按运行先后）</figcaption>
+          <div id="evals-pass-chart" class="chart"></div>
+        </figure>
+        <figure>
+          <figcaption>judge clarity 均值 1–5（按运行先后）</figcaption>
+          <div id="evals-clarity-chart" class="chart"></div>
+        </figure>
+      </div>
+      <h2>运行列表（点一行看逐样本结果）</h2>
+      <div id="evals-body"></div>
+      <div id="evals-detail"></div>
+    </section>
+  </main>
 </div>
 
 <script>
@@ -189,14 +282,23 @@
   // 日志是历史数据，可能含今天已经不存在的 purpose；给它们中性灰，不进固定色序。
   var FALLBACK_COLOR = '#8a8880';
 
-  // 文字一律用文本色，绝不用系列色写字（浅色系列当文字读不清）。
+  // 文字一律用文本色，绝不用系列色写字（浅色系列当文字读不清）。SVG 里没法用
+  // CSS 变量的地方就用这几个常量，色值与 :root 的 token 保持一致。
   var INK = '#1f1f1e';
   var INK_MUTED = '#6b6a63';
   var SURFACE = '#fcfcfb';
-  var GRID = '#e8e7e4';
+  var GRID = '#e8e7e2';
   var AXIS = '#d5d4d0';
 
-  var TRUNCATE = 80;
+  // 渠道徽标：平台标识是英文代号，看板上一律显示中文。配色各渠道一套，靠色相
+  // 区分而不是靠亮度，一眼扫下来知道哪几行是同一个来源。
+  var CHANNELS = {
+    feishu: { label: '飞书', bg: '#eaf2fc', fg: '#1c5cab' },
+    eval: { label: '评估', bg: '#f3f0fc', fg: '#4a3aa7' },
+    test: { label: '测试', bg: '#f2f1ee', fg: '#6b6a63' }
+  };
+
+  var TURN_LIMIT = 200;
   var POLL_MS = 10000;
 
   var PROFILE_FIELDS = [
@@ -234,9 +336,9 @@
     return Object.prototype.hasOwnProperty.call(object, key);
   }
 
-  function trunc(value) {
+  function trunc(value, max) {
     var text = value === null || value === undefined ? '' : String(value);
-    return text.length > TRUNCATE ? text.slice(0, TRUNCATE) + '…' : text;
+    return text.length > max ? text.slice(0, max) + '…' : text;
   }
 
   function fmtInt(value) {
@@ -267,6 +369,28 @@
       pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
   }
 
+  /** 回放里每个气泡组只标时分秒——日期在信息卡上，逐条重复读起来全是噪音。 */
+  function fmtClock(value) {
+    if (!value) { return ''; }
+    var d = new Date(value);
+    if (isNaN(d.getTime())) { return String(value); }
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
+  /** 侧栏读的是"多久没动静"，不是绝对时间；超过一周才退回日期。 */
+  function relTime(value) {
+    if (!value) { return '从未'; }
+    var d = new Date(value);
+    if (isNaN(d.getTime())) { return String(value); }
+    var seconds = (Date.now() - d.getTime()) / 1000;
+    if (seconds < 0) { return fmtStamp(value).slice(0, 5); }
+    if (seconds < 60) { return '刚刚'; }
+    if (seconds < 3600) { return Math.floor(seconds / 60) + '分钟前'; }
+    if (seconds < 86400) { return Math.floor(seconds / 3600) + '小时前'; }
+    if (seconds < 86400 * 7) { return Math.floor(seconds / 86400) + '天前'; }
+    return fmtStamp(value).slice(0, 5);
+  }
+
   function f1(n) { return Number(n).toFixed(1); }
 
   function purposeColor(purpose) {
@@ -288,6 +412,24 @@
     var node = document.getElementById(id);
     if (text) { node.textContent = text; node.hidden = false; }
     else { node.textContent = ''; node.hidden = true; }
+  }
+
+  function setBar(id, text) {
+    var bar = document.getElementById(id);
+    if (text) { bar.textContent = text; bar.hidden = false; }
+    else { bar.textContent = ''; bar.hidden = true; }
+  }
+
+  /** 渠道徽标。未知平台原样显示代号 + 灰调，绝不猜它是什么，也不藏起来。 */
+  function channelChip(platform) {
+    var key = platform === null || platform === undefined ? '' : String(platform);
+    var spec = has(CHANNELS, key) ? CHANNELS[key] : null;
+    var chip = el('span', 'chip', spec ? spec.label : (key || '未知'));
+    if (spec) {
+      chip.style.background = spec.bg;
+      chip.style.color = spec.fg;
+    }
+    return chip;
   }
 
   /** 单元格可以是字符串，也可以是已经建好的节点（徽标）。字符串走 textContent。 */
@@ -323,19 +465,11 @@
     });
   }
 
-  function showError(message) {
-    var bar = document.getElementById('error');
-    bar.textContent = message;
-    bar.hidden = false;
-  }
-
-  function clearError() {
-    var bar = document.getElementById('error');
-    bar.textContent = '';
-    bar.hidden = true;
-  }
+  function showError(message) { setBar('error', message); }
+  function clearError() { setBar('error', ''); }
 
   // ------------------------------------------------------------ 图表
+  // 几何逻辑（堆叠段的 2px 间隔、顶部圆角、单轴）原样沿用，别重写。
 
   function niceMax(value) {
     if (!(value > 0)) { return 1; }
@@ -517,45 +651,296 @@
     host.innerHTML = parts.join('');
   }
 
-  // ------------------------------------------------------------ 回合
+  // ------------------------------------------------------------ 侧栏
 
-  function renderTurns(data) {
-    setNote('turns-skipped', data.skipped_lines > 0
-      ? '跳过 ' + data.skipped_lines + ' 行损坏数据' : '');
+  // 选中的 session。platform 可能为空（只有档案、没有 thread 对得上的那种），
+  // 所以 key 要两段一起拼；分隔符用 NUL 而不是冒号——user_id 里就可以有冒号。
+  var selectedKey = null;
+  var sessionIndex = {};
 
-    var host = document.getElementById('turns-body');
-    clear(host);
-    var turns = data.turns || [];
-    if (!turns.length) { host.appendChild(emptyNote()); return; }
-
-    var rows = turns.map(function (turn) {
-      var owner = turn.platform && turn.user_id
-        ? turn.platform + ':' + turn.user_id
-        : (turn.user_id || '');
-      var input = turn.input_text !== null && turn.input_text !== undefined
-        ? turn.input_text : turn.input_filename;
-      var output = turn.output_text !== null && turn.output_text !== undefined
-        ? turn.output_text : turn.output_filename;
-      return [
-        fmtStamp(turn.timestamp),
-        owner,
-        turn.record_type || '',
-        trunc(input),
-        trunc(output),
-        turn.duration_ms === null || turn.duration_ms === undefined
-          ? '' : fmtInt(turn.duration_ms),
-        badge(turn.success ? '成功' : '失败', turn.success ? 'ok' : 'bad'),
-        // 失败回合光有红徽标等于只说"炸了"不说为什么，得跳去翻 JSONL 才知道。
-        turn.error === null || turn.error === undefined || turn.error === ''
-          ? '' : el('span', 'cell-error', trunc(turn.error)),
-        turn.run_id || ''
-      ];
-    });
-    host.appendChild(buildTable(
-      ['时间', '用户', '类型', '输入', '输出', '耗时 ms', '结果', '错误', 'run_id'], rows));
+  function sessionKey(session) {
+    return String(session.platform || '') + '\u0000' + String(session.user_id || '');
   }
 
-  // ------------------------------------------------------------ 成本
+  function displayName(session) {
+    return session.display_name || trunc(session.user_id, 16);
+  }
+
+  function renderSidebar(data) {
+    var sessions = data.sessions || [];
+    sessionIndex = {};
+    sessions.forEach(function (session) { sessionIndex[sessionKey(session)] = session; });
+
+    // 选中的用户可能已经被日志轮转掉了；这时退回第一个（最近活跃的）。
+    if (selectedKey === null || !has(sessionIndex, selectedKey)) {
+      selectedKey = sessions.length ? sessionKey(sessions[0]) : null;
+    }
+
+    var host = document.getElementById('session-list');
+    clear(host);
+    if (!sessions.length) {
+      host.appendChild(el('p', 'side-note', '还没有任何 session'));
+    }
+    sessions.forEach(function (session) {
+      var key = sessionKey(session);
+      var row = el('button', key === selectedKey ? 's-row is-active' : 's-row');
+      row.type = 'button';
+      var name = displayName(session);
+      row.appendChild(el('span', 's-avatar', name.slice(0, 1)));
+
+      var body = el('span', 's-body');
+      body.appendChild(el('span', 's-name', name));
+      var meta = el('span', 's-meta');
+      meta.appendChild(channelChip(session.platform));
+      meta.appendChild(el('span', 's-time mono', relTime(session.last_active)));
+      // 0 不显示：一个常驻的"0 失败"会让真正的失败数字失去重量。
+      if (session.failed_count) {
+        meta.appendChild(el('span', 's-fail', session.failed_count + ' 失败'));
+      }
+      body.appendChild(meta);
+      row.appendChild(body);
+
+      row.addEventListener('click', function () { selectSession(key); });
+      host.appendChild(row);
+    });
+
+    setNote('sessions-skipped', data.skipped_lines > 0
+      ? '跳过 ' + data.skipped_lines + ' 行无法解析的数据' : '');
+    setBar('cp-error', data.checkpoint_error
+      ? '读取会话 checkpoint 失败：' + data.checkpoint_error : '');
+  }
+
+  function selectSession(key) {
+    selectedKey = key;
+    setView('session');
+  }
+
+  function currentSession() {
+    return selectedKey !== null && has(sessionIndex, selectedKey)
+      ? sessionIndex[selectedKey] : null;
+  }
+
+  // ------------------------------------------------------------ session 详情
+
+  /**
+   * evidence 是 list[str]（Summarizer 的契约）：多条原文各自成片段，用全角竖线
+   * 分隔。绝不直接拼数组——JS 会用逗号把两条原文粘成一句读不断的话，而原文本身
+   * 就常带逗号。空数组返回空串，让调用方整块不渲染，不留一个孤零零的"原文："。
+   */
+  function evidenceText(evidence) {
+    if (Array.isArray(evidence)) {
+      return evidence
+        .filter(function (piece) { return piece !== null && piece !== undefined && piece !== ''; })
+        .map(function (piece) { return String(piece); })
+        .join('　|　');
+    }
+    return evidence === null || evidence === undefined ? '' : String(evidence);
+  }
+
+  function profileChips(profile) {
+    var chips = el('div', 'chips');
+    var count = 0;
+    PROFILE_FIELDS.forEach(function (field) {
+      var value = has(profile, field[0]) ? profile[field[0]] : null;
+      if (value === null || value === undefined || value === '') { return; }
+      var chip = el('span', 'p-chip');
+      chip.appendChild(el('span', 'p-label', field[1]));
+      chip.appendChild(document.createTextNode(String(value)));
+      chips.appendChild(chip);
+      count += 1;
+    });
+    // 有值才显示：四行"—"占着地方却什么都没说。
+    return count ? chips : null;
+  }
+
+  function summaryFold(summary) {
+    var fold = el('details', 'summary-fold');
+    fold.appendChild(el('summary', null, '会话摘要（' + summary.length + ' 条）'));
+    var list = el('ul', 'sum-list');
+    summary.forEach(function (entry) {
+      var item = el('li');
+      var fact = entry && typeof entry === 'object' ? entry.fact : entry;
+      item.appendChild(el('div', 'fact', fact === null || fact === undefined ? '' : fact));
+      var evidence = evidenceText(entry && typeof entry === 'object' ? entry.evidence : null);
+      if (evidence) {
+        item.appendChild(el('div', 'evidence', '原文：' + evidence));
+      }
+      list.appendChild(item);
+    });
+    fold.appendChild(list);
+    return fold;
+  }
+
+  function miniStat(label, value, isFail) {
+    var box = el('div', 'mini');
+    box.appendChild(el('div', 'mini-label', label));
+    box.appendChild(el('div', isFail ? 'mini-value is-fail' : 'mini-value', value));
+    return box;
+  }
+
+  function renderSessionCard(session, memoryUser) {
+    var host = document.getElementById('session-card');
+    clear(host);
+    var card = el('section', 'card');
+
+    var top = el('div', 'card-top');
+    top.appendChild(channelChip(session.platform));
+    top.appendChild(el('h1', 'title', displayName(session)));
+    top.appendChild(el('span', 'mono muted', session.user_id));
+    if (session.pending_compaction) {
+      top.appendChild(badge('待压缩 ' + session.pending_compaction + ' 条', 'neutral'));
+    }
+    card.appendChild(top);
+
+    var profile = (memoryUser && memoryUser.profile) || {};
+    var chips = profileChips(profile);
+    if (chips) { card.appendChild(chips); }
+
+    var stats = el('div', 'mini-stats');
+    stats.appendChild(miniStat('回合', fmtInt(session.turn_count)));
+    stats.appendChild(miniStat('失败', fmtInt(session.failed_count), session.failed_count > 0));
+    stats.appendChild(miniStat('近 7 天成本', fmtUsd(session.cost_usd)));
+    stats.appendChild(miniStat('模型调用', fmtInt(session.cost_calls)));
+    stats.appendChild(miniStat('最近活跃', relTime(session.last_active)));
+    card.appendChild(stats);
+
+    var summary = (memoryUser && memoryUser.summary) || [];
+    if (summary.length) { card.appendChild(summaryFold(summary)); }
+
+    host.appendChild(card);
+  }
+
+  function bubble(side, text, filename, failed) {
+    var row = el('div', 'bubble-row ' + (side === 'user' ? 'is-user' : 'is-bot'));
+    var cls = side === 'user' ? 'bubble bubble-user' : 'bubble bubble-bot';
+    if (failed && side !== 'user') { cls += ' is-fail'; }
+    var box = el('div', cls);
+    if (text !== null && text !== undefined && text !== '') {
+      box.appendChild(document.createTextNode(String(text)));
+    } else if (filename) {
+      box.appendChild(el('span', 'bubble-file', '文件 ' + filename));
+    } else {
+      return null;
+    }
+    row.appendChild(box);
+    return row;
+  }
+
+  function conversationItem(turn) {
+    var failed = !turn.success;
+    var item = el('div', 'tl-item');
+    item.appendChild(el('span', failed ? 'tl-dot is-fail' : 'tl-dot'));
+    var body = el('div', 'tl-body');
+
+    var input = bubble('user', turn.input_text, turn.input_filename, failed);
+    if (input) { body.appendChild(input); }
+    var output = bubble('bot', turn.output_text, turn.output_filename, failed);
+    if (output) { body.appendChild(output); }
+    // 失败回合光有红点等于只说"炸了"不说为什么，得跳去翻 JSONL 才知道。
+    if (turn.error) {
+      body.appendChild(el('div', 'bubble-error', '错误：' + trunc(turn.error, 300)));
+    }
+
+    var meta = [fmtClock(turn.timestamp)];
+    if (turn.duration_ms !== null && turn.duration_ms !== undefined) {
+      meta.push(fmtInt(turn.duration_ms) + ' ms');
+    }
+    if (turn.run_id) { meta.push(turn.run_id); }
+    body.appendChild(el('div', 'tl-meta', meta.join(' · ')));
+
+    item.appendChild(body);
+    return item;
+  }
+
+  function executionItem(turn) {
+    var failed = !turn.success;
+    var item = el('div', 'tl-item');
+    item.appendChild(el('span', failed ? 'tl-dot is-fail' : 'tl-dot is-exec'));
+    var body = el('div', 'tl-body');
+
+    var parts = ['⚙ 执行'];
+    var file = turn.output_filename || turn.input_filename;
+    if (file) { parts.push(String(file)); }
+    if (turn.duration_ms !== null && turn.duration_ms !== undefined) {
+      parts.push(fmtInt(turn.duration_ms) + ' ms');
+    }
+    parts.push(fmtClock(turn.timestamp));
+    var strip = el('div', 'strip-row');
+    strip.appendChild(el('span', 'sys-strip', parts.join(' · ')));
+    body.appendChild(strip);
+    if (turn.error) {
+      body.appendChild(el('div', 'bubble-error', '错误：' + trunc(turn.error, 300)));
+    }
+
+    item.appendChild(body);
+    return item;
+  }
+
+  var renderedKey = null;
+
+  function renderSessionTurns(session, data) {
+    var host = document.getElementById('session-turns');
+    var main = document.getElementById('main');
+    // 换 session 或本来就贴着底：滚到底。用户翻上去读旧消息时不许把他拽回来。
+    var atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 48;
+    var switched = renderedKey !== sessionKey(session);
+
+    clear(host);
+    var turns = (data.turns || []).filter(function (turn) {
+      // /api/turns 只按 user_id 过滤；platform 在这里补一刀，免得同名 user_id
+      // 的两个渠道混进同一条时间轴。platform 为空的 session 没有回合可对。
+      return !session.platform || turn.platform === session.platform;
+    });
+    if (!turns.length) {
+      host.appendChild(emptyNote('这个 session 还没有对话'));
+    } else {
+      var timeline = el('div', 'timeline');
+      // 接口最新在前；回放是正序读的（旧在上）。
+      turns.slice().reverse().forEach(function (turn) {
+        timeline.appendChild(turn.record_type === 'execution'
+          ? executionItem(turn) : conversationItem(turn));
+      });
+      host.appendChild(timeline);
+    }
+
+    if (switched || atBottom) { main.scrollTop = main.scrollHeight; }
+    renderedKey = sessionKey(session);
+  }
+
+  function findMemoryUser(memory, session) {
+    var users = memory.users || [];
+    for (var i = 0; i < users.length; i++) {
+      if (users[i].platform === session.platform && users[i].user_id === session.user_id) {
+        return users[i];
+      }
+    }
+    return null;
+  }
+
+  function loadSession() {
+    var session = currentSession();
+    if (!session) {
+      clear(document.getElementById('session-card'));
+      var host = document.getElementById('session-turns');
+      clear(host);
+      host.appendChild(emptyNote('还没有任何 session'));
+      return Promise.resolve();
+    }
+    var query = '/api/turns?limit=' + TURN_LIMIT +
+      '&user=' + encodeURIComponent(session.user_id);
+    // 档案与摘要的正文只有 /api/memory 有（侧栏那份只带 has_profile / 条数）。
+    var key = sessionKey(session);
+    return Promise.all([api(query), api('/api/memory')]).then(function (results) {
+      // 请求飞在天上时用户可能已经点了别的一行，回来要先确认还是同一个。比的是
+      // key 不是对象：每次轮询都会重建 sessionIndex，比引用会把正常刷新也当成
+      // "用户切走了"，页面从此不再更新。
+      if (selectedKey !== key) { return; }
+      renderSessionCard(session, findMemoryUser(results[1], session));
+      renderSessionTurns(session, results[0]);
+    });
+  }
+
+  // ------------------------------------------------------------ 总成本
 
   function renderCosts(data) {
     var agg = data.aggregate || {};
@@ -572,7 +957,7 @@
       ? '其中 ' + agg.unknown_token_calls + ' 次调用没拿到 usage，token 与金额未计入'
       : '');
     setNote('costs-skipped', data.skipped_lines > 0
-      ? '跳过 ' + data.skipped_lines + ' 行损坏数据' : '');
+      ? '跳过 ' + data.skipped_lines + ' 行无法解析的数据' : '');
 
     renderCostUsers(agg.by_user || []);
     renderCostLegend(agg.purposes || []);
@@ -597,77 +982,6 @@
           fmtUsd(row.cost_usd)
         ];
       })));
-  }
-
-  // ------------------------------------------------------------ 记忆
-
-  /**
-   * evidence 是 list[str]（Summarizer 的契约）：多条原文各自成片段，用全角竖线
-   * 分隔。绝不直接拼数组——JS 会用逗号把两条原文粘成一句读不断的话，而原文本身
-   * 就常带逗号。空数组返回空串，让调用方整块不渲染，不留一个孤零零的"原文："。
-   */
-  function evidenceText(evidence) {
-    if (Array.isArray(evidence)) {
-      return evidence
-        .filter(function (piece) { return piece !== null && piece !== undefined && piece !== ''; })
-        .map(function (piece) { return String(piece); })
-        .join('　|　');
-    }
-    return evidence === null || evidence === undefined ? '' : String(evidence);
-  }
-
-  function memoryCard(user) {
-    var card = el('section', 'card');
-    var head = el('div', 'card-head');
-    head.appendChild(el('h3', null, user.platform ? user.platform + ':' + user.user_id
-      : String(user.user_id || '')));
-    if (user.pending_compaction) {
-      head.appendChild(badge('待压缩 ' + user.pending_compaction + ' 条', 'neutral'));
-    }
-    card.appendChild(head);
-
-    var profile = user.profile || {};
-    card.appendChild(buildTable(['档案字段', '值'], PROFILE_FIELDS.map(function (field) {
-      var value = has(profile, field[0]) ? profile[field[0]] : null;
-      return [field[1], value === null || value === undefined || value === '' ? '—' : String(value)];
-    })));
-
-    var summary = user.summary || [];
-    card.appendChild(el('h4', 'card-sub', '会话摘要（' + summary.length + ' 条）'));
-    if (!summary.length) {
-      card.appendChild(emptyNote());
-      return card;
-    }
-    var list = el('ul', 'summary');
-    summary.forEach(function (entry) {
-      var item = el('li');
-      var fact = entry && typeof entry === 'object' ? entry.fact : entry;
-      item.appendChild(el('div', 'fact', fact === null || fact === undefined ? '' : fact));
-      var evidence = evidenceText(entry && typeof entry === 'object' ? entry.evidence : null);
-      if (evidence) {
-        item.appendChild(el('div', 'evidence', '原文：' + evidence));
-      }
-      list.appendChild(item);
-    });
-    card.appendChild(list);
-    return card;
-  }
-
-  function renderMemory(data) {
-    var bar = document.getElementById('memory-error');
-    if (data.checkpoint_error) {
-      bar.textContent = '读取会话 checkpoint 失败：' + data.checkpoint_error;
-      bar.hidden = false;
-    } else {
-      bar.textContent = '';
-      bar.hidden = true;
-    }
-
-    var host = document.getElementById('memory-body');
-    clear(host);
-    var users = data.users || [];
-    if (!users.length) { host.appendChild(emptyNote()); return; }
-    users.forEach(function (user) { host.appendChild(memoryCard(user)); });
   }
 
   // ------------------------------------------------------------ Eval
@@ -742,7 +1056,7 @@
       return [
         item.case_id || '',
         badge(item.passed ? '通过' : '未通过', item.passed ? 'ok' : 'bad'),
-        failures.length ? trunc(failures.join('；')) : '—',
+        failures.length ? trunc(failures.join('；'), 80) : '—',
         item.judge && item.judge.clarity !== null && item.judge.clarity !== undefined
           ? String(item.judge.clarity) : '—'
       ];
@@ -798,30 +1112,35 @@
 
   // ------------------------------------------------------------ 轮询与切页
 
-  // 筛选条件存在这里，不是每次轮询去读输入框：读输入框的话，用户打字打到一半
-  // 定时器就会拿着半个 user_id 去过滤，表格自己跳掉。
-  var turnFilter = { user: '', limit: '50' };
-
-  var LOADERS = {
-    turns: function () {
-      var query = '/api/turns?limit=' + encodeURIComponent(turnFilter.limit);
-      if (turnFilter.user) { query += '&user=' + encodeURIComponent(turnFilter.user); }
-      return api(query).then(renderTurns);
-    },
+  var VIEW_LOADERS = {
+    session: loadSession,
     costs: function () { return api('/api/costs?days=7').then(renderCosts); },
-    memory: function () { return api('/api/memory').then(renderMemory); },
     evals: function () {
       return api('/api/evals').then(renderEvals).then(loadOpenedReport);
     }
   };
 
-  var currentTab = 'turns';
+  var currentView = 'session';
 
-  // 只刷当前 tab：四个端点一起刷等于每 10 秒把 bot 的日志文件全读一遍。
+  function setView(view) {
+    currentView = view;
+    document.querySelectorAll('.view').forEach(function (section) {
+      section.hidden = section.getAttribute('data-view') !== view;
+    });
+    document.querySelectorAll('.nav-item').forEach(function (button) {
+      button.classList.toggle('is-active', button.getAttribute('data-view') === view);
+    });
+    refresh();
+  }
+
+  // 侧栏在所有视图里都在，所以每次都刷 session 列表；另外只刷当前视图的端点。
+  // 侧栏先落地再取详情：详情要用列表里的那条记录（成本、失败数、pending）。
   function refresh() {
-    LOADERS[currentTab]().then(function () {
+    return api('/api/sessions').then(renderSidebar).then(function () {
+      return VIEW_LOADERS[currentView]();
+    }).then(function () {
       clearError();
-      document.getElementById('refreshed').textContent = '最后刷新 ' + clockNow();
+      document.getElementById('refreshed').textContent = clockNow();
     }).catch(function (error) {
       // fetch 是真正的系统边界：服务停了、端点 500 了，页内飘一条错误条，
       // 已经画出来的数据留在原地——白屏是最没用的失败方式。
@@ -829,26 +1148,10 @@
     });
   }
 
-  document.querySelectorAll('.tab').forEach(function (button) {
+  document.querySelectorAll('.nav-item').forEach(function (button) {
     button.addEventListener('click', function () {
-      currentTab = button.getAttribute('data-tab');
-      document.querySelectorAll('.tab').forEach(function (other) {
-        other.classList.toggle('active', other === button);
-      });
-      document.querySelectorAll('.panel').forEach(function (panel) {
-        panel.hidden = panel.id !== 'panel-' + currentTab;
-      });
-      refresh();
+      setView(button.getAttribute('data-view'));
     });
-  });
-
-  document.getElementById('turn-user').addEventListener('change', function (event) {
-    turnFilter.user = event.target.value.trim();
-    refresh();
-  });
-  document.getElementById('turn-limit').addEventListener('change', function (event) {
-    turnFilter.limit = event.target.value;
-    refresh();
   });
 
   refresh();
