@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -23,11 +24,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from walkie_dokie.agents.claude_agent import ClaudeAgentSDKBackend
-from walkie_dokie.artifacts import (
-    display_name,
-    resolve_artifact_reference,
-    store_incoming_file,
-)
+from walkie_dokie.artifacts import display_name, store_incoming_file
 from walkie_dokie.logging_config import setup_logging
 from walkie_dokie.main_agent import (
     DeepSeekMainAgent,
@@ -40,7 +37,8 @@ from walkie_dokie.orchestrator import build_graph
 from walkie_dokie.orchestrator.debounce import Debouncer
 from walkie_dokie.orchestrator.graph import COMPACTION_BATCH_SIZE
 from walkie_dokie.orchestrator.locks import UserLocks
-from walkie_dokie.platforms.base import IncomingFile, InboundEvent, OutboundMessage
+from walkie_dokie.orchestrator.outbox import Outbox
+from walkie_dokie.platforms.base import IncomingFile, InboundEvent
 from walkie_dokie.platforms.feishu import FeishuAdapter
 from walkie_dokie.turn_log import TurnRecord, log_turn
 
@@ -162,15 +160,15 @@ def build_outbound_messages(state: dict) -> tuple[list[tuple[str, dict]], dict]:
     }
 
 
-async def deliver_graph_output(
-    platform: FeishuAdapter, user_id: str, state: dict, *, trace_id: str | None = None
-) -> tuple[str | None, str | None, bool]:
-    """中间态：组装全在 ``build_outbound_messages``，这里只剩发送。
+def _log_graph_output(
+    user_id: str, trace_id: str | None, state: dict, messages: list
+) -> None:
+    """一行日志说清这一轮走的是哪个出口：等确认 / 空输出 / 有结果（带产物数）。
 
-    持久 outbox 落地后（回合终点改为入队）本函数整体删除。
+    投递搬去 worker 之后这几行跟着回合终点走，不跟着发送走：它记的是"图给了
+    什么"，不是"平台收到了什么"。
     """
 
-    messages, summary = build_outbound_messages(state)
     if "__interrupt__" in state:
         logger.info("图输出等待用户确认 user_id=%s trace_id=%s", user_id, trace_id)
     elif state.get("result") is None:
@@ -185,22 +183,15 @@ async def deliver_graph_output(
             len(messages) - 1,
         )
 
-    for kind, payload in messages:
-        if kind == "file":
-            artifact = resolve_artifact_reference(payload)
-            await platform.send(
-                user_id,
-                OutboundMessage(
-                    file=IncomingFile(
-                        filename=payload["filename"],
-                        content=artifact.read_bytes(),
-                        mime_type=payload["mime_type"],
-                    )
-                ),
-            )
-        else:
-            await platform.send(user_id, OutboundMessage(text=payload["text"]))
-    return summary["output_text"], summary["output_filename"], summary["success"]
+
+def _wake_delivery_worker(wakeup: asyncio.Event | None) -> None:
+    """入队之后叫醒常驻投递 worker，省掉最多一轮（1 秒）轮询等待。
+
+    调用点一律在放开 session 锁之后。没有 worker 的调用方（测试、eval）传 None。
+    """
+
+    if wakeup is not None:
+        wakeup.set()
 
 
 async def maybe_run_compaction(graph, config: dict, summarizer) -> None:
@@ -217,8 +208,8 @@ async def maybe_run_compaction(graph, config: dict, summarizer) -> None:
     await graph.ainvoke(
         {"new_compaction_request": True}, config=config, durability="sync"
     )
-    # 刻意不调用 deliver_graph_output：compaction 无用户输出，且 deliver 对
-    # pending_files 非空的状态会重发“收到文件”提示。
+    # 刻意不组装/入队这一轮的输出：compaction 无用户输出，且 build_outbound_messages
+    # 对 pending_files 非空的状态会重发“收到文件”提示。
 
 
 async def _log_conversation_turn(
@@ -267,7 +258,16 @@ async def dispatch_fresh(
     locks: UserLocks,
     trace_id: str,
     summarizer=None,
+    *,
+    outbox: Outbox,
+    wakeup: asyncio.Event | None = None,
 ) -> None:
+    """一个防抖回合：图 -> 组装 -> 入队 -> turn log -> 压缩 -> 叫醒 worker。
+
+    ``platform`` 参数保留但本函数不再使用：发送整体搬去了投递 worker，回合终点
+    只负责把这一轮的输出写进 outbox。
+    """
+
     session_key = _session_key(platform_name, user_id)
     started = time.monotonic()
     logger.info(
@@ -293,7 +293,13 @@ async def dispatch_fresh(
             logger.exception(
                 "orchestrator 处理失败 user_id=%s trace_id=%s", user_id, trace_id
             )
-            await platform.send(user_id, OutboundMessage(text=fallback_text))
+            # 兜底话术也走 outbox：直接 send 会让它跟着一次网络抖动一起消失。
+            outbox.enqueue(
+                session_key,
+                trace_id,
+                [("text", {"text": fallback_text})],
+                now=datetime.now(),
+            )
             await _log_conversation_turn(
                 platform_name=platform_name,
                 user_id=user_id,
@@ -306,20 +312,13 @@ async def dispatch_fresh(
                 success=False,
                 error=str(exc),
             )
-            return
-        output_text = None
-        output_filename = None
-        output_success = False
-        delivery_error = None
-        duration_ms = 0
-        try:
-            # MVP 先把同 session 的状态推进与对应网络投递放在同一顺序域；正式版
-            # 应改为 durable outbox，而不是长期持锁等待平台网络。
-            output_text, output_filename, output_success = await deliver_graph_output(
-                platform, user_id, state, trace_id=trace_id
-            )
-            # 本轮时长在投递完成的这一刻定格：后面的 compaction 是投递之后的后台
-            # 回合，用户已经收到回复，它的耗时不属于“用户等待”。
+        else:
+            messages, summary = build_outbound_messages(state)
+            _log_graph_output(user_id, trace_id, state, messages)
+            if messages:
+                outbox.enqueue(session_key, trace_id, messages, now=datetime.now())
+            # 本轮时长在入队完成的这一刻定格：用户等待 = 图 + 本地入队。后面的
+            # compaction 是后台回合，投递也已经交给 worker，都不属于“用户等待”。
             duration_ms = int((time.monotonic() - started) * 1000)
             try:
                 # 压缩失败不改变本轮业务结果：compact 节点内部已有重试语义，这层
@@ -331,29 +330,17 @@ async def dispatch_fresh(
                 logger.exception(
                     "压缩回合失败 session=%s trace_id=%s", session_key, trace_id
                 )
-        except Exception as exc:
-            delivery_error = str(exc)
-            duration_ms = int((time.monotonic() - started) * 1000)
-            # 文件可能已经成功而文字失败；不能再追加一条“处理失败”制造更多
-            # 不确定投递。持久 outbox 实现前只记录并保留 workspace 供人工恢复。
-            logger.exception(
-                "投递图输出失败 platform=%s user_id=%s trace_id=%s",
-                platform_name,
-                user_id,
-                trace_id,
-            )
-        finally:
+            # success 直接照抄图小结：投递成败已经不在这一层，没有 delivery_error。
             await _log_conversation_turn(
                 platform_name=platform_name,
                 user_id=user_id,
                 trace_id=trace_id,
                 input_text=combined_text or None,
                 input_filename=", ".join(item.filename for item in files) or None,
-                output_text=output_text,
-                output_filename=output_filename,
+                output_text=summary["output_text"],
+                output_filename=summary["output_filename"],
                 duration_ms=duration_ms,
-                success=output_success and delivery_error is None,
-                error=delivery_error,
+                success=summary["success"],
             )
             logger.info(
                 "防抖回合处理结束 session=%s trace_id=%s duration_ms=%d",
@@ -361,6 +348,7 @@ async def dispatch_fresh(
                 trace_id,
                 duration_ms,
             )
+    _wake_delivery_worker(wakeup)
 
 
 async def handle_event(
@@ -371,29 +359,43 @@ async def handle_event(
     memory_repository: JsonMemoryRepository,
     event: InboundEvent,
     summarizer=None,
+    *,
+    outbox: Outbox,
+    wakeup: asyncio.Event | None = None,
 ) -> None:
+    """路由一条平台事件：长期记忆命令 / 确认恢复回合 / 交给防抖攒批。
+
+    ``platform`` 参数保留但本函数不再使用，理由同 ``dispatch_fresh``：所有出站
+    消息一律先入 outbox，发送由投递 worker 独占。
+    """
+
     if not event.text and event.file is None:
         return
 
     session_key = _session_key(event.platform, event.user_id)
     if event.file is None and (event.text or "").strip() == LONG_TERM_MEMORY_COMMAND:
         started = time.monotonic()
+        trace_id = uuid.uuid4().hex[:8]
         async with locks.get(session_key):
             try:
                 output_text = render_memory_snapshot(
                     memory_repository.load(event.platform, event.user_id)
                 )
-                await platform.send(event.user_id, OutboundMessage(text=output_text))
                 error = None
             except Exception as exc:
                 logger.exception("查询长期记忆失败 user_id=%s", event.user_id)
                 output_text = "长期记忆这次没有读取成功，请稍后再试。"
                 error = str(exc)
-                await platform.send(event.user_id, OutboundMessage(text=output_text))
+            outbox.enqueue(
+                session_key,
+                trace_id,
+                [("text", {"text": output_text})],
+                now=datetime.now(),
+            )
             await _log_conversation_turn(
                 platform_name=event.platform,
                 user_id=event.user_id,
-                trace_id=uuid.uuid4().hex[:8],
+                trace_id=trace_id,
                 input_text=event.text,
                 input_filename=None,
                 output_text=output_text,
@@ -402,9 +404,11 @@ async def handle_event(
                 success=error is None,
                 error=error,
             )
+        _wake_delivery_worker(wakeup)
         return
 
-    resumed_state = None
+    # 这一轮是否已经在锁内处理完（确认恢复 / 异常状态拒绝）；否则交给防抖攒批。
+    handled = False
     # 查询状态和决定“resume 还是防抖新回合”也必须和 ainvoke 使用同一把锁。
     # 否则 execute 正好结束/进入 interrupt 的边界上仍有 TOCTOU 窗口。
     try:
@@ -437,49 +441,37 @@ async def handle_event(
                     config=config,
                     durability="sync",
                 )
-                output_text = None
-                output_filename = None
-                output_success = False
-                delivery_error = None
-                duration_ms = 0
+                handled = True
+                messages, summary = build_outbound_messages(resumed_state)
+                _log_graph_output(event.user_id, trace_id, resumed_state, messages)
+                if messages:
+                    outbox.enqueue(session_key, trace_id, messages, now=datetime.now())
+                # 同 dispatch_fresh：时长在入队完成时定格，不含后台压缩。
+                duration_ms = int((time.monotonic() - started) * 1000)
                 try:
-                    output_text, output_filename, output_success = await deliver_graph_output(
-                        platform, event.user_id, resumed_state, trace_id=trace_id
-                    )
-                    # 同 dispatch_fresh：时长在投递完成时定格，不含后台压缩。
-                    duration_ms = int((time.monotonic() - started) * 1000)
-                    try:
-                        # 同 dispatch_fresh：压缩失败只记录，不改变本轮业务结果。
-                        await maybe_run_compaction(graph, config, summarizer)
-                    except Exception:
-                        logger.exception(
-                            "压缩回合失败 session=%s trace_id=%s", session_key, trace_id
-                        )
-                except Exception as exc:
-                    delivery_error = str(exc)
-                    duration_ms = int((time.monotonic() - started) * 1000)
+                    # 同 dispatch_fresh：压缩失败只记录，不改变本轮业务结果。
+                    await maybe_run_compaction(graph, config, summarizer)
+                except Exception:
                     logger.exception(
-                        "恢复后投递失败 user_id=%s trace_id=%s", event.user_id, trace_id
+                        "压缩回合失败 session=%s trace_id=%s", session_key, trace_id
                     )
-                finally:
-                    await _log_conversation_turn(
-                        platform_name=event.platform,
-                        user_id=event.user_id,
-                        trace_id=trace_id,
-                        input_text=event.text,
-                        input_filename=event.file.filename if event.file else None,
-                        output_text=output_text,
-                        output_filename=output_filename,
-                        duration_ms=duration_ms,
-                        success=output_success and delivery_error is None,
-                        error=delivery_error,
-                    )
-                    logger.info(
-                        "确认回合处理结束 session=%s trace_id=%s duration_ms=%d",
-                        session_key,
-                        trace_id,
-                        duration_ms,
-                    )
+                await _log_conversation_turn(
+                    platform_name=event.platform,
+                    user_id=event.user_id,
+                    trace_id=trace_id,
+                    input_text=event.text,
+                    input_filename=event.file.filename if event.file else None,
+                    output_text=summary["output_text"],
+                    output_filename=summary["output_filename"],
+                    duration_ms=duration_ms,
+                    success=summary["success"],
+                )
+                logger.info(
+                    "确认回合处理结束 session=%s trace_id=%s duration_ms=%d",
+                    session_key,
+                    trace_id,
+                    duration_ms,
+                )
             elif snapshot.interrupts:
                 raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
             elif snapshot.next:
@@ -490,21 +482,33 @@ async def handle_event(
                     session_key,
                     snapshot.next,
                 )
-                await platform.send(
-                    event.user_id,
-                    OutboundMessage(
-                        text="上一次处理留下了异常状态，我没有执行你这条新消息，请联系维护者恢复会话。"
-                    ),
+                handled = True
+                outbox.enqueue(
+                    session_key,
+                    None,
+                    [
+                        (
+                            "text",
+                            {
+                                "text": "上一次处理留下了异常状态，我没有执行你这条新消息，请联系维护者恢复会话。"
+                            },
+                        )
+                    ],
+                    now=datetime.now(),
                 )
-                return
     except Exception:
         logger.exception("orchestrator 查询/恢复失败 user_id=%s", event.user_id)
-        await platform.send(
-            event.user_id, OutboundMessage(text="处理失败，稍后再试一下")
+        outbox.enqueue(
+            session_key,
+            None,
+            [("text", {"text": "处理失败，稍后再试一下"})],
+            now=datetime.now(),
         )
+        _wake_delivery_worker(wakeup)
         return
 
-    if resumed_state is not None:
+    if handled:
+        _wake_delivery_worker(wakeup)
         return
     debouncer.add(event.platform, event.user_id, event.text, event.file)
 
@@ -532,6 +536,9 @@ async def main():
             summarizer=summarizer,
         )
         locks = UserLocks()
+        outbox = Outbox()
+        # 入队方叫醒投递 worker 的信号，省掉最多一轮轮询等待。
+        wakeup = asyncio.Event()
         debouncer = Debouncer(
             DEBOUNCE_WINDOW_SECONDS,
             on_ready=lambda platform_name, user_id, text, files, trace_id: dispatch_fresh(
@@ -544,6 +551,8 @@ async def main():
                 locks,
                 trace_id,
                 summarizer=summarizer,
+                outbox=outbox,
+                wakeup=wakeup,
             ),
         )
 
@@ -562,6 +571,8 @@ async def main():
                     memory_repository,
                     event,
                     summarizer=summarizer,
+                    outbox=outbox,
+                    wakeup=wakeup,
                 )
             except asyncio.CancelledError:
                 raise

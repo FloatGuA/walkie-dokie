@@ -1,28 +1,79 @@
 import asyncio
+import json
 import logging
+import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import walkie_dokie.artifacts as artifact_store
 from scripts.run_mvp import (
     _invoke_from_event,
     _waiting_for_confirmation,
     build_outbound_messages,
-    deliver_graph_output,
     dispatch_fresh,
     handle_event,
 )
 from walkie_dokie.main_agent.base import MemoryOperation
 from walkie_dokie.main_agent.memory import JsonMemoryRepository
 from walkie_dokie.orchestrator.locks import UserLocks
+from walkie_dokie.orchestrator.outbox import Outbox
 from walkie_dokie.platforms.base import IncomingFile, InboundEvent
 
 
 class FakePlatform:
+    """回合终点改为入队之后，``dispatch_fresh``/``handle_event`` 不再自己发送。
+
+    这个 fake 留着是因为两个函数仍然收 ``platform``（投递 worker 用），它的
+    ``sent`` 现在是一条负向断言：回合期间必须一条都没发。
+    """
+
     def __init__(self):
         self.sent = []
 
     async def send(self, user_id, message):
         self.sent.append((user_id, message))
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    return tmp_path / "outbox.db"
+
+
+@pytest.fixture
+def outbox(db_path):
+    return Outbox(db_path)
+
+
+def _outbox_rows(db_path):
+    """直读 outbox 表：``due_batch`` 每 session 只给队头，断言"整批入队"要看全部行。"""
+
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = [
+            dict(row)
+            for row in connection.execute("SELECT * FROM outbox ORDER BY id")
+        ]
+    finally:
+        connection.close()
+    for row in rows:
+        row["payload"] = json.loads(row["payload"])
+    return rows
+
+
+class _StateGraph:
+    """fresh 回合的 fake graph：会话空闲，``ainvoke`` 直接返回预置的图输出状态。"""
+
+    def __init__(self, state):
+        self._state = state
+
+    async def aget_state(self, config):
+        return SimpleNamespace(next=(), interrupts=(), values={})
+
+    async def ainvoke(self, value, config, durability=None):
+        return self._state
 
 
 def test_only_real_ask_confirm_interrupt_is_resumable():
@@ -166,33 +217,58 @@ async def test_debounced_batch_survives_confirm_race_with_multiple_files(
     assert graph.durability == "sync"
 
 
-async def test_artifact_is_delivered_before_main_agent_text(monkeypatch, tmp_path):
+async def test_artifact_is_enqueued_before_main_agent_text(
+    monkeypatch, tmp_path, outbox, db_path
+):
+    """"文件先于文字"这条投递承诺现在由入队顺序承担：seq 决定投递序，file 行
+    只带 reference，bytes 留给投递 worker 发送时再读。"""
+
     root = tmp_path / "workspaces"
     root.mkdir()
     artifact = root / "result.docx"
     artifact.write_bytes(b"document")
     monkeypatch.setattr(artifact_store, "WORKSPACES_ROOT", root)
     reference = artifact_store.output_artifact_reference(artifact, artifact.name)
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
     platform = FakePlatform()
 
-    await deliver_graph_output(
-        platform,
-        "u1",
-        {
-            "result": {
-                "artifacts": [reference],
-                "reply_text": "已经处理好了。",
-                "success": True,
+    await dispatch_fresh(
+        _StateGraph(
+            {
+                "result": {
+                    "artifacts": [reference],
+                    "reply_text": "已经处理好了。",
+                    "success": True,
+                }
             }
-        },
+        ),
+        platform,
+        "test",
+        "u1",
+        "帮我改一下",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
     )
-    assert len(platform.sent) == 2
-    assert platform.sent[0][1].file.filename == "result.docx"
-    assert platform.sent[0][1].file.content == b"document"
-    assert platform.sent[1][1].text == "已经处理好了。"
+
+    rows = _outbox_rows(db_path)
+    assert [(row["seq"], row["kind"]) for row in rows] == [(0, "file"), (1, "text")]
+    assert rows[0]["payload"] == reference
+    assert rows[0]["payload"]["filename"] == "result.docx"
+    assert "content" not in rows[0]["payload"]
+    assert Path(rows[0]["payload"]["path"]).read_bytes() == b"document"
+    assert rows[1]["payload"] == {"text": "已经处理好了。"}
+    assert platform.sent == []
 
 
-async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatch):
+async def test_fresh_direct_reply_is_written_to_conversation_turn_log(
+    monkeypatch, outbox
+):
     class Graph:
         async def aget_state(self, config):
             return SimpleNamespace(next=(), interrupts=())
@@ -222,6 +298,7 @@ async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatc
         (),
         UserLocks(),
         trace_id="t1",
+        outbox=outbox,
     )
 
     assert len(records) == 1
@@ -231,7 +308,9 @@ async def test_fresh_direct_reply_is_written_to_conversation_turn_log(monkeypatc
     assert records[0].success is True
 
 
-async def test_dispatch_fresh_trace_id_is_recorded_as_conversation_run_id(monkeypatch):
+async def test_dispatch_fresh_trace_id_is_recorded_as_conversation_run_id(
+    monkeypatch, outbox, db_path
+):
     class Graph:
         async def aget_state(self, config):
             return SimpleNamespace(next=(), interrupts=(), values={})
@@ -261,12 +340,17 @@ async def test_dispatch_fresh_trace_id_is_recorded_as_conversation_run_id(monkey
         (),
         UserLocks(),
         trace_id="batch-42",
+        outbox=outbox,
     )
 
     assert records[0].run_id == "batch-42"
+    # 同一个 trace_id 也要写进 outbox 行：投递侧日志与 turn log 才能对得上。
+    assert [row["trace_id"] for row in _outbox_rows(db_path)] == ["batch-42"]
 
 
-async def test_handle_event_confirm_resume_reuses_snapshots_trace_id(monkeypatch):
+async def test_handle_event_confirm_resume_reuses_snapshots_trace_id(
+    monkeypatch, outbox, db_path
+):
     class Graph:
         async def aget_state(self, config):
             return SimpleNamespace(
@@ -294,17 +378,21 @@ async def test_handle_event_confirm_resume_reuses_snapshots_trace_id(monkeypatch
     await handle_event(
         Graph(),
         platform,
-        object(),  # debouncer.add is unreachable once resumed_state is set
+        object(),  # debouncer.add is unreachable once the resume branch handled it
         UserLocks(),
         object(),  # memory_repository is unreachable outside the /long-term-memory branch
         InboundEvent("test", "u1", "是", None),
+        outbox=outbox,
     )
 
     assert records[0].run_id == "original-propose-id"
+    assert [row["trace_id"] for row in _outbox_rows(db_path)] == [
+        "original-propose-id"
+    ]
 
 
 async def test_concurrent_handle_event_calls_do_not_interleave_graph_access(
-    monkeypatch,
+    monkeypatch, outbox
 ):
     """两个几乎同时到达的 handle_event 调用（同一 session，都命中确认分支）必须
     被 UserLocks 完全序列化——graph.aget_state/ainvoke 不能交错执行。这是
@@ -343,10 +431,11 @@ async def test_concurrent_handle_event_calls_do_not_interleave_graph_access(
         handle_event(
             graph,
             platform,
-            object(),  # debouncer.add is unreachable once resumed_state is set
+            object(),  # debouncer.add is unreachable once the resume branch handled it
             locks,
             object(),  # memory_repository is unreachable outside /long-term-memory
             InboundEvent("test", "u1", "是", None),
+            outbox=outbox,
         ),
         handle_event(
             graph,
@@ -355,6 +444,7 @@ async def test_concurrent_handle_event_calls_do_not_interleave_graph_access(
             locks,
             object(),
             InboundEvent("test", "u1", "是，确认", None),
+            outbox=outbox,
         ),
     )
 
@@ -367,7 +457,7 @@ async def test_concurrent_handle_event_calls_do_not_interleave_graph_access(
 
 
 async def test_concurrent_dispatch_fresh_and_handle_event_resume_do_not_interleave(
-    monkeypatch,
+    monkeypatch, outbox
 ):
     """一次由 debounce 触发的 dispatch_fresh，和一条几乎同时到达、直接命中确认
     分支的 handle_event，必须被同一把 UserLocks 完全序列化——这是上次真实
@@ -411,6 +501,7 @@ async def test_concurrent_dispatch_fresh_and_handle_event_resume_do_not_interlea
             (),
             locks,
             trace_id="new-batch",
+            outbox=outbox,
         ),
         handle_event(
             graph,
@@ -419,6 +510,7 @@ async def test_concurrent_dispatch_fresh_and_handle_event_resume_do_not_interlea
             locks,
             object(),
             InboundEvent("test", "u1", "是", None),
+            outbox=outbox,
         ),
     )
 
@@ -431,7 +523,7 @@ async def test_concurrent_dispatch_fresh_and_handle_event_resume_do_not_interlea
 
 
 async def test_long_term_memory_command_bypasses_graph_and_debounce(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, outbox, db_path
 ):
     class MustNotRun:
         def __getattr__(self, name):
@@ -459,14 +551,20 @@ async def test_long_term_memory_command_bypasses_graph_and_debounce(
         UserLocks(),
         memory,
         InboundEvent("test", "u1", " /long-term-memory ", None),
+        outbox=outbox,
     )
 
-    assert platform.sent[0][1].text == "当前保存的长期记忆：\n姓名：浮瓜"
+    rows = _outbox_rows(db_path)
+    assert rows[0]["payload"]["text"] == "当前保存的长期记忆：\n姓名：浮瓜"
+    assert rows[0]["session_key"] == "test:u1"
+    assert platform.sent == []
     assert records[0].record_type == "conversation"
     assert records[0].success is True
 
 
-async def test_multiple_artifacts_are_delivered_before_text(monkeypatch, tmp_path):
+async def test_multiple_artifacts_are_enqueued_before_text(
+    monkeypatch, tmp_path, outbox, db_path
+):
     root = tmp_path / "workspaces"
     root.mkdir()
     a = root / "a.docx"
@@ -476,26 +574,44 @@ async def test_multiple_artifacts_are_delivered_before_text(monkeypatch, tmp_pat
     monkeypatch.setattr(artifact_store, "WORKSPACES_ROOT", root)
     ref_a = artifact_store.output_artifact_reference(a, a.name)
     ref_b = artifact_store.output_artifact_reference(b, b.name)
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
     platform = FakePlatform()
 
-    await deliver_graph_output(
-        platform,
-        "u1",
-        {
-            "result": {
-                "artifacts": [ref_a, ref_b],
-                "reply_text": "两份都处理好了。",
-                "success": True,
+    await dispatch_fresh(
+        _StateGraph(
+            {
+                "result": {
+                    "artifacts": [ref_a, ref_b],
+                    "reply_text": "两份都处理好了。",
+                    "success": True,
+                }
             }
-        },
+        ),
+        platform,
+        "test",
+        "u1",
+        "帮我改一下",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
     )
-    assert len(platform.sent) == 3
-    assert platform.sent[0][1].file.filename == "a.docx"
-    assert platform.sent[1][1].file.filename == "b.docx"
-    assert platform.sent[2][1].text == "两份都处理好了。"
+
+    rows = _outbox_rows(db_path)
+    assert [row["kind"] for row in rows] == ["file", "file", "text"]
+    assert rows[0]["payload"]["filename"] == "a.docx"
+    assert rows[1]["payload"]["filename"] == "b.docx"
+    assert rows[2]["payload"] == {"text": "两份都处理好了。"}
+    assert platform.sent == []
 
 
-async def test_pending_files_notice_lists_all_filenames(monkeypatch, tmp_path):
+async def test_pending_files_notice_lists_all_filenames(
+    monkeypatch, tmp_path, outbox, db_path
+):
     root = tmp_path / "inputs"
     monkeypatch.setattr(artifact_store, "INPUT_ARTIFACTS_ROOT", root)
     ref_a = artifact_store.store_incoming_file(
@@ -504,15 +620,33 @@ async def test_pending_files_notice_lists_all_filenames(monkeypatch, tmp_path):
     ref_b = artifact_store.store_incoming_file(
         "test", "u1", IncomingFile("b.docx", b"b", "application/octet-stream")
     )
-    platform = FakePlatform()
-    await deliver_graph_output(
-        platform, "u1", {"pending_files": (ref_a, ref_b)}
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+
+    await dispatch_fresh(
+        _StateGraph({"result": None, "pending_files": (ref_a, ref_b)}),
+        FakePlatform(),
+        "test",
+        "u1",
+        "",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
     )
-    assert "a.docx" in platform.sent[0][1].text
-    assert "b.docx" in platform.sent[0][1].text
+
+    rows = _outbox_rows(db_path)
+    assert len(rows) == 1
+    assert "a.docx" in rows[0]["payload"]["text"]
+    assert "b.docx" in rows[0]["payload"]["text"]
 
 
-async def test_pending_files_notice_uses_deduped_display_name():
+async def test_pending_files_notice_uses_deduped_display_name(
+    monkeypatch, outbox, db_path
+):
     """回归 Finding 5：碰撞文件名要展示去重后的 display_filename，不能重复展示
     原始 filename（“收到文件「报价单.xlsx、报价单.xlsx」了”这种误导性文案）。"""
 
@@ -530,11 +664,25 @@ async def test_pending_files_notice_uses_deduped_display_name():
         "display_filename": "报价单-2.xlsx",
         "mime_type": "application/octet-stream",
     }
-    platform = FakePlatform()
-    await deliver_graph_output(
-        platform, "u1", {"pending_files": (reference_1, reference_2)}
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+
+    await dispatch_fresh(
+        _StateGraph({"result": None, "pending_files": (reference_1, reference_2)}),
+        FakePlatform(),
+        "test",
+        "u1",
+        "",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
     )
-    text = platform.sent[0][1].text
+
+    text = _outbox_rows(db_path)[0]["payload"]["text"]
     assert text.count("报价单.xlsx") == 1
     assert "报价单-2.xlsx" in text
 
@@ -700,7 +848,9 @@ def _compaction_invocations(graph):
     ]
 
 
-async def test_compaction_triggers_after_delivery_when_batch_full(monkeypatch):
+async def test_compaction_triggers_after_delivery_when_batch_full(
+    monkeypatch, outbox, db_path
+):
     records = []
 
     async def fake_log_turn(record):
@@ -720,16 +870,18 @@ async def test_compaction_triggers_after_delivery_when_batch_full(monkeypatch):
         UserLocks(),
         trace_id="t1",
         summarizer=object(),
+        outbox=outbox,
     )
 
     assert len(graph.invocations) == 2
     assert graph.invocations[1] == ({"new_compaction_request": True}, "sync")
-    # compaction 回合没有用户输出：deliver_graph_output 只能为正常回合跑一次。
-    assert [message.text for _user, message in platform.sent] == ["好的。"]
+    # compaction 回合没有用户输出：只有正常回合那一条进了 outbox。
+    assert [row["payload"]["text"] for row in _outbox_rows(db_path)] == ["好的。"]
+    assert platform.sent == []
     assert records[0].success is True
 
 
-async def test_compaction_skipped_when_pending_below_threshold(monkeypatch):
+async def test_compaction_skipped_when_pending_below_threshold(monkeypatch, outbox):
     async def fake_log_turn(record):
         pass
 
@@ -746,13 +898,14 @@ async def test_compaction_skipped_when_pending_below_threshold(monkeypatch):
         UserLocks(),
         trace_id="t1",
         summarizer=object(),
+        outbox=outbox,
     )
 
     assert len(graph.invocations) == 1
     assert _compaction_invocations(graph) == []
 
 
-async def test_compaction_skipped_while_waiting_for_confirmation(monkeypatch):
+async def test_compaction_skipped_while_waiting_for_confirmation(monkeypatch, outbox):
     """对 interrupt 等待态做非 resume 的 compaction invoke 是未定义行为：带旗标的
     checkpoint 会落盘、interrupt 重抛、compact 根本不跑，旗标就此粘滞。"""
 
@@ -781,12 +934,13 @@ async def test_compaction_skipped_while_waiting_for_confirmation(monkeypatch):
         UserLocks(),
         trace_id="t1",
         summarizer=object(),
+        outbox=outbox,
     )
 
     assert _compaction_invocations(graph) == []
 
 
-async def test_compaction_skipped_when_summarizer_none(monkeypatch):
+async def test_compaction_skipped_when_summarizer_none(monkeypatch, outbox):
     async def fake_log_turn(record):
         pass
 
@@ -802,6 +956,7 @@ async def test_compaction_skipped_when_summarizer_none(monkeypatch):
         (),
         UserLocks(),
         trace_id="t1",
+        outbox=outbox,
     )
 
     # 没有 summarizer 时连状态都不该查：aget_state 只有回合本身调用了一次。
@@ -809,7 +964,9 @@ async def test_compaction_skipped_when_summarizer_none(monkeypatch):
     assert _compaction_invocations(graph) == []
 
 
-async def test_compaction_invoke_failure_does_not_fail_turn(monkeypatch, caplog):
+async def test_compaction_invoke_failure_does_not_fail_turn(
+    monkeypatch, caplog, outbox, db_path
+):
     records = []
 
     async def fake_log_turn(record):
@@ -833,10 +990,11 @@ async def test_compaction_invoke_failure_does_not_fail_turn(monkeypatch, caplog)
             UserLocks(),
             trace_id="t1",
             summarizer=object(),
+            outbox=outbox,
         )
 
     assert records[0].success is True
-    assert [message.text for _user, message in platform.sent] == ["好的。"]
+    assert [row["payload"]["text"] for row in _outbox_rows(db_path)] == ["好的。"]
     assert any(record.exc_info for record in caplog.records)
 
 
@@ -862,7 +1020,7 @@ def _install_fake_clock(monkeypatch):
     return clock
 
 
-async def test_turn_duration_excludes_compaction_time(monkeypatch):
+async def test_turn_duration_excludes_compaction_time(monkeypatch, outbox):
     """turn log 的 duration_ms 是用户回合时长（“零感知延迟”的验收指标）：
     投递之后才发起的后台压缩绝不能计进去。"""
 
@@ -888,6 +1046,7 @@ async def test_turn_duration_excludes_compaction_time(monkeypatch):
         UserLocks(),
         trace_id="t1",
         summarizer=object(),
+        outbox=outbox,
     )
 
     assert _compaction_invocations(graph) != []  # 压缩确实跑了
@@ -895,7 +1054,7 @@ async def test_turn_duration_excludes_compaction_time(monkeypatch):
     assert records[0].duration_ms == 0
 
 
-async def test_confirm_turn_duration_excludes_compaction_time(monkeypatch):
+async def test_confirm_turn_duration_excludes_compaction_time(monkeypatch, outbox):
     """第二个触发点（确认恢复分支）同样不得把压缩耗时算进本轮时长。"""
 
     records = []
@@ -920,13 +1079,14 @@ async def test_confirm_turn_duration_excludes_compaction_time(monkeypatch):
         object(),
         InboundEvent("test", "u1", "是", None),
         summarizer=object(),
+        outbox=outbox,
     )
 
     assert clock.now == 5.0
     assert records[0].duration_ms == 0
 
 
-async def test_compaction_triggers_after_confirm_resume_delivery(monkeypatch):
+async def test_compaction_triggers_after_confirm_resume_delivery(monkeypatch, outbox):
     """第二个触发点：handle_event 的确认恢复分支投递完成后同样要触发压缩。"""
 
     async def fake_log_turn(record):
@@ -941,11 +1101,233 @@ async def test_compaction_triggers_after_confirm_resume_delivery(monkeypatch):
     await handle_event(
         graph,
         FakePlatform(),
-        object(),  # debouncer.add is unreachable once resumed_state is set
+        object(),  # debouncer.add is unreachable once the resume branch handled it
         UserLocks(),
         object(),  # memory_repository is unreachable outside /long-term-memory
         InboundEvent("test", "u1", "是", None),
         summarizer=object(),
+        outbox=outbox,
     )
 
     assert graph.invocations[1] == ({"new_compaction_request": True}, "sync")
+
+
+async def test_empty_graph_output_is_not_enqueued(monkeypatch, outbox, db_path):
+    """图既没产出也没待处理文件：一行都不能进 outbox（空批入队等于制造空投递）。"""
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+
+    await dispatch_fresh(
+        _StateGraph({"result": None, "pending_files": ()}),
+        FakePlatform(),
+        "test",
+        "u1",
+        "嗯",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
+    )
+
+    assert _outbox_rows(db_path) == []
+    assert records[0].output_text is None
+    assert records[0].success is True
+
+
+async def test_interrupt_question_is_enqueued_as_a_text_message(
+    monkeypatch, outbox, db_path
+):
+    """等确认这一轮的输出（MainAgent 的确认话术）同样走 outbox，不再直接发。"""
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    platform = FakePlatform()
+
+    await dispatch_fresh(
+        _StateGraph(
+            {
+                "__interrupt__": (
+                    SimpleNamespace(value={"user_message": "要转成表格吗？"}),
+                )
+            }
+        ),
+        platform,
+        "test",
+        "u1",
+        "把这个表整理一下",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
+    )
+
+    rows = _outbox_rows(db_path)
+    assert [(row["kind"], row["payload"]) for row in rows] == [
+        ("text", {"text": "要转成表格吗？"})
+    ]
+    assert rows[0]["session_key"] == "test:u1"
+    assert rows[0]["status"] == "pending"
+    assert platform.sent == []
+
+
+async def test_orchestrator_failure_enqueues_the_fallback_text(
+    monkeypatch, outbox, db_path
+):
+    """异常兜底话术也必须落 outbox：直接 send 会在网络抖动时把它一起丢掉。"""
+
+    class Graph:
+        async def aget_state(self, config):
+            return SimpleNamespace(next=(), interrupts=(), values={})
+
+        async def ainvoke(self, value, config, durability=None):
+            raise RuntimeError("图炸了")
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    platform = FakePlatform()
+    wakeup = asyncio.Event()
+
+    await dispatch_fresh(
+        Graph(),
+        platform,
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
+        wakeup=wakeup,
+    )
+
+    rows = _outbox_rows(db_path)
+    assert [(row["kind"], row["payload"]) for row in rows] == [
+        ("text", {"text": "处理失败，稍后再试一下"})
+    ]
+    assert rows[0]["trace_id"] == "t1"
+    assert records[0].success is False
+    assert records[0].error == "图炸了"
+    assert platform.sent == []
+    assert wakeup.is_set()
+
+
+async def test_turn_log_success_follows_the_graph_summary_not_delivery(
+    monkeypatch, outbox, db_path
+):
+    """回合终点是入队，投递成败已不在这一层：turn log 的 success 直接照抄图小结，
+    error 不再承载 delivery_error。"""
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+
+    await dispatch_fresh(
+        _StateGraph(
+            {"result": {"artifacts": [], "reply_text": "这次没做成。", "success": False}}
+        ),
+        FakePlatform(),
+        "test",
+        "u1",
+        "帮我改一下",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
+    )
+
+    assert records[0].success is False
+    assert records[0].error is None
+    assert records[0].output_text == "这次没做成。"
+    assert [row["payload"]["text"] for row in _outbox_rows(db_path)] == ["这次没做成。"]
+
+
+async def test_dispatch_fresh_wakes_the_delivery_worker_after_enqueue(
+    monkeypatch, outbox, db_path
+):
+    """入队之后要叫醒常驻 worker，否则最坏要等它下一次 1 秒轮询才发件。"""
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    wakeup = asyncio.Event()
+
+    await dispatch_fresh(
+        _StateGraph(
+            {"result": {"artifacts": [], "reply_text": "好的。", "success": True}}
+        ),
+        FakePlatform(),
+        "test",
+        "u1",
+        "你是谁？",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
+        wakeup=wakeup,
+    )
+
+    assert len(_outbox_rows(db_path)) == 1
+    assert wakeup.is_set()
+
+
+async def test_confirm_resume_output_is_enqueued_and_wakes_worker(
+    monkeypatch, outbox, db_path
+):
+    """第二个回合终点（handle_event 的确认恢复分支）语义与 dispatch_fresh 一致。"""
+
+    class Graph:
+        async def aget_state(self, config):
+            return SimpleNamespace(
+                next=("ask_confirm",),
+                interrupts=(object(),),
+                values={"trace_id": "t0"},
+            )
+
+        async def ainvoke(self, value, config, durability=None):
+            return {
+                "result": {
+                    "artifacts": [],
+                    "reply_text": "好的，已经处理。",
+                    "success": True,
+                }
+            }
+
+    async def fake_log_turn(record):
+        pass
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    platform = FakePlatform()
+    wakeup = asyncio.Event()
+
+    await handle_event(
+        Graph(),
+        platform,
+        object(),  # debouncer.add is unreachable once the resume branch handled it
+        UserLocks(),
+        object(),  # memory_repository is unreachable outside /long-term-memory
+        InboundEvent("test", "u1", "是", None),
+        outbox=outbox,
+        wakeup=wakeup,
+    )
+
+    rows = _outbox_rows(db_path)
+    assert [(row["session_key"], row["trace_id"], row["payload"]) for row in rows] == [
+        ("test:u1", "t0", {"text": "好的，已经处理。"})
+    ]
+    assert platform.sent == []
+    assert wakeup.is_set()
