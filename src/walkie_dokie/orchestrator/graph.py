@@ -484,11 +484,24 @@ def _parse_resume_reply(reply, *, field: str) -> tuple[str | None, tuple[dict, .
     return reply or None, ()
 
 
+# 难度反馈的固定话术：判难度归模型，怎么展示归代码——固定文案可测试、不漂移。
+# 用户拍板三档都显示（给用户每次提醒难度的自然入口）；用户在确认阶段说"很难/
+# 要仔细"会走 revise 循环回 MainAgent 重判（prompt 规定只上调不下调）。
+_DIFFICULTY_NOTES = {
+    "simple": "这个任务不复杂，确认后我很快就能办好。",
+    "standard": "确认后我就开始处理。",
+    "complex": "这个任务比较复杂，我会仔细处理，可能要多花一点时间。",
+}
+
+
 async def _ask_confirm(state: SessionState) -> dict:
     decision = state["decision"]
+    # 老 checkpoint 的 task dict 可能没有 difficulty 键，与 task_from_dict 同兜。
+    difficulty = decision["task"].get("difficulty", "standard")
+    note = _DIFFICULTY_NOTES.get(difficulty, _DIFFICULTY_NOTES["standard"])
     reply = interrupt(
         {
-            "user_message": decision["user_message"],
+            "user_message": f"{decision['user_message']}{note}",
             "task": decision["task"],
         }
     )

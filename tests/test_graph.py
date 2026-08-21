@@ -266,7 +266,7 @@ async def test_task_reaches_confirm_then_execution_and_main_agent_finalizes(
         config=config(),
     )
     assert proposal["__interrupt__"][0].value == {
-        "user_message": "我理解为写一份测试文档，回复“是”确认。",
+        "user_message": "我理解为写一份测试文档，回复“是”确认。确认后我就开始处理。",
         "task": {
             "instruction": "写一份测试文档",
             "missing_info": [],
@@ -281,6 +281,34 @@ async def test_task_reaches_confirm_then_execution_and_main_agent_finalizes(
     assert state["pending_instruction"] is None
     assert execution_agent.calls[0]["instruction"] == "写一份测试文档"
     assert main_agent.finalize_calls[0].report.summary == "测试文档已生成"
+
+
+@pytest.mark.parametrize(
+    "difficulty,note",
+    [
+        ("simple", "这个任务不复杂，确认后我很快就能办好。"),
+        ("standard", "确认后我就开始处理。"),
+        ("complex", "这个任务比较复杂，我会仔细处理，可能要多花一点时间。"),
+    ],
+)
+async def test_confirmation_message_ends_with_a_difficulty_note(
+    tmp_path, execution_agent, difficulty, note
+):
+    main_agent = FakeMainAgent([task_decision(difficulty=difficulty)])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    proposal = await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "帮我处理文档",
+            "new_file": None,
+        },
+        config=config(),
+    )
+    message = proposal["__interrupt__"][0].value["user_message"]
+    assert message.endswith(note)
+    assert message.startswith("我理解为写一份测试文档")
 
 
 async def test_task_difficulty_reaches_the_execution_agent(
@@ -474,7 +502,10 @@ async def test_leaked_internal_setup_in_task_proposal_is_replaced(
         config=config(),
     )
 
-    assert proposal["__interrupt__"][0].value["user_message"] == _LEAK_REDACTION_REPLY
+    # 兜底话术仍在确认路径上（任务照常等确认），难度短语一样追加。
+    assert proposal["__interrupt__"][0].value["user_message"] == (
+        _LEAK_REDACTION_REPLY + "确认后我就开始处理。"
+    )
 
 
 async def test_leaked_internal_setup_in_finalize_is_replaced_before_delivery(
