@@ -6,6 +6,7 @@ import walkie_dokie.artifacts as artifact_store
 from scripts.run_mvp import (
     _invoke_from_event,
     _waiting_for_confirmation,
+    build_outbound_messages,
     deliver_graph_output,
     dispatch_fresh,
     handle_event,
@@ -536,6 +537,116 @@ async def test_pending_files_notice_uses_deduped_display_name():
     text = platform.sent[0][1].text
     assert text.count("报价单.xlsx") == 1
     assert "报价单-2.xlsx" in text
+
+
+async def test_build_outbound_messages_interrupt_asks_with_main_agent_text():
+    """确认话术来自 MainAgent 的 user_message，且这一轮算成功（等待用户输入）。"""
+
+    messages, summary = build_outbound_messages(
+        {
+            "__interrupt__": (
+                SimpleNamespace(value={"user_message": "要转成表格吗？回复「是」。"}),
+            )
+        }
+    )
+    assert messages == [("text", {"text": "要转成表格吗？回复「是」。"})]
+    assert summary == {
+        "output_text": "要转成表格吗？回复「是」。",
+        "output_filename": None,
+        "success": True,
+    }
+
+
+async def test_build_outbound_messages_pending_files_notice_uses_display_names():
+    """收到文件还没指令：一条主动话术，文件名用去重后的 display_filename。"""
+
+    reference_1 = {
+        "kind": "input",
+        "path": "/tmp/does-not-matter-1",
+        "filename": "报价单.xlsx",
+        "display_filename": None,
+        "mime_type": "application/octet-stream",
+    }
+    reference_2 = {
+        "kind": "input",
+        "path": "/tmp/does-not-matter-2",
+        "filename": "报价单.xlsx",
+        "display_filename": "报价单-2.xlsx",
+        "mime_type": "application/octet-stream",
+    }
+    messages, summary = build_outbound_messages(
+        {"pending_files": (reference_1, reference_2)}
+    )
+    assert len(messages) == 1
+    kind, payload = messages[0]
+    assert kind == "text"
+    assert payload["text"].count("报价单.xlsx") == 1
+    assert "报价单-2.xlsx" in payload["text"]
+    assert summary == {
+        "output_text": payload["text"],
+        "output_filename": None,
+        "success": True,
+    }
+
+
+async def test_build_outbound_messages_empty_state_produces_nothing():
+    """图没产出也没待处理文件：清单为空，这一轮仍算成功（不是失败）。"""
+
+    assert build_outbound_messages({"result": None, "pending_files": ()}) == (
+        [],
+        {"output_text": None, "output_filename": None, "success": True},
+    )
+
+
+async def test_build_outbound_messages_puts_files_before_text_as_references(
+    monkeypatch, tmp_path
+):
+    """文件在前文字在后；file 消息只带 reference dict，纯函数绝不读 bytes。"""
+
+    root = tmp_path / "workspaces"
+    root.mkdir()
+    a = root / "a.docx"
+    a.write_bytes(b"doc-a")
+    b = root / "b.docx"
+    b.write_bytes(b"doc-b")
+    monkeypatch.setattr(artifact_store, "WORKSPACES_ROOT", root)
+    ref_a = artifact_store.output_artifact_reference(a, a.name)
+    ref_b = artifact_store.output_artifact_reference(b, b.name)
+
+    messages, summary = build_outbound_messages(
+        {
+            "result": {
+                "artifacts": [ref_a, ref_b],
+                "reply_text": "两份都处理好了。",
+                "success": True,
+            }
+        }
+    )
+    assert messages == [
+        ("file", ref_a),
+        ("file", ref_b),
+        ("text", {"text": "两份都处理好了。"}),
+    ]
+    assert all("content" not in payload for _kind, payload in messages)
+    assert summary == {
+        "output_text": "两份都处理好了。",
+        "output_filename": "a.docx, b.docx",
+        "success": True,
+    }
+
+
+async def test_build_outbound_messages_keeps_failed_result_text_and_success_flag():
+    """执行失败也要把话术发出去；success 照抄 result，不做兜底改写。"""
+
+    messages, summary = build_outbound_messages(
+        {"result": {"artifacts": [], "reply_text": "这次没做成。", "success": False}}
+    )
+    assert messages == [("text", {"text": "这次没做成。"})]
+    assert summary == {
+        "output_text": "这次没做成。",
+        "output_filename": None,
+        "success": False,
+    }
 
 
 class CompactionGraph:

@@ -121,6 +121,8 @@ async def test_propose_then_confirm_executes(tmp_path):
     assert result.turns[0].intent == "document_task"
     assert result.turns[0].executed is False
     assert result.turns[1].executed is True
+    # 出站清单里产出文件在文字前面，但文件不产生话术：replies 只收 text 消息。
+    assert result.turns[1].replies == ("任务完成，文件已发给你。",)
     assert recorder.calls[0]["input_filenames"] == ("simple.docx",)
 
 

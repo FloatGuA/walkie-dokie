@@ -120,15 +120,21 @@ async def _invoke_from_event(
     return state, trace_id
 
 
-async def deliver_graph_output(
-    platform: FeishuAdapter, user_id: str, state: dict, *, trace_id: str | None = None
-) -> tuple[str | None, str | None, bool]:
+def build_outbound_messages(state: dict) -> tuple[list[tuple[str, dict]], dict]:
+    """把一轮图输出组装成有序出站清单 + 这一轮写 turn log 用的小结。
+
+    纯函数：不发送、不碰文件系统。``file`` 消息只带 ArtifactReference dict，
+    bytes 留到真正发送的那一刻再读——和旧的“发送时才 read_bytes”语义一致，
+    也让清单可以整条落盘进 outbox。
+    """
+
     if "__interrupt__" in state:
         # 给用户的话来自 MainAgent；task contract 只给 ExecutionAgent，不能混用。
-        payload = state["__interrupt__"][0].value
-        logger.info("图输出等待用户确认 user_id=%s trace_id=%s", user_id, trace_id)
-        await platform.send(user_id, OutboundMessage(text=payload["user_message"]))
-        return payload["user_message"], None, True
+        user_message = state["__interrupt__"][0].value["user_message"]
+        return (
+            [("text", {"text": user_message})],
+            {"output_text": user_message, "output_filename": None, "success": True},
+        )
 
     result = state.get("result")
     if result is None:
@@ -138,38 +144,63 @@ async def deliver_graph_output(
             # 得主动回一句，不能沉默，不然用户不知道文件收到没有。
             names = "、".join(display_name(ref) for ref in pending_files)
             text = f"收到文件「{names}」了，请告诉我需要我做什么。"
-            await platform.send(user_id, OutboundMessage(text=text))
-            return text, None, True
-        else:
-            logger.info("图输出为空 user_id=%s trace_id=%s", user_id, trace_id)
-        return None, None, True
+            return (
+                [("text", {"text": text})],
+                {"output_text": text, "output_filename": None, "success": True},
+            )
+        return [], {"output_text": None, "output_filename": None, "success": True}
 
     artifacts = result.get("artifacts") or []
-    logger.info(
-        "图输出完成 user_id=%s trace_id=%s success=%s artifact_count=%d",
-        user_id,
-        trace_id,
-        result.get("success"),
-        len(artifacts),
-    )
-    for reference in artifacts:
-        artifact = resolve_artifact_reference(reference)
-        await platform.send(
+    messages: list[tuple[str, dict]] = [
+        ("file", reference) for reference in artifacts
+    ]
+    messages.append(("text", {"text": result["reply_text"]}))
+    return messages, {
+        "output_text": result["reply_text"],
+        "output_filename": ", ".join(item["filename"] for item in artifacts) or None,
+        "success": bool(result.get("success")),
+    }
+
+
+async def deliver_graph_output(
+    platform: FeishuAdapter, user_id: str, state: dict, *, trace_id: str | None = None
+) -> tuple[str | None, str | None, bool]:
+    """中间态：组装全在 ``build_outbound_messages``，这里只剩发送。
+
+    持久 outbox 落地后（回合终点改为入队）本函数整体删除。
+    """
+
+    messages, summary = build_outbound_messages(state)
+    if "__interrupt__" in state:
+        logger.info("图输出等待用户确认 user_id=%s trace_id=%s", user_id, trace_id)
+    elif state.get("result") is None:
+        if not messages:
+            logger.info("图输出为空 user_id=%s trace_id=%s", user_id, trace_id)
+    else:
+        logger.info(
+            "图输出完成 user_id=%s trace_id=%s success=%s artifact_count=%d",
             user_id,
-            OutboundMessage(
-                file=IncomingFile(
-                    filename=reference["filename"],
-                    content=artifact.read_bytes(),
-                    mime_type=reference["mime_type"],
-                )
-            ),
+            trace_id,
+            state["result"].get("success"),
+            len(messages) - 1,
         )
-    await platform.send(user_id, OutboundMessage(text=result["reply_text"]))
-    return (
-        result["reply_text"],
-        ", ".join(item["filename"] for item in artifacts) or None,
-        bool(result.get("success")),
-    )
+
+    for kind, payload in messages:
+        if kind == "file":
+            artifact = resolve_artifact_reference(payload)
+            await platform.send(
+                user_id,
+                OutboundMessage(
+                    file=IncomingFile(
+                        filename=payload["filename"],
+                        content=artifact.read_bytes(),
+                        mime_type=payload["mime_type"],
+                    )
+                ),
+            )
+        else:
+            await platform.send(user_id, OutboundMessage(text=payload["text"]))
+    return summary["output_text"], summary["output_filename"], summary["success"]
 
 
 async def maybe_run_compaction(graph, config: dict, summarizer) -> None:
