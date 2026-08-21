@@ -91,12 +91,25 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
 
     走本机 `claude login` 缓存的订阅鉴权（MVP 阶段用户知情接受的风险，见 DECISION.md）。
 
-    ``model`` 接受别名（"haiku"/"sonnet"/"opus"）或完整模型 ID。默认 sonnet：
-    文档任务够用，且固定住模型让 golden eval 冒烟跨机器可比（不随 CLI 默认漂移）。
+    模型选择：默认按 MainAgent 判定的任务难度路由（simple→haiku、standard→sonnet、
+    complex→opus）；构造时传入 ``model``（别名或完整模型 ID）则锁死为该模型、
+    旁路路由——调试或额度紧张时用 EXECUTION_AGENT_MODEL 环境变量走这条路。
     """
 
-    def __init__(self, model: str = "sonnet"):
+    _DIFFICULTY_MODELS = {"simple": "haiku", "standard": "sonnet", "complex": "opus"}
+
+    def __init__(self, model: str | None = None):
         self.model = model
+
+    def model_for(self, difficulty: str) -> str:
+        """难度 → 模型的确定性映射；锁死模式下无视难度。
+
+        未知难度兜 sonnet：MainAgent 侧已把非法值收成 standard，这里只会在
+        老 checkpoint 或直接调用者传怪值时触发，不值得炸掉一次已确认的执行。
+        """
+        if self.model is not None:
+            return self.model
+        return self._DIFFICULTY_MODELS.get(difficulty, "sonnet")
 
     async def run(
         self,
@@ -104,9 +117,14 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
         input_paths: tuple[Path, ...],
         input_filenames: tuple[str, ...],
         workdir: Path,
+        difficulty: str = "standard",
     ) -> ExecutionReport:
+        model = self.model_for(difficulty)
         logger.info(
-            "Claude Agent SDK 开始执行，instruction=%r input_filenames=%r workdir=%s",
+            "Claude Agent SDK 开始执行，difficulty=%s model=%s "
+            "instruction=%r input_filenames=%r workdir=%s",
+            difficulty,
+            model,
             instruction,
             input_filenames,
             workdir,
@@ -131,7 +149,7 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
             "不要直接和用户对话，不要决定或讨论用户的长期记忆。"
         )
 
-        options = _execution_options(workdir, model=self.model)
+        options = _execution_options(workdir, model=model)
 
         structured: dict | None = None
         execution_error: str | None = None

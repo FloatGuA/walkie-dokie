@@ -32,5 +32,11 @@ async def test_recording_agent_records_then_delegates(tmp_path):
         input_filenames=("a.docx",),
         workdir=tmp_path,
     )
-    assert recorder.calls == [{"instruction": "改标题", "input_filenames": ("a.docx",)}]
+    assert recorder.calls == [
+        {
+            "instruction": "改标题",
+            "input_filenames": ("a.docx",),
+            "difficulty": "standard",
+        }
+    ]
     assert report.summary

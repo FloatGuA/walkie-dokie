@@ -692,8 +692,9 @@ async def main():
 
         platform = FeishuAdapter(app_id, app_secret)
         main_agent = DeepSeekMainAgent()
+        # EXECUTION_AGENT_MODEL 设了就锁死单模型（旁路难度路由）；不设走路由。
         backend = ClaudeAgentSDKBackend(
-            model=os.environ.get("EXECUTION_AGENT_MODEL", "sonnet")
+            model=os.environ.get("EXECUTION_AGENT_MODEL") or None
         )
         memory_repository = JsonMemoryRepository()
         summarizer = ClaudeAgentSummarizer()

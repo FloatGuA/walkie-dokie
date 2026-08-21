@@ -142,7 +142,10 @@ class CodexBackend(ExecutionAgent):
         input_paths: tuple[Path, ...],
         input_filenames: tuple[str, ...],
         workdir: Path,
+        difficulty: str = "standard",
     ) -> ExecutionReport:
+        # difficulty 目前只有 Claude 后端做模型路由；Codex 固定用登录态默认模型，
+        # 接受该参数以满足 ExecutionAgent 接口，暂不消费（不是疏漏）。
         logger.info(
             "Codex 开始执行，instruction=%r input_filenames=%r workdir=%s",
             instruction,

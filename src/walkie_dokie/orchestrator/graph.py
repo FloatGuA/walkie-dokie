@@ -1009,6 +1009,7 @@ def build_graph(
                         input_paths=input_paths,
                         input_filenames=input_filenames,
                         workdir=workdir,
+                        difficulty=task.difficulty,
                     )
                 report = _validate_execution_report(workdir, report)
                 artifacts = [

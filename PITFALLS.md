@@ -176,3 +176,13 @@
 **已由**：`src/walkie_dokie/admin/data.py::_read_checkpoint_users` 守门，并由 `tests/test_admin_data.py::test_read_memory_reads_non_wal_db_without_writing` 钉住（删掉那一行该测试立刻红）。
 
 **关联**：只读连接读 **WAL** 库仍会 map/touch `-shm` 文件（SQLite 强制要求），所以"只读"也需要该目录的写权限；换用户跑观测台时会拿到 `unable to open database file`。`immutable=1` 能彻底免除，但对正在被写的库不安全，没用。
+
+## `load_dotenv()` 在 stdin/heredoc 里必炸，快速探针脚本要么传显式路径要么落成文件
+
+**现象**：`python3 - <<'EOF'` 这类 heredoc 里调 `load_dotenv()`，抛 `AssertionError: assert frame.f_back is not None`（python-dotenv `find_dotenv` 内部），报错信息完全看不出跟"从 stdin 运行"有关。
+
+**真因**：`find_dotenv()` 靠遍历调用栈帧找"调用者的文件路径"再向上找 `.env`；stdin 运行时栈帧没有真实文件，断言直接失败。这不是 `.env` 缺失或路径问题，换目录、设环境变量都救不了。
+
+**正确做法**：给显式路径 `load_dotenv("/abs/path/.env")`（stdin 里也能用），或把脚本写成真实文件再跑（scratchpad 即可）。
+
+**判据**：任何"临时拼一段 python 打真实 API"的探针，只要用到 dotenv，就别走 heredoc 裸调 `load_dotenv()`。

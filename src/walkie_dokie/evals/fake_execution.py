@@ -18,6 +18,7 @@ class FakeExecutionAgent(ExecutionAgent):
         input_paths: tuple[Path, ...],
         input_filenames: tuple[str, ...],
         workdir: Path,
+        difficulty: str = "standard",
     ) -> ExecutionReport:
         target = workdir / "output.docx"
         shutil.copyfile(self._output_fixture, target)
@@ -40,8 +41,15 @@ class RecordingExecutionAgent(ExecutionAgent):
         input_paths: tuple[Path, ...],
         input_filenames: tuple[str, ...],
         workdir: Path,
+        difficulty: str = "standard",
     ) -> ExecutionReport:
         self.calls.append(
-            {"instruction": instruction, "input_filenames": input_filenames}
+            {
+                "instruction": instruction,
+                "input_filenames": input_filenames,
+                "difficulty": difficulty,
+            }
         )
-        return await self._inner.run(instruction, input_paths, input_filenames, workdir)
+        return await self._inner.run(
+            instruction, input_paths, input_filenames, workdir, difficulty
+        )

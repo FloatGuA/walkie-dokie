@@ -55,6 +55,8 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 持久 outbox/inbox 上线（设计见 `docs/superpowers/specs/2026-08-21-outbox-inbox-design.md`）：回合终点从"直接 `platform.send`"改成写 `var/outbox.db`，平台发送由常驻投递 worker 独占——每 session 只取队头保序（文件还没寄出去，"都改好了"绝不会先到）、失败按 30s/2m/10m 三档退避、第 4 次失败转死信并 WARNING（死信可查 `Outbox.dead_letters`）、单条 send 30s 超时按一次失败算、同一批里一条会话失败不带走其他会话；进程启动 `reset_sending` 把卡在 sending 的行一律复位重寄（at-least-once：宁可重发一次，不可静默丢件）。入站侧 `InboundEvent.event_id` 去重排在 `handle_event` 最前面（先记后处理，且去重先于防抖，`inbox_seen` 7 天 TTL），飞书重投不再被攒批当成"用户又说了一遍"。**turn log 语义随之收窄**：`success` 从"已投递"变成"图产出成功且已入队"，不再有 delivery_error——2026-08-21 起的成功率统计跨这条边界时需要注意。端到端演练测试覆盖"入队 → 按 seq 三轮投递 → 崩在 sending → 复位 → 恰好补寄那一条"，以及"平台全程 500、三条全进死信时 turn log 仍 success=True"。TDD 全程覆盖，2026-08-21，`pytest` 448 passed（414 → 448）。
 - debounce+graph 并发场景补了两个 `asyncio.gather` 真并发回归测试（此前 7 个 debounce 测试全是顺序模拟）：同一 session 两条 `handle_event` 同时到达、以及 `dispatch_fresh` 与 `handle_event` confirm-resume 竞态（即 commit `1201650` 修过的那类 bug 的场景），均确认共享 `UserLocks` 实例下 `graph.aget_state`/`ainvoke` 严格序列化不交错；每个测试都先用"两把独立锁"版本验证过自身能检测到交错（RED）再切回生产接线（GREEN）。无生产代码改动。2026-08-20，`pytest` 142 passed。
 
+- 执行模型按任务难度路由（2026-08-21）：MainAgent 在 propose 输出 `task.difficulty`（simple/standard/complex，缺失/非法兜 standard），`ClaudeAgentSDKBackend` 映射 haiku/sonnet/opus；`EXECUTION_AGENT_MODEL` 设置后锁死单模型旁路路由。离线 461 passed + golden 回归 23/23 + 真实 DeepSeek 四条代表性输入难度判定 4/4 符合预期。
+
 ## 尚未验证
 
 - v2 尚未在正常部署 OS 上跑完真实 `DeepSeek → AsyncSqliteSaver → Claude → 飞书` 全链路。
@@ -62,6 +64,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - compaction 的摘要质量只做过单次真实标定（6 消息批），长会话下的抽取质量分布与二级合并的真实表现未知，badcase 驱动观察；Claude 登录态失效时压缩按失败语义退化为硬截断。
 - 确认判定四层结构的灰区判定只在离线 fake 与 21 样本 golden 回归上验证过；真实多用户长期使用中模型对灰区词的判定分布（尤其"好的/行"类）尚无数据，样本按 badcase 驱动继续回填。
 - Claude 后端的正常 docx 生成已由 2026-08-21 `--real-execution` 冒烟覆盖（2 样本全链路 PASSED）；超时、取消后的子进程/远端状态清理仍未专项冒烟。
+- 难度路由后 haiku 档的真实执行质量（python-docx/openpyxl 代码翻车率）未实测，待下次 `--real-execution` 冒烟含 simple 档样本验证；判 simple 实为难任务的误判代价（用户拿到差结果重发）也无真实数据。
 - Codex 最小权限 profile 已做本地命令隔离测试，但独立 `var/codex_home` 尚未登录，真实模型文档任务仍未冒烟。
 - 持久 outbox/inbox 只做过离线验证：保序、退避、死信、崩溃复位、event_id 去重都由 fake 平台 + 临时 sqlite 的端到端演练覆盖，真实飞书的投递/重投冒烟（含发送半成功、进程在 checkpoint/投递边界崩溃的实况）仍待用户配合场次。
 

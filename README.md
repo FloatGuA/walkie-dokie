@@ -48,7 +48,7 @@ pip install -e ".[claude,dev]"
 pytest tests/
 ```
 
-主 Agent 通过 OpenAI 兼容 SDK 调用 DeepSeek，执行 Agent 当前默认用 Claude Agent SDK。鉴权和对外使用边界见 [.env.example](.env.example) 与 [PITFALLS.md](PITFALLS.md)。
+主 Agent 通过 OpenAI 兼容 SDK 调用 DeepSeek，执行 Agent 当前默认用 Claude Agent SDK。执行模型按主 Agent 判定的任务难度路由（simple→haiku、standard→sonnet、complex→opus），设 `EXECUTION_AGENT_MODEL` 可锁死单模型。鉴权和对外使用边界见 [.env.example](.env.example) 与 [PITFALLS.md](PITFALLS.md)。
 
 执行任务把用户指令、文件名和文档内容全部视为不可信输入。Claude 后端只开放沙箱内 Bash，禁用 MCP、skills、子 Agent、网页与网络，清除应用凭证环境变量，并且只读 Python 运行时、只写本轮用户工作区；Codex 后端使用等价的最小 permission profile。输入和输出只接受经过确定性检查的 `.docx/.xlsx`，宏、嵌入对象、外部关系、危险字段/公式和异常压缩包会在 Agent 前后被拒绝。prompt 约束只是辅助，权限边界由 OS 沙箱和产物校验承担。
 

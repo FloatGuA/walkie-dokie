@@ -36,6 +36,9 @@ class TaskContract:
     missing_info: tuple[str, ...] = ()
     # 只有主 Agent 能根据对话语义选择上一轮产物；控制平面不自行猜测“继续”。
     use_previous_artifact: bool = False
+    # 主 Agent 判定的任务难度（simple/standard/complex），执行后端据此选模型。
+    # 判定是模型的事，映射到具体模型是后端代码的事（models judge, code decides）。
+    difficulty: str = "standard"
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,7 @@ def decision_to_dict(decision: MainAgentDecision) -> dict:
                 "instruction": task.instruction,
                 "missing_info": list(task.missing_info),
                 "use_previous_artifact": task.use_previous_artifact,
+                "difficulty": task.difficulty,
             }
             if task
             else None
@@ -152,4 +156,6 @@ def task_from_dict(value: dict) -> TaskContract:
         instruction=value["instruction"],
         missing_info=tuple(value.get("missing_info", ())),
         use_previous_artifact=use_previous,
+        # 旧 checkpoint 里的 task dict 没有这个键，缺省中档。
+        difficulty=value.get("difficulty", "standard"),
     )

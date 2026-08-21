@@ -208,6 +208,50 @@ async def test_propose_task_requires_valid_task_contract():
         )
 
 
+async def test_decide_parses_task_difficulty_into_the_contract():
+    client, _ = fake_client(
+        [
+            {
+                "intent": "document_task",
+                "action": "propose_task",
+                "user_message": "确认吗？",
+                "task": {
+                    "instruction": "整理三份 Excel 交叉汇总",
+                    "missing_info": [],
+                    "difficulty": "complex",
+                },
+                "memory_operations": [],
+            }
+        ]
+    )
+    decision = await DeepSeekMainAgent(client=client).decide(
+        DialogueContext("汇总这三份表", (), {})
+    )
+    assert decision.task.difficulty == "complex"
+
+
+@pytest.mark.parametrize("raw_difficulty", [None, "ultra", 3])
+async def test_missing_or_invalid_difficulty_falls_back_to_standard(raw_difficulty):
+    task = {"instruction": "写一份请假条", "missing_info": []}
+    if raw_difficulty is not None:
+        task["difficulty"] = raw_difficulty
+    client, _ = fake_client(
+        [
+            {
+                "intent": "document_task",
+                "action": "propose_task",
+                "user_message": "确认吗？",
+                "task": task,
+                "memory_operations": [],
+            }
+        ]
+    )
+    decision = await DeepSeekMainAgent(client=client).decide(
+        DialogueContext("写请假条", (), {})
+    )
+    assert decision.task.difficulty == "standard"
+
+
 async def test_memory_operation_without_verbatim_evidence_is_discarded():
     client, _ = fake_client(
         [

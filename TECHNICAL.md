@@ -53,9 +53,10 @@ InboundEvent
 1. `decide(DialogueContext) -> MainAgentDecision` 输出显式 `intent`：`chat` 必须对应 `action=reply`，由 MainAgent 直接回答；`document_task` 必须对应 `action=propose_task`，经确认后才进入 ExecutionAgent。控制平面拒绝不一致的协议结果。
 2. `TaskContract.instruction` 必须自包含；缺失信息采用什么默认值或占位符由主 Agent 写进契约，graph 不追加业务 prompt。
 3. `use_previous_artifact` 只有主 Agent 能根据“继续修改刚才的文件”等语义设置。执行层不会自行猜测上一轮文件。
-4. `finalize(FinalizeContext) -> str` 把内部执行报告改写成用户回复。finalize 失败时使用确定性完成文案，不重新执行已经产生的副作用。
-5. 主 Agent 只收到 artifact 文件名等元数据，不获得任意文件系统工具。
-6. `judge_confirmation(ConfirmationContext) -> ConfirmationVerdict` 对灰区确认回复输出 confirm/revise/cancel 三分类；只在四层确定性预判都不命中时被调用。不变式：该路径上任何异常/非法输出只允许落向 revise（多澄清一轮），绝不落向 confirm（误执行）。
+4. `TaskContract.difficulty`（simple/standard/complex，缺失/非法收敛为 standard）由主 Agent 判定；graph 原样透传给 `ExecutionAgent.run(difficulty=...)`，Claude 后端据此映射执行模型（haiku/sonnet/opus），`EXECUTION_AGENT_MODEL` 环境变量可锁死单模型。判难度归模型、映射归代码。
+5. `finalize(FinalizeContext) -> str` 把内部执行报告改写成用户回复。finalize 失败时使用确定性完成文案，不重新执行已经产生的副作用。
+6. 主 Agent 只收到 artifact 文件名等元数据，不获得任意文件系统工具。
+7. `judge_confirmation(ConfirmationContext) -> ConfirmationVerdict` 对灰区确认回复输出 confirm/revise/cancel 三分类；只在四层确定性预判都不命中时被调用。不变式：该路径上任何异常/非法输出只允许落向 revise（多澄清一轮），绝不落向 confirm（误执行）。
 
 ### 长期记忆治理
 

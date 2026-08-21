@@ -41,6 +41,7 @@ def task_decision(
     missing_info=(),
     memory_operations=(),
     use_previous_artifact=False,
+    difficulty="standard",
 ):
     return MainAgentDecision(
         intent="document_task",
@@ -50,6 +51,7 @@ def task_decision(
             instruction,
             tuple(missing_info),
             use_previous_artifact=use_previous_artifact,
+            difficulty=difficulty,
         ),
         memory_operations=tuple(memory_operations),
     )
@@ -154,13 +156,16 @@ class FakeExecutionAgent(ExecutionAgent):
         self.artifact_names = artifact_names
         self.error = error
 
-    async def run(self, instruction, input_paths, input_filenames, workdir):
+    async def run(
+        self, instruction, input_paths, input_filenames, workdir, difficulty="standard"
+    ):
         self.calls.append(
             {
                 "instruction": instruction,
                 "input_paths": input_paths,
                 "input_filenames": input_filenames,
                 "workdir": workdir,
+                "difficulty": difficulty,
             }
         )
         if self.error:
@@ -266,6 +271,7 @@ async def test_task_reaches_confirm_then_execution_and_main_agent_finalizes(
             "instruction": "写一份测试文档",
             "missing_info": [],
             "use_previous_artifact": False,
+            "difficulty": "standard",
         },
     }
 
@@ -275,6 +281,25 @@ async def test_task_reaches_confirm_then_execution_and_main_agent_finalizes(
     assert state["pending_instruction"] is None
     assert execution_agent.calls[0]["instruction"] == "写一份测试文档"
     assert main_agent.finalize_calls[0].report.summary == "测试文档已生成"
+
+
+async def test_task_difficulty_reaches_the_execution_agent(
+    tmp_path, execution_agent
+):
+    main_agent = FakeMainAgent([task_decision(difficulty="complex")])
+    graph, _ = make_graph(tmp_path, main_agent, execution_agent)
+
+    await graph.ainvoke(
+        {
+            "platform": "test",
+            "user_id": "u1",
+            "new_text": "汇总三份表",
+            "new_file": None,
+        },
+        config=config(),
+    )
+    await graph.ainvoke(Command(resume="是"), config=config())
+    assert execution_agent.calls[0]["difficulty"] == "complex"
 
 
 async def test_direct_reply_never_calls_execution_agent(tmp_path, execution_agent):

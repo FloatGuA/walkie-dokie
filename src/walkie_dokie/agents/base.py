@@ -62,6 +62,7 @@ class ExecutionAgent(ABC):
         input_paths: tuple[Path, ...],
         input_filenames: tuple[str, ...],
         workdir: Path,
+        difficulty: str = "standard",
     ) -> ExecutionReport: ...
 
 

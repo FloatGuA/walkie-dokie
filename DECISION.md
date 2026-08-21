@@ -433,3 +433,12 @@
   - graph checkpoint（`checkpoints-v2.db`）提交后、`outbox.enqueue`（`outbox.db`）提交前崩溃：图副作用与会话状态已持久但出站清单没入队，重启没有任何机制重放，结果永久不送达且没有 turn log。这是决策 ② 独立双库的必然代价（两个库无法进同一事务），窗口毫秒级，接受。
   - `record_event` 先记后处理：记完就崩 = 这条事件永久丢弃。防重复处理优先于防极小概率丢弃，是 spec 原文语义，此处只是把结论回填。
 - **什么情况下应该重新考虑**：多进程/多实例部署时 worker 需分布式化（单行取件的 SQL 需加锁语义）；若真实使用出现重复消息投诉，评估飞书是否提供幂等凭证；admin 投递状态 UI 按 badcase 需求接入。
+
+## 执行 Agent 按任务难度路由模型（MainAgent 判难度，代码映射模型）
+
+- **日期 / 版本**：2026-08-21
+- **背景**：执行后端此前不指定模型（随 CLI 默认漂移）。用户先拍板固定 sonnet + `EXECUTION_AGENT_MODEL` 可配，随即提出希望按任务难度把简单任务发给更便宜的模型。
+- **选了什么**（三点均用户拍板）：① 难度由 MainAgent 在现有 propose 调用里顺手判（结构化输出新增 `task.difficulty`，零额外模型调用）；② 三档 simple→haiku、standard→sonnet、complex→opus，映射表在 `ClaudeAgentSDKBackend` 内部，图和状态只传难度字符串；③ 低档执行失败**不自动升档重试**，走既有失败报告路径，用户重发时 MainAgent 从上下文自然判高档。`EXECUTION_AGENT_MODEL` 语义改为锁死开关：设了旁路路由。字段缺失/非法两道兜底均为 standard/sonnet（外部 API 输出边界）。
+- **否掉了什么，为什么**：确定性规则判难度（"改几个错别字"字面短但可能很难，规则会越补越多，与 "models judge, code decides" 相反——判断该归模型）；两档 sonnet/opus（用户要 haiku 档省额度，接受三分类误判面更大）；自动升档重试（需要新 execution_id、双倍耗时、半成品清理，execution marker 机制当初就是为防重跑设计的）；先不做路由等 badcase（用户直接要）。
+- **代价 / 已知不足**：haiku 写 python-docx/openpyxl 的翻车率**未实测**，等 `--real-execution` 冒烟验证；三分类误判把 complex 判成 simple 时用户拿到差结果需重发；Codex 后端接受 difficulty 但不消费（明确注释非疏漏）。
+- **什么情况下应该重新考虑**：真实使用中 haiku 档 badcase 集中出现→把 simple 也并到 sonnet（改映射表一行）；若"用户重发"这条隐式升档路径实测走不通（MainAgent 不看失败上下文提档）→再议显式升档。
