@@ -1336,6 +1336,96 @@ async def test_confirm_resume_output_is_enqueued_and_wakes_worker(
     assert wakeup.is_set()
 
 
+# --- inbox 去重 --------------------------------------------------------------
+# 飞书会重投同一条事件（回调超时、网络抖动）。去重必须在 handle_event 的最前面
+# 生效——排在防抖之后就等于"重复消息也进了同一个窗口"，攒批会把它当成用户又说
+# 了一遍。
+
+
+class _CountingGraph:
+    """会话空闲的 fake graph，只数 aget_state 被调了几次。
+
+    去重生效时第二次 handle_event 连图都碰不到，所以这个计数就是"处理了几次"。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    async def aget_state(self, config):
+        self.calls += 1
+        return SimpleNamespace(next=(), interrupts=(), values={})
+
+
+class _RecordingDebouncer:
+    def __init__(self):
+        self.added = []
+
+    def add(self, platform_name, user_id, text, file):
+        self.added.append((platform_name, user_id, text, file))
+
+
+async def test_duplicate_event_id_is_dropped_before_the_debouncer(outbox):
+    graph = _CountingGraph()
+    debouncer = _RecordingDebouncer()
+    event = InboundEvent("test", "u1", "帮我写份请假条", None, event_id="evt-dup")
+
+    for _ in range(2):
+        await handle_event(
+            graph,
+            FakePlatform(),
+            debouncer,
+            UserLocks(),
+            object(),  # memory_repository is unreachable outside /long-term-memory
+            event,
+            outbox=outbox,
+        )
+
+    assert graph.calls == 1
+    assert debouncer.added == [("test", "u1", "帮我写份请假条", None)]
+    assert outbox.seen_event("evt-dup") is True
+
+
+async def test_events_without_event_id_are_never_deduped(outbox):
+    """平台没给事件 id 时不猜、不去重：宁可重复处理，不可静默吞掉真实的两条消息。"""
+
+    graph = _CountingGraph()
+    debouncer = _RecordingDebouncer()
+
+    for _ in range(2):
+        await handle_event(
+            graph,
+            FakePlatform(),
+            debouncer,
+            UserLocks(),
+            object(),
+            InboundEvent("test", "u1", "在吗", None),
+            outbox=outbox,
+        )
+
+    assert graph.calls == 2
+    assert len(debouncer.added) == 2
+
+
+async def test_seen_event_is_recorded_before_processing(outbox):
+    """先记后处理：图里抛异常也不能让这条事件重新变成"没见过"。"""
+
+    class ExplodingGraph:
+        async def aget_state(self, config):
+            raise RuntimeError("checkpoint 挂了")
+
+    await handle_event(
+        ExplodingGraph(),
+        FakePlatform(),
+        _RecordingDebouncer(),
+        UserLocks(),
+        object(),
+        InboundEvent("test", "u1", "在吗", None, event_id="evt-boom"),
+        outbox=outbox,
+    )
+
+    assert outbox.seen_event("evt-boom") is True
+
+
 # --- 投递 worker -------------------------------------------------------------
 # 时间一律用固定时钟往前推（``now=`` 注入），不 monkeypatch time：退避表是
 # 30s/2m/10m，真等一遍要 11 分钟，假时钟让"到期没到期"变成纯断言。约定同

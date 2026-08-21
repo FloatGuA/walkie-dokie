@@ -23,6 +23,9 @@ class InboundEvent:
     # Group chat and private chat must not share query context or reply routing.
     conversation_id: str | None = None
     conversation_type: Literal["private", "group"] | None = None
+    # 平台侧的事件唯一 id，用于挡住重复推送（飞书回调超时会重投同一条事件）。
+    # 平台没给就是 None——不拿 message_id 之类的东西冒充，宁可重复处理一次。
+    event_id: str | None = None
 
     @property
     def reply_target(self) -> str:

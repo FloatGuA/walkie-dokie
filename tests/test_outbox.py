@@ -248,6 +248,27 @@ def test_inbox_seen_roundtrip_and_ttl(outbox):
     assert outbox.seen_event("evt-1") is False
 
 
+def test_record_event_twice_is_a_silent_noop(outbox, db_path):
+    """同一 event_id 重复落记不能抛：两个并发事件同时到达时都会走到 record。
+
+    第二次是静默 no-op，且不刷新 seen_at——否则平台每重投一次就把 TTL 往后推，
+    去重记录永远过不了期。
+    """
+
+    outbox.record_event("evt-1", now=T0)
+    outbox.record_event("evt-1", now=T0 + timedelta(days=3))
+
+    assert outbox.seen_event("evt-1") is True
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, seen_at FROM inbox_seen"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [("evt-1", T0.isoformat())]
+
+
 def test_enqueue_is_transactional(outbox, db_path):
     with pytest.raises(ValueError) as excinfo:
         outbox.enqueue(

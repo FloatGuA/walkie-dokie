@@ -51,8 +51,11 @@ class FeishuAdapter(PlatformAdapter):
             logger.info("收到不支持的消息类型 message_type=%s，忽略", message.message_type)
 
         user_id = data.event.sender.sender_id.open_id
+        # p2 事件的去重键在 header 上；p1 格式没有 header，那就是 None（不猜）。
+        event_id = data.header.event_id if data.header is not None else None
         logger.info(
-            "收到飞书消息 message_id=%s user_id=%s message_type=%s text=%r file=%r",
+            "收到飞书消息 event_id=%s message_id=%s user_id=%s message_type=%s text=%r file=%r",
+            event_id,
             message.message_id,
             user_id,
             message.message_type,
@@ -69,6 +72,7 @@ class FeishuAdapter(PlatformAdapter):
             conversation_type=(
                 "group" if getattr(message, "chat_type", None) == "group" else "private"
             ),
+            event_id=event_id,
         )
         assert self._loop is not None, "FeishuAdapter.start() 还没调用就收到消息了"
         self._loop.call_soon_threadsafe(self._queue.put_nowait, inbound)

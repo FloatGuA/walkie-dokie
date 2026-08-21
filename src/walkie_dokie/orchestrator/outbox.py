@@ -241,9 +241,16 @@ class Outbox:
         return row is not None
 
     def record_event(self, event_id: str, *, now: datetime) -> None:
+        """记下这条事件已经见过。重复落记是静默 no-op。
+
+        OR IGNORE 不是防御性兜底：两条重复推送并发到达时都会先 seen_event 得到
+        False 再各自 record，普通 INSERT 在这里必然撞 PRIMARY KEY。忽略而不是
+        覆盖，是因为 seen_at 撑着 7 天 TTL——每重投一次就刷新时间戳的话，去重记录
+        会被平台的重试永远续命。
+        """
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO inbox_seen (event_id, seen_at) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO inbox_seen (event_id, seen_at) VALUES (?, ?)",
                 (event_id, now.isoformat()),
             )
 

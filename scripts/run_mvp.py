@@ -486,7 +486,22 @@ async def handle_event(
 
     ``platform`` 参数保留但本函数不再使用，理由同 ``dispatch_fresh``：所有出站
     消息一律先入 outbox，发送由投递 worker 独占。
+
+    去重排在所有分支之前——包括判空和防抖。排在防抖之后等于让重投的事件进同一个
+    攒批窗口，图会把它当成用户又说了一遍。先记后处理：落记成功才往下走，后面
+    任何失败都不把这条事件退回"没见过"，重投的意义只是补送、不是重跑。
     """
+
+    if event.event_id is not None:
+        if outbox.seen_event(event.event_id):
+            logger.debug(
+                "重复事件已丢弃 event_id=%s platform=%s user_id=%s",
+                event.event_id,
+                event.platform,
+                event.user_id,
+            )
+            return
+        outbox.record_event(event.event_id, now=datetime.now())
 
     if not event.text and event.file is None:
         return
