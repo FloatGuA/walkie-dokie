@@ -1624,3 +1624,164 @@ async def test_file_payload_resolves_reference(monkeypatch, tmp_path, outbox, db
     assert message.file.content == b"\x50\x4b\x03\x04"
     assert message.file.mime_type == reference["mime_type"]
     assert _outbox_rows(db_path)[0]["status"] == "delivered"
+
+
+# --- 端到端演练 --------------------------------------------------------------
+# 上面的测试各自钉一个语义；这两条把它们串成一次真实回合的完整轨迹：一个回合的
+# 三条输出入队 -> worker 按序寄出 -> 进程崩在 sending 上 -> 启动复位 -> 恰好补寄
+# 那一条。用真 Outbox（tmp db）+ fake graph/platform，不 mock 中间任何一层。
+
+
+def _sent_summary(platform):
+    """把 fake 平台收到的出站消息压成可读断言：文件看文件名，文字看正文。"""
+
+    return [
+        message.file.filename if message.file is not None else message.text
+        for _user_id, message in platform.sent
+    ]
+
+
+async def test_end_to_end_drill_delivers_in_order_and_recovers_from_crash(
+    monkeypatch, tmp_path, outbox, db_path
+):
+    """一个回合两文件一文字：入队即回合结束，投递按 seq 走，崩溃后只补寄那一条。"""
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+
+    report = _workspace_reference(monkeypatch, tmp_path, "报告.docx", b"docx-bytes")
+    sheet = _workspace_reference(monkeypatch, tmp_path, "数据.xlsx", b"xlsx-bytes")
+    platform = DeliveryPlatform()
+    wakeup = asyncio.Event()
+
+    await dispatch_fresh(
+        _StateGraph(
+            {
+                "result": {
+                    "artifacts": [report, sheet],
+                    "reply_text": "都改好了",
+                    "success": True,
+                }
+            }
+        ),
+        platform,
+        "test",
+        "u1",
+        "帮我把这两份都改一下",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
+        wakeup=wakeup,
+    )
+
+    # 回合终点=入队：这一刻平台一条都没收到，用户的等待里没有任何网络往返。
+    assert platform.sent == []
+    assert wakeup.is_set()
+    rows = _outbox_rows(db_path)
+    assert [(row["seq"], row["kind"], row["status"]) for row in rows] == [
+        (0, "file", "pending"),
+        (1, "file", "pending"),
+        (2, "text", "pending"),
+    ]
+    assert {row["trace_id"] for row in rows} == {"t1"}
+
+    # 入队走的是真实时钟（dispatch_fresh 内部 datetime.now()），所以投递侧的假
+    # 时钟得从"现在"起步——用固定的 T0 会让三条都还没到期。
+    clock = datetime.now()
+    for _round in range(3):
+        # 每轮只取队头一条：文件没寄出去之前，"都改好了"绝不会先到。
+        assert await deliver_due_once(outbox, platform, now=clock) == 1
+    assert await deliver_due_once(outbox, platform, now=clock) == 0
+
+    assert _sent_summary(platform) == ["报告.docx", "数据.xlsx", "都改好了"]
+    assert platform.sent[0][1].file.content == b"docx-bytes"
+    assert platform.sent[1][1].file.content == b"xlsx-bytes"
+    assert [row["status"] for row in _outbox_rows(db_path)] == ["delivered"] * 3
+
+    # 崩溃模拟：worker 标了 sending 之后进程死掉，平台到底收没收到无人知道。
+    text_row_id = _outbox_rows(db_path)[2]["id"]
+    outbox.mark_sending(text_row_id)
+
+    assert outbox.reset_sending() == 1
+    assert await deliver_due_once(outbox, platform, now=clock) == 1
+    assert await deliver_due_once(outbox, platform, now=clock) == 0
+
+    # at-least-once：恰好补寄卡住的那一条，已 delivered 的两个文件不重发。
+    assert _sent_summary(platform) == [
+        "报告.docx",
+        "数据.xlsx",
+        "都改好了",
+        "都改好了",
+    ]
+    rows = _outbox_rows(db_path)
+    assert [row["status"] for row in rows] == ["delivered"] * 3
+    # 崩溃不是平台的错，复位不消耗这条消息的重试预算。
+    assert [row["attempts"] for row in rows] == [0, 0, 0]
+    assert records[0].success is True
+
+
+async def test_end_to_end_drill_turn_log_success_survives_total_delivery_failure(
+    monkeypatch, tmp_path, outbox, db_path
+):
+    """平台全程 500：三条最终全进死信，但这一轮的 turn log 仍然是 success=True。
+
+    turn log 记的是"图产出成功且已入队"，投递成败在另一条时间线上——两者解耦
+    正是把发送搬去 worker 的目的。翻历史统计时这条语义边界要记住。
+    """
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+
+    report = _workspace_reference(monkeypatch, tmp_path, "报告.docx", b"docx-bytes")
+    sheet = _workspace_reference(monkeypatch, tmp_path, "数据.xlsx", b"xlsx-bytes")
+    platform = DeliveryPlatform(error="平台 500")
+
+    await dispatch_fresh(
+        _StateGraph(
+            {
+                "result": {
+                    "artifacts": [report, sheet],
+                    "reply_text": "都改好了",
+                    "success": True,
+                }
+            }
+        ),
+        platform,
+        "test",
+        "u1",
+        "帮我把这两份都改一下",
+        (),
+        UserLocks(),
+        trace_id="t1",
+        outbox=outbox,
+    )
+
+    clock = datetime.now()
+    # 3 条 × 4 次尝试。步长 20 分钟远大于最长的 10 分钟退避档，所以每一轮队头
+    # 必定到期，12 轮刚好把整个队列走干净。
+    for step in range(12):
+        assert (
+            await deliver_due_once(
+                outbox, platform, now=clock + timedelta(minutes=20 * step)
+            )
+            == 1
+        )
+
+    assert platform.sent == []
+    rows = _outbox_rows(db_path)
+    assert [row["status"] for row in rows] == ["dead"] * 3
+    assert [row["attempts"] for row in rows] == [4, 4, 4]
+    assert [item["id"] for item in outbox.dead_letters("test:u1")] == [
+        row["id"] for row in rows
+    ]
+    assert records[0].success is True
+    assert records[0].error is None
