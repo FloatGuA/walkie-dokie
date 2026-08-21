@@ -23,7 +23,7 @@
 | 能力 | 现状 | 优先级 | 备注 |
 |------|------|--------|------|
 | 可观测性 / Trace | ✅ 已实现（2026-08-20）：`Debouncer` 窗口触发时生成 trace_id，随 `SessionState` checkpoint 落盘并贯穿 debounce→main_agent→execute→投递；confirm-race resume 沿用原 id 不重开。与 `execution_id`（幂等身份）并存不合并 | 已闭环 | debounce+graph 并发场景测试已于 2026-08-20 补齐（见第一张表 debounce 行） |
-| 幂等与失败语义 | started marker 已挡住部分场景，未区分可重试 vs 永久失败，无 backoff/熔断 | 高（已在 PROGRESS.md P0） | 外部调用（DeepSeek/Claude/Codex/飞书）都需要 |
+| 幂等与失败语义 | 外部投递侧已闭环（2026-08-21）：持久 outbox + 30s/2m/10m 退避 + 第 4 次失败转死信 + 启动 `reset_sending` 的 at-least-once 重寄 + 入站 `event_id` 去重。DeepSeek/执行侧仍是老样子：started marker 只挡住部分场景，未区分可重试 vs 永久失败，无 backoff/熔断 | 投递侧已闭环；DeepSeek/执行侧重试语义仍待办（高） | 飞书方向已收口；剩下的是模型调用与 ExecutionAgent 边界 |
 | Evaluation harness（golden set 回归） | ✅ 已实现（2026-08-20）：四类 20 样本端到端回归（真实 DeepSeek + fake 执行）+ Opus judge 话术评分（只报告）+ judge 校准集（一致率 100%），报告存 `var/evals/`，手动 `python3 -m scripts.run_golden_eval` | 已闭环（样本随 badcase 增长） | 22 样本；`--real-execution` 冒烟 2026-08-21 完成（真实 Claude 执行 2 样本 PASSED；DeepSeek 瞬时超时触发 FAILED_INFRA 属防线正常工作） |
 | Guardrails | ✅ 泄漏防护三层已实现（2026-08-21）：prompt 不复述条款 + 出口确定性 guard（零触发安全网）+ eval 双样本盯防；验收 23/23，inject-002 clarity 1→4。**刻意不建输入检测器**（DECISION.md 2026-08-21：出口拦截是完备闭环，输入检测成本每消息级收益被攻击时级） | 输出侧闭环；输入观测层（只打标不阻断）为对外开放前置项 | 攻击尝试目前不可观测，对外开放时补 |
 | 成本与延迟预算 | ✅ 记账已实现（2026-08-21）：model_calls.jsonl 全模型调用结构化记账（含用户归属）+ report_costs.py 汇总/HTML 报表；金额按官方价保守上界估算 | 记账闭环；enforcement（限流/配额/告警）挂对外开放前置项 | deepseek-chat 别名映射未获官方确认；summarizer is_error 分支不记账 |
@@ -44,3 +44,4 @@
 - 2026-08-21：Guardrails 泄漏防护三层上线并验收（23/23，prompt 加固单独生效、出口 guard 零触发待命）；拍板不建输入检测器，输入观测层挂为对外开放前置项。
 - 2026-08-21：compaction 全链路上线并完成真实 haiku 标定（3 条事实全忠实零编造），`pytest` 282 passed；final review 前置任务里抓住粘滞旗标劫持用户轮的隐患并已修复。
 - 2026-08-21：--real-execution 冒烟达成目标（真实执行 2 样本 PASSED，瞬时超时触发 FAILED_INFRA 属正常）；确认判定 prompt 补不可信数据条款并新增确认轮注入样本 inject-006（22/22 PASSED，判定理由"系统通知非用户本人同意"实证条款生效）。
+- 2026-08-21：持久 outbox/inbox 上线（保序投递、退避死信、at-least-once 重寄、入站 event_id 去重），`pytest` 448 passed（414 → 448）；"幂等与失败语义"一行据此改写——外部投递侧闭环，DeepSeek/执行侧重试语义仍待办。turn log 的 `success` 同步收窄为"图产出成功且已入队"。离线端到端演练已覆盖崩溃复位与死信路径，真实飞书投递/重投冒烟尚未做。

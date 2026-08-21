@@ -35,8 +35,11 @@ InboundEvent
                    判定异常在节点内降级为 revise，绝不降级为 confirm
   → ExecutionReport
   → main_agent.finalize
-  → 文件、文字投递
-  → 投递后（同一 session 锁内）：被挤出窗口的历史消息攒满 6 条时，
+  → 回合终点：文件、文字按序写进持久 outbox（`var/outbox.db`），回合到此结束
+      投递 worker（进程内唯一调 `platform.send` 的地方）异步取件：
+      每 session 只取队头保序、失败退避重试、第 4 次失败转死信、
+      启动时 `reset_sending` 复位崩溃残留（at-least-once）
+  → 入队后（同一 session 锁内）：被挤出窗口的历史消息攒满 6 条时，
     专用 compact invoke → haiku 摘要 → 逐字 evidence 机械校验 →
     conversation_summary（随 checkpoint 持久，facts 注入后续 decide）
 ```
@@ -119,7 +122,8 @@ checkpoint 保存工作流短期状态，不保存或事务性覆盖：长期档
 - checkpointer 不会自动串行同一 thread 的并发 `ainvoke()`。`UserLocks` 以复合 session key 串行化当前单进程入口；多进程或多实例需要外部队列/分布式锁与版本冲突策略。
 - MainAgent API、ExecutionAgent、JSON memory、工作目录与平台发送不和 SQLite checkpoint 构成一个事务。report marker 只覆盖其中一部分 crash window。
 - 执行或主 Agent 的业务异常会被节点转换成完成态错误结果，避免下一条用户消息误触发旧节点重跑。checkpointer/进程级崩溃仍需要显式恢复策略。
-- 平台投递当前没有持久 outbox；文件成功但文字失败会形成半投递。平台事件也尚无持久 inbox/event-id 去重。这两项是对外使用前的可靠性待办。
+- 平台投递走持久 outbox（`orchestrator/outbox.py`）：回合终点只入队，发送由投递 worker 独占，语义是 at-least-once 而不是 exactly-once——进程崩在 `sending` 上时无从判断平台收没收到，启动一律复位重寄，用户可能收到重复消息。同 session 严格保序，所以不会再出现"文字先于文件到达"的半投递；彻底失败的消息进死信区等人工处理，不会静默消失。入站侧按 `InboundEvent.event_id` 去重（`inbox_seen`，7 天 TTL），平台没给事件 id 时不猜、不去重。
+- conversation turn log 的 `success` 记的是"图产出成功且已入队"，不是"平台已送达"（2026-08-21 起）。投递成败只体现在 outbox 的行状态与死信区，读成功率时不要把两者混为一谈。
 - `recent_messages` 同时按 12 条、单条 2,000 字符、总计 12,000 字符截断；它不是无限对话历史。
 
 ## 合同智能已拆分

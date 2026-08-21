@@ -52,6 +52,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 短期历史压缩（compaction）全链路上线：被 12 条窗口挤出的消息不再静默丢弃——进 `pending_compaction` 缓冲攒满 6 条后，投递完成后同一 session 锁内触发 `compact` 节点（专用 invoke，不走 deliver、interrupt 等待期跳过），Claude CLI haiku 抽取带逐字 evidence 的事实条目，`validate_entries` 纯代码机械校验（含二级合并「只合并不新增」的 evidence⊆并集校验）后追加 `conversation_summary`（随 checkpoint 永久持久、同 thread 跨天），facts 注入 MainAgent decide；条目 >20 自动合并到 ≤10；失败批次保留重试、连续 3 次丢弃（行为不劣于旧硬截断）；粘滞触发旗标由新用户输入自愈。真实 haiku 标定一次通过：3 条事实全部忠实、evidence 逐字、零拒绝零编造。2026-08-21，`pytest` 282 passed（247 → 282）。
 - `--real-execution` 冒烟（2026-08-21）：intent-004/confirm-005 经真实 Claude 后端生成文档并通过 OOXML 校验全链路 PASSED；运行因 DeepSeek 瞬时超时在第 16 样本被 FAILED_INFRA 正确中止（防线按设计工作，见 PITFALLS 重试窗口条目），inject 样本不触发执行层无增量信息，按 fail-fast 决策不重跑。
 - eval harness（golden set 回归）全量实现并完成首次真实运行：端到端 driver 复用生产 `_invoke_from_event`/`deliver_graph_output` 驱动真 graph（真实 DeepSeek + fake 执行后端 + InMemorySaver），四类 20 样本（意图路由/记忆边界/确认词/prompt injection）确定性断言阻断 + Claude Opus judge 话术评分只报告，报告存 `var/evals/`。首跑 **20/20 PASSED**（含"删掉"删除记忆、四条 injection 全拦住），judge 校准集经三轮迭代达 **100% 一致率**（迭代结论：校准样本必须带场景 context；judge 对歧义确认的标准比样本作者更严且立场与本项目适老化一致），全量话术 clarity 均值 3.45。judge 首跑即产出增量发现：inject-002 的回复把内部设定原文抛给用户——确定性黑名单（"Claude"/邮箱）没拦住，属输入侧 Guardrails 立项的第一条基线证据。顺带修了两个生产 bug：DeepSeek 调用未设 temperature（现固定 0）、`_DELETE_TERMS` 缺"删掉"。运行入口 `python3 -m scripts.run_golden_eval`（须仓库根目录，`--calibrate` 校准 judge，`--real-execution` 冒烟真实执行后端），`EVAL_REPLY_BLACKLIST` 环境变量装敏感话术黑名单不入库。2026-08-20，`pytest` 197 passed（142 → 197）。
+- 持久 outbox/inbox 上线（设计见 `docs/superpowers/specs/2026-08-21-outbox-inbox-design.md`）：回合终点从"直接 `platform.send`"改成写 `var/outbox.db`，平台发送由常驻投递 worker 独占——每 session 只取队头保序（文件还没寄出去，"都改好了"绝不会先到）、失败按 30s/2m/10m 三档退避、第 4 次失败转死信并 WARNING（死信可查 `Outbox.dead_letters`）、单条 send 30s 超时按一次失败算、同一批里一条会话失败不带走其他会话；进程启动 `reset_sending` 把卡在 sending 的行一律复位重寄（at-least-once：宁可重发一次，不可静默丢件）。入站侧 `InboundEvent.event_id` 去重排在 `handle_event` 最前面（先记后处理，且去重先于防抖，`inbox_seen` 7 天 TTL），飞书重投不再被攒批当成"用户又说了一遍"。**turn log 语义随之收窄**：`success` 从"已投递"变成"图产出成功且已入队"，不再有 delivery_error——2026-08-21 起的成功率统计跨这条边界时需要注意。端到端演练测试覆盖"入队 → 按 seq 三轮投递 → 崩在 sending → 复位 → 恰好补寄那一条"，以及"平台全程 500、三条全进死信时 turn log 仍 success=True"。TDD 全程覆盖，2026-08-21，`pytest` 448 passed（414 → 448）。
 - debounce+graph 并发场景补了两个 `asyncio.gather` 真并发回归测试（此前 7 个 debounce 测试全是顺序模拟）：同一 session 两条 `handle_event` 同时到达、以及 `dispatch_fresh` 与 `handle_event` confirm-resume 竞态（即 commit `1201650` 修过的那类 bug 的场景），均确认共享 `UserLocks` 实例下 `graph.aget_state`/`ainvoke` 严格序列化不交错；每个测试都先用"两把独立锁"版本验证过自身能检测到交错（RED）再切回生产接线（GREEN）。无生产代码改动。2026-08-20，`pytest` 142 passed。
 
 ## 尚未验证
@@ -62,12 +63,13 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - 确认判定四层结构的灰区判定只在离线 fake 与 21 样本 golden 回归上验证过；真实多用户长期使用中模型对灰区词的判定分布（尤其"好的/行"类）尚无数据，样本按 badcase 驱动继续回填。
 - Claude 后端的正常 docx 生成已由 2026-08-21 `--real-execution` 冒烟覆盖（2 样本全链路 PASSED）；超时、取消后的子进程/远端状态清理仍未专项冒烟。
 - Codex 最小权限 profile 已做本地命令隔离测试，但独立 `var/codex_home` 尚未登录，真实模型文档任务仍未冒烟。
-- 飞书重投、发送半成功、进程在 checkpoint/投递边界崩溃尚无端到端故障注入测试。
+- 持久 outbox/inbox 只做过离线验证：保序、退避、死信、崩溃复位、event_id 去重都由 fake 平台 + 临时 sqlite 的端到端演练覆盖，真实飞书的投递/重投冒烟（含发送半成功、进程在 checkpoint/投递边界崩溃的实况）仍待用户配合场次。
 
 ## 当前数据流
 
 ```text
 飞书消息 → FeishuAdapter → InboundEvent
+  → event_id 去重（inbox_seen，先记后处理；排在防抖之前）
   → 非确认消息：Debouncer(platform,user_id) 10 秒聚合
   → 附件写 ArtifactStore，bytes 到此为止；图只收到 reference
   → UserLocks[platform:user_id]
@@ -92,7 +94,8 @@ PlatformAdapter → Session coordination → LangGraph control plane
       → ExecutionReport(summary/artifact/warnings)
       → MainAgent.finalize
       → graph result 只存 artifact reference
-      → runner 先发文件、再发文字
+      → 回合终点：整轮输出按序写进 outbox（文件在前、文字在后），回合到此结束
+      → 投递 worker 独占 platform.send：每 session 取队头、退避重试、转死信
 ```
 
 ## 下一步（按优先级）
@@ -100,9 +103,8 @@ PlatformAdapter → Session coordination → LangGraph control plane
 ### P0：真实冒烟与对外使用前可靠性
 
 1. 在正常 OS 上跑真实 v2 闭环，并验证 SQLite 进程重启后的 ask-confirm 恢复。当前 sandbox 不能完成这项证明。
-2. 增加持久 inbox/outbox：`InboundEvent.event_id` 去重；文件与文字分别记录 delivery ack/retry。现在图成功后平台发送失败会丢结果，文件成功而文字失败会半投递。
-3. 将 execution idempotency 扩展到 backend 边界。started marker 会在结果未知时拒绝自动重跑，但无法判断 coding agent 是否已经完成，只能转人工恢复；这仍不是 exactly-once。
-4. 公开给开发者本人以外的人之前，将当前订阅登录改为合规服务鉴权，并把已启用的进程级 OS sandbox 再放进专用服务账号 + container/cgroup，补齐 CPU、内存、进程数和磁盘配额。
+2. 将 execution idempotency 扩展到 backend 边界。started marker 会在结果未知时拒绝自动重跑，但无法判断 coding agent 是否已经完成，只能转人工恢复；这仍不是 exactly-once。
+3. 公开给开发者本人以外的人之前，将当前订阅登录改为合规服务鉴权，并把已启用的进程级 OS sandbox 再放进专用服务账号 + container/cgroup，补齐 CPU、内存、进程数和磁盘配额。
 
 ### P1：状态和部署边界
 
