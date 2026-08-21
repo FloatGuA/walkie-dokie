@@ -598,3 +598,59 @@ def test_read_eval_report_missing_file(tmp_path):
     evals_dir.mkdir()
     with pytest.raises(FileNotFoundError):
         read_eval_report(evals_dir, "20260820T111441Z.json")
+
+
+def test_read_outbox_missing_db_is_empty_state(tmp_path):
+    from walkie_dokie.admin.data import read_outbox
+
+    result = read_outbox(tmp_path / "outbox.db")
+    assert result == {
+        "counts": {"pending": 0, "sending": 0, "delivered": 0, "dead": 0},
+        "queue": [],
+        "dead": [],
+        "error": None,
+    }
+
+
+def test_read_outbox_counts_queue_and_dead_letters(tmp_path):
+    from walkie_dokie.admin.data import read_outbox
+    from walkie_dokie.orchestrator.outbox import Outbox
+
+    db = tmp_path / "outbox.db"
+    outbox = Outbox(db)
+    t0 = datetime(2026, 8, 22, 10, 0, 0)
+    outbox.enqueue("feishu:u1", "t-1", [("text", {"text": "还在排队"})], now=t0)
+    outbox.enqueue("feishu:u2", "t-2", [("text", {"text": "会死信"})], now=t0)
+
+    # 用远超退避窗口的时间推进，把 u2 的消息打满 4 次失败进死信。
+    for hour in range(4):
+        now = datetime(2026, 8, 22, 12 + hour * 3, 0, 0)
+        rows = [
+            row
+            for row in outbox.due_batch(now)
+            if row["session_key"] == "feishu:u2"
+        ]
+        assert rows, f"第 {hour + 1} 次失败前 u2 的消息应当 due"
+        outbox.mark_sending(rows[0]["id"])
+        outbox.mark_failed(rows[0]["id"], "boom", now=now)
+
+    result = read_outbox(db)
+    assert result["error"] is None
+    assert result["counts"] == {
+        "pending": 1,
+        "sending": 0,
+        "delivered": 0,
+        "dead": 1,
+    }
+    assert len(result["queue"]) == 1
+    queued = result["queue"][0]
+    assert queued["session_key"] == "feishu:u1"
+    assert queued["status"] == "pending"
+    assert queued["kind"] == "text"
+    dead = result["dead"][0]
+    assert dead["session_key"] == "feishu:u2"
+    assert dead["trace_id"] == "t-2"
+    assert dead["attempts"] == 4
+    assert dead["last_error"] == "boom"
+    # 死信要能人工补寄，payload 必须完整可见。
+    assert dead["payload"] == {"text": "会死信"}

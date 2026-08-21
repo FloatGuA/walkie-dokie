@@ -218,6 +218,7 @@
     <p id="sessions-skipped" class="side-note" hidden></p>
     <nav class="global-nav">
       <button type="button" class="nav-item" data-view="costs">▤　总成本</button>
+      <button type="button" class="nav-item" data-view="outbox">▥　投递</button>
       <button type="button" class="nav-item" data-view="evals">◫　Eval</button>
     </nav>
     <div class="side-foot mono">只读 · 本机 · <span id="refreshed">--:--:--</span></div>
@@ -243,6 +244,16 @@
       <h2>按日 tokens（按 purpose 堆叠）</h2>
       <div id="costs-legend" class="legend"></div>
       <div id="costs-chart" class="chart"></div>
+    </section>
+
+    <section id="view-outbox" class="view" data-view="outbox" hidden>
+      <h1 class="title">投递</h1>
+      <p id="outbox-error" class="note" hidden></p>
+      <div id="outbox-stats" class="stats"></div>
+      <h2>未终态队列（pending / sending）</h2>
+      <div id="outbox-queue"></div>
+      <h2>死信（需人工补寄，倒序）</h2>
+      <div id="outbox-dead"></div>
     </section>
 
     <section id="view-evals" class="view" data-view="evals" hidden>
@@ -1110,10 +1121,57 @@
     renderEvalDetail();
   }
 
+  /** 死信/队列行的内容预览：text 给正文截断，file 给文件名——补寄前先看清是什么。 */
+  function payloadPreview(kind, payload) {
+    if (!payload) { return ''; }
+    if (kind === 'file') { return payload.filename || '(文件)'; }
+    var text = payload.text || '';
+    return text.length > 80 ? text.slice(0, 80) + '…' : text;
+  }
+
+  function renderOutbox(data) {
+    setNote('outbox-error', data.error ? '读取 outbox 失败：' + data.error : '');
+
+    var counts = data.counts || {};
+    var stats = document.getElementById('outbox-stats');
+    clear(stats);
+    stats.appendChild(statTile('排队中', fmtInt((counts.pending || 0) + (counts.sending || 0))));
+    stats.appendChild(statTile('已送达', fmtInt(counts.delivered)));
+    stats.appendChild(statTile('死信', fmtInt(counts.dead), (counts.dead || 0) > 0));
+
+    var queueHost = document.getElementById('outbox-queue');
+    clear(queueHost);
+    if (!(data.queue || []).length) { queueHost.appendChild(emptyNote()); }
+    else {
+      queueHost.appendChild(buildTable(
+        ['id', 'session', 'trace', '类型', '状态', '重试', '下次尝试', '最近错误'],
+        data.queue.map(function (row) {
+          return [row.id, row.session_key, row.trace_id, row.kind, row.status,
+                  row.attempts, row.next_attempt_at, row.last_error];
+        })
+      ));
+    }
+
+    var deadHost = document.getElementById('outbox-dead');
+    clear(deadHost);
+    if (!(data.dead || []).length) { deadHost.appendChild(emptyNote()); }
+    else {
+      deadHost.appendChild(buildTable(
+        ['id', 'session', 'trace', '类型', '内容', '败于', '最后错误', '入队时间'],
+        data.dead.map(function (row) {
+          return [row.id, row.session_key, row.trace_id, row.kind,
+                  payloadPreview(row.kind, row.payload),
+                  row.attempts + ' 次', row.last_error, row.created_at];
+        })
+      ));
+    }
+  }
+
   // ------------------------------------------------------------ 轮询与切页
 
   var VIEW_LOADERS = {
     session: loadSession,
+    outbox: function () { return api('/api/outbox').then(renderOutbox); },
     costs: function () { return api('/api/costs?days=7').then(renderCosts); },
     evals: function () {
       return api('/api/evals').then(renderEvals).then(loadOpenedReport);

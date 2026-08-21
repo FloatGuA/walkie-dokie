@@ -408,3 +408,13 @@ def test_app_exposes_no_write_routes():
     for route in app_module.create_app().routes:
         methods |= set(getattr(route, "methods", None) or set())
     assert methods <= {"GET", "HEAD"}
+
+
+def test_outbox_endpoint_returns_empty_state(client, paths, monkeypatch):
+    monkeypatch.setattr(app_module, "OUTBOX_DB", paths.checkpoint.parent / "outbox.db")
+    response = client.get("/api/outbox")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["counts"] == {"pending": 0, "sending": 0, "delivered": 0, "dead": 0}
+    assert body["queue"] == []
+    assert body["dead"] == []

@@ -393,3 +393,76 @@ def read_eval_report(evals_dir: Path, name: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"eval 报告不存在: {name}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_outbox(outbox_db: Path) -> dict:
+    """投递账本的只读视图：状态计数、未终态队列、死信明细。
+
+    outbox.db 是本项目自己的 sqlite3 库（无 ORM、无 lazy-DDL），只读连接安全。
+    死信行带完整 payload——死信半投递靠人工补寄，看不到内容就补不了。
+    """
+    empty = {
+        "counts": {"pending": 0, "sending": 0, "delivered": 0, "dead": 0},
+        "queue": [],
+        "dead": [],
+        "error": None,
+    }
+    if not outbox_db.exists():
+        return empty
+    try:
+        connection = sqlite3.connect(f"file:{outbox_db}?mode=ro", uri=True)
+        try:
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbox'"
+            ).fetchone()
+            if not table_exists:
+                return empty
+            connection.row_factory = sqlite3.Row
+
+            counts = dict(empty["counts"])
+            for status, count in connection.execute(
+                "SELECT status, COUNT(*) FROM outbox GROUP BY status"
+            ):
+                if status in counts:
+                    counts[status] = count
+
+            queue = [
+                {
+                    "id": row["id"],
+                    "session_key": row["session_key"],
+                    "trace_id": row["trace_id"],
+                    "kind": row["kind"],
+                    "status": row["status"],
+                    "attempts": row["attempts"],
+                    "next_attempt_at": row["next_attempt_at"],
+                    "created_at": row["created_at"],
+                    "last_error": row["last_error"],
+                }
+                for row in connection.execute(
+                    "SELECT * FROM outbox WHERE status IN ('pending', 'sending')"
+                    " ORDER BY id"
+                )
+            ]
+            dead = [
+                {
+                    "id": row["id"],
+                    "session_key": row["session_key"],
+                    "trace_id": row["trace_id"],
+                    "kind": row["kind"],
+                    "attempts": row["attempts"],
+                    "created_at": row["created_at"],
+                    "last_error": row["last_error"],
+                    "payload": json.loads(row["payload"]),
+                }
+                for row in connection.execute(
+                    "SELECT * FROM outbox WHERE status = 'dead' ORDER BY id DESC"
+                )
+            ]
+        finally:
+            connection.close()
+    # 与 checkpoint 读取同款的刻意宽 except：库正被 bot 进程并发写，读到锁、
+    # 半个事务都不该让看板 500。
+    except Exception as exc:
+        logger.exception("读取 outbox 失败 path=%s", outbox_db)
+        return {**empty, "error": str(exc)}
+    return {"counts": counts, "queue": queue, "dead": dead, "error": None}

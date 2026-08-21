@@ -90,7 +90,7 @@ python3 -m scripts.report_costs --days 30 --html var/logs/costs.html  # 单文�
 
 ## Admin 观测台（只读）
 
-本机 web 控制台，收拢四块观测仪器：对话回合流、成本仪表、记忆与对话摘要、eval 报告趋势。只绑 127.0.0.1、无鉴权、纯只读（无任何写端点；注意记忆板块会展示用户档案与逐字 evidence，勿将端口暴露到本机之外）：
+本机 web 控制台，收拢五块观测仪器：对话回合流、成本仪表、记忆与对话摘要、eval 报告趋势、投递账本（outbox 队列与死信，死信人工补寄的入口）。只绑 127.0.0.1、无鉴权、纯只读（无任何写端点；注意记忆板块会展示用户档案与逐字 evidence，勿将端口暴露到本机之外）：
 
 ```bash
 python3 -m scripts.run_admin --port 8788

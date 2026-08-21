@@ -56,6 +56,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - debounce+graph 并发场景补了两个 `asyncio.gather` 真并发回归测试（此前 7 个 debounce 测试全是顺序模拟）：同一 session 两条 `handle_event` 同时到达、以及 `dispatch_fresh` 与 `handle_event` confirm-resume 竞态（即 commit `1201650` 修过的那类 bug 的场景），均确认共享 `UserLocks` 实例下 `graph.aget_state`/`ainvoke` 严格序列化不交错；每个测试都先用"两把独立锁"版本验证过自身能检测到交错（RED）再切回生产接线（GREEN）。无生产代码改动。2026-08-20，`pytest` 142 passed。
 
 - 执行模型按任务难度路由（2026-08-21）：MainAgent 在 propose 输出 `task.difficulty`（simple/standard/complex，缺失/非法兜 standard），`ClaudeAgentSDKBackend` 映射 haiku/sonnet/opus；`EXECUTION_AGENT_MODEL` 设置后锁死单模型旁路路由。离线 461 passed + golden 回归 23/23 + 真实 DeepSeek 四条代表性输入难度判定 4/4 符合预期。
+- admin 观测台接入投递板块（2026-08-22）：`/api/outbox` 只读展示状态计数、未终态队列、死信明细（含完整 payload 供人工补寄）；outbox 定稿时挂账的"死信区人工处理数据源"闭环。库缺失/表缺失空态，读失败降级为 error 字段不 500。
 - 难度对用户可见且可口头上调（2026-08-22）：确认话术尾部追加按档位固定短语（三档都显示，`graph._DIFFICULTY_NOTES`）；用户复议说"挺复杂"经 revise 循环重判上调（prompt 只上调不下调）。真实探针 simple→complex 上调、"很简单"不降档；golden 回归 23/23。
 
 ## 尚未验证

@@ -1,4 +1,4 @@
-"""观测台的 HTTP 层：把 ``admin.data`` 的六个读取函数暴露成七个只读端点。
+"""观测台的 HTTP 层：把 ``admin.data`` 的七个读取函数暴露成八个只读端点。
 
 全只读，没有任何 POST/PUT/DELETE——这个面板只看被观测的 bot，绝不改它的数据。
 路由只做三件事：读模块常量拿路径、调 data 层、把返回的 dict 原样交出去。
@@ -25,9 +25,11 @@ from walkie_dokie.admin.data import (
     read_costs,
     read_eval_report,
     read_memory,
+    read_outbox,
     read_turns,
 )
 from walkie_dokie.main_agent import memory as memory_module
+from walkie_dokie.orchestrator import outbox as outbox_module
 
 TURNS_PATH = turn_log.TURN_LOG_PATH
 MODEL_CALLS_PATH = model_call_log.MODEL_CALL_LOG_PATH
@@ -39,6 +41,7 @@ MEMORY_DIR = memory_module.MEMORY_DIR
 _VAR_ROOT = MEMORY_DIR.parent
 CHECKPOINT_DB = _VAR_ROOT / "checkpoints-v2.db"
 EVALS_DIR = _VAR_ROOT / "evals"
+OUTBOX_DB = outbox_module.OUTBOX_DB_PATH
 
 INDEX_HTML_PATH = Path(__file__).parent / "index.html"
 
@@ -77,6 +80,10 @@ def create_app() -> FastAPI:
     @app.get("/api/memory")
     def memory() -> dict:
         return read_memory(MEMORY_DIR, CHECKPOINT_DB)
+
+    @app.get("/api/outbox")
+    def outbox() -> dict:
+        return read_outbox(OUTBOX_DB)
 
     @app.get("/api/evals")
     def evals() -> dict:
