@@ -255,6 +255,9 @@ async def deliver_due_once(outbox: Outbox, platform, *, now: datetime) -> int:
             )
             # 重试排期的 INFO 和转死信的 WARNING 都由 mark_failed 自己记，这里
             # 不重复——死信告警重复两条会让"一条告警=一次人工介入"失效。
+            # mark_failed 自身抛错（sqlite 故障）时不兜底：行会卡在 sending 堵住
+            # 该 session 队列，直到下次进程重启由 reset_sending() 复位重寄——
+            # 与崩溃恢复走同一条路，故意不在此层加恢复逻辑。
             outbox.mark_failed(row["id"], error, now=now)
         else:
             outbox.mark_delivered(row["id"], now=now)
