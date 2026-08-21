@@ -543,26 +543,68 @@ async def handle_event(
 
     # 这一轮是否已经在锁内处理完（确认恢复 / 异常状态拒绝）；否则交给防抖攒批。
     handled = False
+    fallback_text = "处理失败，稍后再试一下"
     # 查询状态和决定“resume 还是防抖新回合”也必须和 ainvoke 使用同一把锁。
     # 否则 execute 正好结束/进入 interrupt 的边界上仍有 TOCTOU 窗口。
-    try:
-        async with locks.get(session_key):
+    async with locks.get(session_key):
+        # 路由决策这一段（查状态 + 非确认分支）失败仍然兜底话术；确认恢复回合的
+        # 失败语义由下面那段自己按 dispatch_fresh 的结构处理，绝不被这里吞掉。
+        try:
             snapshot = await graph.aget_state(
                 config={"configurable": {"thread_id": session_key}}
             )
+            waiting = _waiting_for_confirmation(snapshot)
             logger.info(
                 "事件路由 session=%s waiting_confirmation=%s next=%r",
                 session_key,
-                _waiting_for_confirmation(snapshot),
+                waiting,
                 snapshot.next,
             )
-            if _waiting_for_confirmation(snapshot):
-                started = time.monotonic()
-                trace_id = snapshot.values.get("trace_id")
-                logger.info(
-                    "恢复确认中的回合 session=%s trace_id=%s", session_key, trace_id
+            if not waiting and snapshot.interrupts:
+                raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
+            if not waiting and snapshot.next:
+                # next 也会出现在 failed/pending task 上，它并不是 interrupt 标志。
+                # 绝不能把当前用户消息作为 resume 吞掉或自动重放有副作用的 execute。
+                logger.error(
+                    "会话存在非 interrupt 的未完成任务 session=%s next=%r",
+                    session_key,
+                    snapshot.next,
                 )
-                config = {"configurable": {"thread_id": session_key}}
+                handled = True
+                outbox.enqueue(
+                    session_key,
+                    None,
+                    [
+                        (
+                            "text",
+                            {
+                                "text": "上一次处理留下了异常状态，我没有执行你这条新消息，请联系维护者恢复会话。"
+                            },
+                        )
+                    ],
+                    now=datetime.now(),
+                )
+        except Exception:
+            logger.exception("orchestrator 查询会话状态失败 user_id=%s", event.user_id)
+            outbox.enqueue(
+                session_key,
+                None,
+                [("text", {"text": fallback_text})],
+                now=datetime.now(),
+            )
+            _wake_delivery_worker(wakeup)
+            return
+
+        if waiting:
+            # 图一旦被调起，这条事件就归本回合，绝不再退回防抖攒批。
+            handled = True
+            started = time.monotonic()
+            trace_id = snapshot.values.get("trace_id")
+            logger.info(
+                "恢复确认中的回合 session=%s trace_id=%s", session_key, trace_id
+            )
+            config = {"configurable": {"thread_id": session_key}}
+            try:
                 file_reference = (
                     store_incoming_file(event.platform, event.user_id, event.file)
                     if event.file
@@ -575,7 +617,32 @@ async def handle_event(
                     config=config,
                     durability="sync",
                 )
-                handled = True
+            except Exception as exc:
+                logger.exception(
+                    "恢复确认回合失败 user_id=%s trace_id=%s", event.user_id, trace_id
+                )
+                # 同 dispatch_fresh：兜底话术也走 outbox，且这一轮要留下 turn log。
+                outbox.enqueue(
+                    session_key,
+                    trace_id,
+                    [("text", {"text": fallback_text})],
+                    now=datetime.now(),
+                )
+                await _log_conversation_turn(
+                    platform_name=event.platform,
+                    user_id=event.user_id,
+                    trace_id=trace_id,
+                    input_text=event.text,
+                    input_filename=event.file.filename if event.file else None,
+                    output_text=fallback_text,
+                    output_filename=None,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    success=False,
+                    error=str(exc),
+                )
+            else:
+                # 图已经成功（副作用与 checkpoint 都落了）：这一段裸奔是刻意的，
+                # 入队/记账失败必须冒泡，吞成兜底话术等于骗用户这轮失败了。
                 messages, summary = build_outbound_messages(resumed_state)
                 _log_graph_output(event.user_id, trace_id, resumed_state, messages)
                 if messages:
@@ -606,40 +673,6 @@ async def handle_event(
                     trace_id,
                     duration_ms,
                 )
-            elif snapshot.interrupts:
-                raise RuntimeError(f"未知 interrupt 状态 next={snapshot.next!r}")
-            elif snapshot.next:
-                # next 也会出现在 failed/pending task 上，它并不是 interrupt 标志。
-                # 绝不能把当前用户消息作为 resume 吞掉或自动重放有副作用的 execute。
-                logger.error(
-                    "会话存在非 interrupt 的未完成任务 session=%s next=%r",
-                    session_key,
-                    snapshot.next,
-                )
-                handled = True
-                outbox.enqueue(
-                    session_key,
-                    None,
-                    [
-                        (
-                            "text",
-                            {
-                                "text": "上一次处理留下了异常状态，我没有执行你这条新消息，请联系维护者恢复会话。"
-                            },
-                        )
-                    ],
-                    now=datetime.now(),
-                )
-    except Exception:
-        logger.exception("orchestrator 查询/恢复失败 user_id=%s", event.user_id)
-        outbox.enqueue(
-            session_key,
-            None,
-            [("text", {"text": "处理失败，稍后再试一下"})],
-            now=datetime.now(),
-        )
-        _wake_delivery_worker(wakeup)
-        return
 
     if handled:
         _wake_delivery_worker(wakeup)

@@ -1336,6 +1336,113 @@ async def test_confirm_resume_output_is_enqueued_and_wakes_worker(
     assert wakeup.is_set()
 
 
+class _ConfirmWaitingGraph:
+    """确认恢复分支的 fake graph：``aget_state`` 报"正在等确认"，``ainvoke``
+    (resume) 的返回值/异常由子类或构造参数决定。"""
+
+    def __init__(self, state=None, error=None):
+        self._state = state
+        self._error = error
+
+    async def aget_state(self, config):
+        return SimpleNamespace(
+            next=("ask_confirm",),
+            interrupts=(object(),),
+            values={"trace_id": "t0"},
+        )
+
+    async def ainvoke(self, value, config, durability=None):
+        if self._error is not None:
+            raise self._error
+        return self._state
+
+
+async def test_confirm_resume_graph_failure_logs_a_failed_turn(
+    monkeypatch, outbox, db_path
+):
+    """确认恢复分支的图失败要和 dispatch_fresh 同构：兜底话术入队 **且** 写一条
+    success=False 的 turn log。重构前这条回合完全没有 turn log。"""
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    debouncer = _RecordingDebouncer()
+    wakeup = asyncio.Event()
+
+    await handle_event(
+        _ConfirmWaitingGraph(error=RuntimeError("恢复炸了")),
+        FakePlatform(),
+        debouncer,
+        UserLocks(),
+        object(),  # memory_repository is unreachable outside /long-term-memory
+        InboundEvent("test", "u1", "是", None),
+        outbox=outbox,
+        wakeup=wakeup,
+    )
+
+    rows = _outbox_rows(db_path)
+    assert [(row["kind"], row["payload"]) for row in rows] == [
+        ("text", {"text": "处理失败，稍后再试一下"})
+    ]
+    assert rows[0]["trace_id"] == "t0"
+    assert len(records) == 1
+    assert records[0].success is False
+    assert records[0].error == "恢复炸了"
+    # 图失败也算这一轮处理过了：不能再把这条确认回复丢进防抖攒批。
+    assert debouncer.added == []
+    assert wakeup.is_set()
+
+
+async def test_confirm_resume_enqueue_failure_bubbles_without_fallback(
+    monkeypatch, outbox, db_path
+):
+    """图已经成功（副作用和 checkpoint 都落了）之后入队失败必须冒泡：吞成一次
+    兜底话术会让用户在实际成功的回合收到"处理失败"。spec §5 入队失败 fail fast。"""
+
+    records = []
+
+    async def fake_log_turn(record):
+        records.append(record)
+
+    monkeypatch.setattr("scripts.run_mvp.log_turn", fake_log_turn)
+    real_enqueue = Outbox.enqueue
+    enqueued = []
+
+    def failing_enqueue(self, session_key, trace_id, messages, *, now):
+        enqueued.append(messages)
+        if len(enqueued) == 1:  # 回合输出这一次炸；兜底话术（如果有）会是第二次
+            raise RuntimeError("outbox 写失败")
+        return real_enqueue(self, session_key, trace_id, messages, now=now)
+
+    monkeypatch.setattr(Outbox, "enqueue", failing_enqueue)
+
+    with pytest.raises(RuntimeError, match="outbox 写失败"):
+        await handle_event(
+            _ConfirmWaitingGraph(
+                state={
+                    "result": {
+                        "artifacts": [],
+                        "reply_text": "好的，已经处理。",
+                        "success": True,
+                    }
+                }
+            ),
+            FakePlatform(),
+            _RecordingDebouncer(),
+            UserLocks(),
+            object(),  # memory_repository is unreachable outside /long-term-memory
+            InboundEvent("test", "u1", "是", None),
+            outbox=outbox,
+        )
+
+    assert len(enqueued) == 1  # 没有第二次：兜底话术没有被写出去
+    assert _outbox_rows(db_path) == []
+    assert records == []
+
+
 # --- inbox 去重 --------------------------------------------------------------
 # 飞书会重投同一条事件（回调超时、网络抖动）。去重必须在 handle_event 的最前面
 # 生效——排在防抖之后就等于"重复消息也进了同一个窗口"，攒批会把它当成用户又说
