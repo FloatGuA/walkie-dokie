@@ -1,5 +1,7 @@
 # Admin 观测台（只读）Implementation Plan
 
+> **状态：✅ 已于 2026-08-21 全部执行完毕**（subagent-driven；final review 后修 evidence 数组渲染/error 列/Host 校验等 7 项；真实验收通车，`pytest` 398 passed）。留档备查，不要重复执行；与实现不一致处以代码与 spec 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 本机只读 web 控制台：四板块（回合流/成本/记忆+摘要/eval 报告）收拢既有观测仪器，FastAPI + 单文件前端，127.0.0.1 无鉴权。
