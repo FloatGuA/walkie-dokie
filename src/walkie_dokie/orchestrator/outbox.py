@@ -8,7 +8,7 @@
 
 1. 保序：同 session 只取最早那条未终态的行。前一条 pending/sending 时后一条绝
    不发（否则"文件还没到，'都改好了'先到了"），delivered/dead 则放行。
-2. 退避与死信：失败按 (30s, 2m, 10m) 退避，第 3 次失败置 dead + WARNING。
+2. 退避与死信：失败按 (30s, 2m, 10m) 三档退避，第 4 次失败置 dead + WARNING。
 3. at-least-once：进程崩在 sending 上时没人知道平台收到没有，启动 reset_sending
    一律复位重寄——宁可重发一次，不可静默丢件。
 4. 去重：inbox_seen 挡住平台的重复推送（飞书会重投），7 天 TTL。
@@ -31,7 +31,9 @@ _VAR_ROOT = Path(__file__).parent.parent.parent.parent / "var"
 OUTBOX_DB_PATH = _VAR_ROOT / "outbox.db"
 
 _BACKOFF_SECONDS = (30, 120, 600)
-_MAX_ATTEMPTS = 3
+# 4 而不是 3：退避表有三档，第 1/2/3 次失败各排一档（30s/2m/10m），第 4 次失败才转死信。
+# 写 3 的话 600 这一档永远排不上——三元组会变成两级退避加一个死代码常量。
+_MAX_ATTEMPTS = 4
 _SEEN_TTL_DAYS = 7
 
 _VALID_KINDS = ("file", "text")
@@ -171,7 +173,8 @@ class Outbox:
             )
 
     def mark_failed(self, message_id: int, error: str, *, now: datetime) -> None:
-        """尝试次数 +1，按退避表安排重试；到 _MAX_ATTEMPTS 转死信并 WARNING。
+        """尝试次数 +1，按退避表安排重试（第 n 次失败排 _BACKOFF_SECONDS[n-1]）；
+        到 _MAX_ATTEMPTS 转死信并 WARNING。
 
         死信这行日志是唯一的人工介入信号：消息不会再被取件了，只剩死信区能看到。
         """

@@ -94,7 +94,8 @@ def test_dead_head_releases_tail(outbox):
     )
     head = outbox.due_batch(T0)[0]
 
-    for attempt in range(3):
+    # 三档退避各用一次（30s/2m/10m），第 4 次失败才转死信。
+    for attempt in range(4):
         outbox.mark_failed(head["id"], f"网络炸了 {attempt}", now=T0 + timedelta(hours=attempt))
 
     batch = outbox.due_batch(T0 + timedelta(days=1))
@@ -105,8 +106,8 @@ def test_dead_head_releases_tail(outbox):
     assert len(dead) == 1
     assert dead[0]["id"] == head["id"]
     assert dead[0]["status"] == "dead"
-    assert dead[0]["attempts"] == 3
-    assert dead[0]["last_error"] == "网络炸了 2"
+    assert dead[0]["attempts"] == 4
+    assert dead[0]["last_error"] == "网络炸了 3"
     assert dead[0]["payload"] == {"path": "a.docx"}
     assert outbox.dead_letters("feishu:u2") == []
     assert outbox.dead_letters("feishu:u1")[0]["id"] == head["id"]
@@ -134,22 +135,33 @@ def test_backoff_schedule(outbox, caplog):
     assert second_retry[0]["attempts"] == 2
     assert second_retry[0]["next_attempt_at"] == (t1 + timedelta(seconds=120)).isoformat()
 
+    # 第三档 600s 不是死代码：第 3 次失败排的是 10 分钟后重试，不是死信。
     t2 = t1 + timedelta(seconds=121)
+    outbox.mark_failed(message_id, "第三次失败", now=t2)
+    assert outbox.due_batch(t2 + timedelta(seconds=599)) == []
+    third_retry = outbox.due_batch(t2 + timedelta(seconds=601))
+    assert len(third_retry) == 1
+    assert third_retry[0]["attempts"] == 3
+    assert third_retry[0]["status"] == "pending"
+    assert third_retry[0]["next_attempt_at"] == (t2 + timedelta(seconds=600)).isoformat()
+
+    t3 = t2 + timedelta(seconds=601)
     with caplog.at_level(logging.WARNING, logger="walkie_dokie.orchestrator.outbox"):
-        outbox.mark_failed(message_id, "第三次失败", now=t2)
+        outbox.mark_failed(message_id, "第四次失败", now=t3)
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     warning_text = warnings[0].getMessage()
     assert "feishu:u1" in warning_text
     assert "trace-1" in warning_text
-    assert "第三次失败" in warning_text
+    assert "第四次失败" in warning_text
 
-    assert outbox.due_batch(t2 + timedelta(days=1)) == []
+    assert outbox.due_batch(t3 + timedelta(days=1)) == []
     dead = outbox.dead_letters()
     assert len(dead) == 1
     assert dead[0]["id"] == message_id
-    assert dead[0]["attempts"] == 3
+    assert dead[0]["attempts"] == 4
+    assert dead[0]["last_error"] == "第四次失败"
 
 
 def test_multi_session_isolation(outbox):
