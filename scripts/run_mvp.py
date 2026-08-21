@@ -692,7 +692,9 @@ async def main():
 
         platform = FeishuAdapter(app_id, app_secret)
         main_agent = DeepSeekMainAgent()
-        backend = ClaudeAgentSDKBackend()
+        backend = ClaudeAgentSDKBackend(
+            model=os.environ.get("EXECUTION_AGENT_MODEL", "sonnet")
+        )
         memory_repository = JsonMemoryRepository()
         summarizer = ClaudeAgentSummarizer()
         graph = build_graph(

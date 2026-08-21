@@ -109,7 +109,7 @@ def test_prompt_injection_cannot_enable_claude_capabilities(tmp_path, monkeypatc
     workdir = tmp_path / "one-user-run"
     workdir.mkdir()
 
-    options = _execution_options(workdir)
+    options = _execution_options(workdir, model="sonnet")
     sandbox = options.sandbox
     settings = json.loads(options.settings)
 

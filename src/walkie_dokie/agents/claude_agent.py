@@ -51,7 +51,7 @@ _OUTPUT_SCHEMA = {
 }
 
 
-def _execution_options(workdir: Path) -> ClaudeAgentOptions:
+def _execution_options(workdir: Path, *, model: str) -> ClaudeAgentOptions:
     """Return the complete fail-closed capability set for one execution."""
 
     settings = {
@@ -63,6 +63,7 @@ def _execution_options(workdir: Path) -> ClaudeAgentOptions:
         "autoMemoryEnabled": False,
     }
     return ClaudeAgentOptions(
+        model=model,
         cwd=str(workdir),
         tools=["Bash"],
         allowed_tools=["Bash"],
@@ -89,7 +90,13 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
     """基于 Claude Agent SDK 的执行后端。
 
     走本机 `claude login` 缓存的订阅鉴权（MVP 阶段用户知情接受的风险，见 DECISION.md）。
+
+    ``model`` 接受别名（"haiku"/"sonnet"/"opus"）或完整模型 ID。默认 sonnet：
+    文档任务够用，且固定住模型让 golden eval 冒烟跨机器可比（不随 CLI 默认漂移）。
     """
+
+    def __init__(self, model: str = "sonnet"):
+        self.model = model
 
     async def run(
         self,
@@ -124,7 +131,7 @@ class ClaudeAgentSDKBackend(ExecutionAgent):
             "不要直接和用户对话，不要决定或讨论用户的长期记忆。"
         )
 
-        options = _execution_options(workdir)
+        options = _execution_options(workdir, model=self.model)
 
         structured: dict | None = None
         execution_error: str | None = None
