@@ -56,6 +56,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - debounce+graph 并发场景补了两个 `asyncio.gather` 真并发回归测试（此前 7 个 debounce 测试全是顺序模拟）：同一 session 两条 `handle_event` 同时到达、以及 `dispatch_fresh` 与 `handle_event` confirm-resume 竞态（即 commit `1201650` 修过的那类 bug 的场景），均确认共享 `UserLocks` 实例下 `graph.aget_state`/`ainvoke` 严格序列化不交错；每个测试都先用"两把独立锁"版本验证过自身能检测到交错（RED）再切回生产接线（GREEN）。无生产代码改动。2026-08-20，`pytest` 142 passed。
 
 - 执行模型按任务难度路由（2026-08-21）：MainAgent 在 propose 输出 `task.difficulty`（simple/standard/complex，缺失/非法兜 standard），`ClaudeAgentSDKBackend` 映射 haiku/sonnet/opus；`EXECUTION_AGENT_MODEL` 设置后锁死单模型旁路路由。离线 461 passed + golden 回归 23/23 + 真实 DeepSeek 四条代表性输入难度判定 4/4 符合预期。
+- 混合冒烟（2026-08-22，入站注入+出站全真）：难度判定 simple、口头"挺复杂的"复议升 complex、执行按档路由到 opus、产物 docx 经 outbox→worker 真实上传飞书，全程单 trace_id；同 event_id 重复注入被去重（恰好一次执行、恰好 4 条账）。脚本 var/smoke-hybrid 隔离态，不碰生产库。
 - admin 观测台接入投递板块（2026-08-22）：`/api/outbox` 只读展示状态计数、未终态队列、死信明细（含完整 payload 供人工补寄）；outbox 定稿时挂账的"死信区人工处理数据源"闭环。库缺失/表缺失空态，读失败降级为 error 字段不 500。
 - 难度对用户可见且可口头上调（2026-08-22）：确认话术尾部追加按档位固定短语（三档都显示，`graph._DIFFICULTY_NOTES`）；用户复议说"挺复杂"经 revise 循环重判上调（prompt 只上调不下调）。真实探针 simple→complex 上调、"很简单"不降档；golden 回归 23/23。
 
@@ -68,7 +69,7 @@ PlatformAdapter → Session coordination → LangGraph control plane
 - Claude 后端的正常 docx 生成已由 2026-08-21 `--real-execution` 冒烟覆盖（2 样本全链路 PASSED）；超时、取消后的子进程/远端状态清理仍未专项冒烟。
 - haiku 档已由 2026-08-22 `--real-execution` 冒烟初验（2 个 simple 档样本走 haiku 全链路 PASSED），但样本面窄；判 simple 实为难任务的误判代价（用户拿到差结果重发）仍无真实数据，badcase 驱动观察。
 - Codex 最小权限 profile 已做本地命令隔离测试，但独立 `var/codex_home` 尚未登录，真实模型文档任务仍未冒烟。
-- 持久 outbox/inbox 只做过离线验证：保序、退避、死信、崩溃复位、event_id 去重都由 fake 平台 + 临时 sqlite 的端到端演练覆盖，真实飞书的投递/重投冒烟（含发送半成功、进程在 checkpoint/投递边界崩溃的实况）仍待用户配合场次。
+- 持久 outbox/inbox 已由 2026-08-22 混合冒烟验证出站全链路（入站注入、其余全真）：propose→复议升档→确认→opus 执行→outbox→worker→真实飞书送达（文件+文字共 4 条全部 delivered、attempts=0、全程单 trace_id），同 event_id 双发只执行一次。**仍未验证**：真实入站（飞书 websocket 事件解析、header.event_id 现场提取、真实防抖时序）；真实网络故障下的退避重寄与半投递实况（冒烟全部一次成功，重试路径只有离线覆盖）。
 
 ## 当前数据流
 
