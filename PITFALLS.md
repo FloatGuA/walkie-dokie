@@ -186,3 +186,13 @@
 **正确做法**：给显式路径 `load_dotenv("/abs/path/.env")`（stdin 里也能用），或把脚本写成真实文件再跑（scratchpad 即可）。
 
 **判据**：任何"临时拼一段 python 打真实 API"的探针，只要用到 dotenv，就别走 heredoc 裸调 `load_dotenv()`。
+
+## 在 Claude Code 会话里起常驻服务必须 `setsid`，裸 `nohup ... &` 会随沙箱 shell 一起死
+
+**现象**：`nohup python3 -m scripts.run_admin & ` 起观测台，命令返回正常、进程短暂存在，但下一条命令再 curl 就连不上——服务已悄悄死了，nohup.out 里也没有报错。
+
+**真因**：每条 Bash 工具调用跑在独立的沙箱 shell 里，命令结束时整个进程组被回收；`nohup` 只挡 SIGHUP，挡不住进程组级别的清理。服务活不过发起它的那条命令。
+
+**正确做法**：`setsid nohup <cmd> > log 2>&1 < /dev/null &`——`setsid` 让服务脱离会话/进程组，沙箱回收波及不到。日志重定向到 `var/logs/` 下具体文件，别用默认 nohup.out。
+
+**判据**：凡是"起一个要活过本条命令的进程"（观测台、run_mvp、任何 daemon）一律 setsid；起完立刻用独立的下一条命令 curl/pgrep 验活，别信启动命令自己的退出码。
